@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/bedrock-mc/cinnabar-api/main/schema/v1.json",
+  "$id": "https://raw.githubusercontent.com/cinnabar-mc/cinnabar-api/main/schema/v1.json",
   "title": "Cinnabar API v1",
   "description": "HTTP bodies and WebSocket messages of the Cinnabar API. Receivers ignore unknown fields and, after authentication, unknown message types.",
   "x-protocol": 1,

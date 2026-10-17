@@ -8,12 +8,12 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bedrock-mc/cinnabar-api.git"
+    "url": "git+https://github.com/cinnabar-mc/cinnabar-api.git"
   },
   "bugs": {
-    "url": "https://github.com/bedrock-mc/cinnabar-api/issues"
+    "url": "https://github.com/cinnabar-mc/cinnabar-api/issues"
   },
-  "homepage": "https://github.com/bedrock-mc/cinnabar-api#readme",
+  "homepage": "https://github.com/cinnabar-mc/cinnabar-api#readme",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",

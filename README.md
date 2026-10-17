@@ -1,6 +1,6 @@
 # cinnabar-api
 
-The Cinnabar client's API: release notifications and player presence, as a Cloudflare Worker
+The [Cinnabar](https://github.com/cinnabar-mc/cinnabar) client's API: release notifications and player presence, as a Cloudflare Worker
 (Hono) with one Durable Object. [`schema/v1.json`](schema/v1.json) is the machine-readable
 contract (JSON Schema for every HTTP body and WebSocket message); the server validates inbound
 messages against it.
