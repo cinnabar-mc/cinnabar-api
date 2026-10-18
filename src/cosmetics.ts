@@ -36,7 +36,10 @@ const assetBytes = new Map<string, ArrayBuffer>();
 
 /** Serves only reviewed, catalog-addressed R2 objects; clients verify the declared digest and size. */
 export async function assetResponse(hash: string, bucket: R2Bucket): Promise<Response> {
-  const assets = catalog.items.flatMap((item) => Object.entries(item.assets).map(([kind, asset]) => ({ kind, asset, license: item.license })));
+  const assets = [
+    ...catalog.items.flatMap((item) => Object.entries(item.assets).map(([kind, asset]) => ({ kind, asset, license: item.license }))),
+    ...catalog.emotes.map((item) => ({ kind: "clip", asset: item.clip, license: item.license })),
+  ];
   const entry = assets.find(({ asset }) => asset.sha256 === hash);
   if (!entry) return new Response(null, { status: 404 });
   let bytes = assetBytes.get(hash);

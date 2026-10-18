@@ -164,7 +164,7 @@ it("keeps catalog metadata and every packaged original asset consistent with the
   validator.addSchema(schema as unknown as Schema);
   expect(validator.validate(catalog).valid).toBe(true);
   const files = import.meta.glob("../assets/cosmetics/*", { query: "?raw", import: "default", eager: true });
-  const expected = new Set(catalog.items.flatMap((item) => Object.values(item.assets).map((asset) => asset.sha256)));
+  const expected = new Set([...catalog.items.flatMap((item) => Object.values(item.assets).map((asset) => asset.sha256)), ...catalog.emotes.map((item) => item.clip.sha256)]);
   expect(new Set(Object.keys(files).map((name) => name.split("/").at(-1)))).toEqual(expected);
   for (const item of catalog.items) for (const [kind, asset] of Object.entries(item.assets)) {
     if (kind === "texture") continue; // PNG bytes are checked by the client asset-admission fixtures.

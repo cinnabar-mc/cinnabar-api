@@ -184,3 +184,18 @@ For a full renderer compatibility check, point the client's
 `api_catalog_assets_admit_through_client_validation` test at this checkout with
 `CINNABAR_API_CHECKOUT`. This uses the actual API catalog and assets without copying
 them into the client. It complements API export checks and client feature tests.
+
+## Catalog emote clips
+
+The optional catalog `emotes` array lists each clip's ID, display name, free
+ownership, license and hash-addressed `clip` asset. Assets use the existing
+cosmetics R2 route and immutable cache policy. Free clips are owned by everyone.
+The catalog includes the original Breakdance sequence; authoring, sampling and
+export checks live in [art/emotes](art/emotes/README.md).
+
+`schema/v1.json` owns the version 1 clip format and limits: duration and loop
+metadata, fixed articulated joints, quaternion XYZW rotations and local offsets
+in leg-height units. Clients reject unsupported versions, malformed channels and
+oversized clips. Shared synthetic conformance cases in `schema/fixtures` exercise
+the server validator and client parser. Publish the API assets before the client
+that consumes them; older clients ignore the additional catalog field.
