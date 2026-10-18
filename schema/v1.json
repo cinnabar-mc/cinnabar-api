@@ -1020,7 +1020,14 @@
       ],
       "properties": {
         "id": {
-          "$ref": "#/$defs/CosmeticItemId"
+          "allOf": [
+            {
+              "$ref": "#/$defs/CosmeticItemId"
+            },
+            {
+              "$ref": "#/$defs/EmoteId"
+            }
+          ]
         },
         "display_name": {
           "type": "string",
