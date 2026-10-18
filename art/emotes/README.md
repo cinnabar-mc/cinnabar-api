@@ -1,16 +1,20 @@
 # Emote authoring
 
-The catalog owns Breakdance's original Rust curves and joint solving. The client
+The catalog owns the original Rust curves and joint solving for all emotes. The client
 contains only the articulated rig and generic clip playback. These sources retain
 the cosmetic artwork license in `../cosmetics/LICENSE`.
 
-Run `python3 art/emotes/export.py` from the repository root. It compiles `sample.rs`
-with Rust 2024, samples the curves in `breakdance.rs` and `breakdance/joints.rs` at
-60 Hz over the inclusive 6.4-second loop, and converts their model-space targets
-to local quaternion rotations and bind-relative offsets. The sampler uses fixed scalar trigonometric series so macOS and Linux produce
-the same encoded clip. The reference pivots and
-logical parents come from `schema/v1.json`'s `EmoteClip.x-rig`. Offsets are divided
-by the reference leg height. Floor correction remains a client responsibility.
+Run `python3 art/emotes/export.py` from the repository root. Each
+`*.emote.json` file supplies the catalog metadata, duration and loop flag for its
+matching Rust choreography module. The exporter compiles `sample.rs` with Rust
+2024 and samples each clip at 60 Hz through its inclusive endpoint. It converts
+model-space targets to local quaternion rotations and bind-relative offsets.
+Fixed scalar trigonometry makes the encoded clips reproducible on macOS and
+Linux. Reference pivots and logical parents come from
+`schema/v1.json`'s `EmoteClip.x-rig`; offsets use reference leg-height units.
+Floor correction remains a client responsibility. Grounded dances use zero root
+height; support-pivot placement stays in the child channels. Explicit vertical
+root offsets remain available for authored airborne motion.
 The script writes the named clip, its hash-addressed deployment copy and catalog
 metadata. Repeating it does not change the catalog version.
 

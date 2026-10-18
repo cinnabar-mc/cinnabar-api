@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 //! Samples the original Rust curves; export.py provides the schema-owned reference rig.
 use std::io::{self, Write};
-const DURATION: f64 = 6.4;
 #[derive(Clone, Copy)]
 struct BoneTransform {
     rotation: [f32; 4],
@@ -16,7 +15,7 @@ mod articulated {
         pub min: [f32; 3],
     }
 }
-mod breakdance;
+include!("choreography.rs");
 include!("rig.rs");
 
 /// Samples each track on the same inclusive grid, converting model targets to logical-parent deltas.
@@ -44,7 +43,7 @@ fn main() {
     let mut out = io::BufWriter::new(io::stdout().lock());
     write!(
         out,
-        "{{\"version\":1,\"duration\":{DURATION},\"loop\":true,\"tracks\":["
+        "{{\"version\":1,\"duration\":{DURATION},\"loop\":{LOOPING},\"tracks\":["
     )
     .unwrap();
     for (joint, (name, parent, _)) in RIG.iter().enumerate() {
@@ -55,7 +54,7 @@ fn main() {
         for frame in 0..=steps {
             let time = DURATION * frame as f64 / steps as f64;
             let targets =
-                breakdance::targets(&bones, &names, &rest, time, REFERENCE_HEIGHT, Some(&bounds));
+                choreography::targets(&bones, &names, &rest, time, REFERENCE_HEIGHT, Some(&bounds));
             let target = targets[joint].unwrap();
             let (rotation, offset) = if let Some(parent) = parent {
                 let pose = targets[*parent].unwrap();
