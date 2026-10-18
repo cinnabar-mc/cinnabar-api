@@ -1,5 +1,5 @@
 {
-  "version": 5,
+  "version": 8,
   "items": [
     {
       "id": "cinnabar:bunny_ears",
@@ -570,6 +570,19 @@
       "render_flags": {
         "double_sided": false,
         "emissive": true
+      },
+      "license": "https://polyformproject.org/licenses/noncommercial/1.0.0"
+    }
+  ],
+  "emotes": [
+    {
+      "id": "cinnabar:breakdance",
+      "display_name": "Breakdance",
+      "free": true,
+      "clip": {
+        "url": "/v1/cosmetics/assets/585e2a23d6d0c0c0b716059f3ccf84fb75e2fbc8c56af4477fd657068ba50d9f",
+        "sha256": "585e2a23d6d0c0c0b716059f3ccf84fb75e2fbc8c56af4477fd657068ba50d9f",
+        "bytes": 762018
       },
       "license": "https://polyformproject.org/licenses/noncommercial/1.0.0"
     }

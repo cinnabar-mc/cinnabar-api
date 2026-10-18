@@ -71,3 +71,8 @@ The **licensor** is the individual or entity offering these terms, and the **sof
 **Your licenses** are all the licenses granted to you for the software under these terms.
 
 **Use** means anything you do with the software requiring one of your licenses.
+
+The original Breakdance choreography, its authoring curves and sampled clip in
+`art/emotes/` and `assets/cosmetics/` use the same PolyForm Noncommercial 1.0.0
+artwork license. The Rust authoring sampler retains that license. The new Python packaging
+tools, generic clip schema and validators use the repository's MIT license.

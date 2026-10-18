@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 from export import export, export_animations
@@ -39,6 +40,9 @@ def check():
             animation = json.loads(path.with_suffix('.animation.json').read_text())
             assert export_animations(project) == animation['animations'], f'{path.name}: stale animation export'
     assert used == projects.keys(), f'projects missing from catalog: {projects.keys() - used}'
+    sys.path.insert(0, str(ROOT / 'art/emotes'))
+    from export_emotes import check_emotes
+    check_emotes(catalog)
     print(f'Checked {len(used)} cosmetic projects and their catalog assets')
 
 
