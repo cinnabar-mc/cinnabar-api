@@ -7,7 +7,8 @@ the cosmetic artwork license in `../cosmetics/LICENSE`.
 Run `python3 art/emotes/export.py` from the repository root. It compiles `sample.rs`
 with Rust 2024, samples the curves in `breakdance.rs` and `breakdance/joints.rs` at
 60 Hz over the inclusive 6.4-second loop, and converts their model-space targets
-to local quaternion rotations and bind-relative offsets. The reference pivots and
+to local quaternion rotations and bind-relative offsets. The sampler uses fixed scalar trigonometric series so macOS and Linux produce
+the same encoded clip. The reference pivots and
 logical parents come from `schema/v1.json`'s `EmoteClip.x-rig`. Offsets are divided
 by the reference leg height. Floor correction remains a client responsibility.
 The script writes the named clip, its hash-addressed deployment copy and catalog

@@ -77,7 +77,7 @@ pub(super) fn apply(
     }
     let body = targets[joints.body].unwrap();
     let twist = if (WINDMILL_START..WINDMILL_END).contains(&frame.phase) {
-        frame.turn[1].to_radians().sin() * 12.0
+        sine(frame.turn[1].to_radians()) * 12.0
     } else {
         0.0
     };

@@ -137,7 +137,7 @@ fn sample(seconds: f64) -> Frame {
         std::array::from_fn(|index| a.bends[index] + (b.bends[index] - a.bends[index]) * amount),
     );
     if (WINDMILL_START..WINDMILL_END).contains(&phase) {
-        let scissor = (result.turn[1].to_radians() * 2.0).sin() * 22.0;
+        let scissor = sine(result.turn[1].to_radians() * 2.0) * 22.0;
         result.legs[0][0] += scissor;
         result.legs[1][0] -= scissor;
         result.bends[2] += scissor * 0.5;

@@ -103,9 +103,9 @@ fn main() {
 /// Converts intrinsic XYZ degree rotations to a quaternion.
 fn quat_from_euler(rotation: [f32; 3]) -> [f32; 4] {
     let [x, y, z] = rotation.map(|value| value.to_radians() * 0.5);
-    let (sx, cx) = x.sin_cos();
-    let (sy, cy) = y.sin_cos();
-    let (sz, cz) = z.sin_cos();
+    let (sx, cx) = sin_cos(x);
+    let (sy, cy) = sin_cos(y);
+    let (sz, cz) = sin_cos(z);
     [
         sx * cy * cz - cx * sy * sz,
         cx * sy * cz + sx * cy * sz,
@@ -130,4 +130,26 @@ fn rotate_vector(rotation: [f32; 4], vector: [f32; 3]) -> [f32; 3] {
     let inverse = [-rotation[0], -rotation[1], -rotation[2], rotation[3]];
     let result = quat_multiply(quat_multiply(rotation, qvector), inverse);
     [result[0], result[1], result[2]]
+}
+
+/// Evaluates bounded trigonometric series with identical scalar arithmetic on export hosts.
+fn sin_cos(angle: f32) -> (f32, f32) {
+    let x = (f64::from(angle) + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
+        - std::f64::consts::PI;
+    let square = x * x;
+    let (mut sine, mut cosine) = (x, 1.0);
+    let (mut sin_term, mut cos_term) = (x, 1.0);
+    for n in 1..=12 {
+        let n = f64::from(n);
+        sin_term *= -square / ((2.0 * n) * (2.0 * n + 1.0));
+        cos_term *= -square / ((2.0 * n - 1.0) * (2.0 * n));
+        sine += sin_term;
+        cosine += cos_term;
+    }
+    (sine as f32, cosine as f32)
+}
+
+/// Samples the deterministic sine used by authored scissor and torso curves.
+fn sine(angle: f32) -> f32 {
+    sin_cos(angle).0
 }
