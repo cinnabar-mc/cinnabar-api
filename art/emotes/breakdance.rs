@@ -219,5 +219,11 @@ pub(super) fn targets(
         })
         .collect();
     joints::apply(names, rest, &mut targets, frame, height, bounds);
+    // Rotation around a support pivot is pose placement, not an authored jump.
+    let root = names
+        .iter()
+        .position(|name| name.as_ref() == "root")
+        .unwrap();
+    targets[root].as_mut().unwrap().translation_scale[1] = rest[root].translation_scale[1];
     targets
 }

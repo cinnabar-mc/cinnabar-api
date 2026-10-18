@@ -1,5 +1,5 @@
 {
-  "version": 8,
+  "version": 10,
   "items": [
     {
       "id": "cinnabar:bunny_ears",
@@ -580,9 +580,20 @@
       "display_name": "Breakdance",
       "free": true,
       "clip": {
-        "url": "/v1/cosmetics/assets/585e2a23d6d0c0c0b716059f3ccf84fb75e2fbc8c56af4477fd657068ba50d9f",
-        "sha256": "585e2a23d6d0c0c0b716059f3ccf84fb75e2fbc8c56af4477fd657068ba50d9f",
-        "bytes": 762018
+        "url": "/v1/cosmetics/assets/d371682cfa22df8cdcfeab7dd8930c78245f4b848ad39d49d0b04cd50f90c5b0",
+        "sha256": "d371682cfa22df8cdcfeab7dd8930c78245f4b848ad39d49d0b04cd50f90c5b0",
+        "bytes": 762275
+      },
+      "license": "https://polyformproject.org/licenses/noncommercial/1.0.0"
+    },
+    {
+      "id": "cinnabar:twerk",
+      "display_name": "Twerk",
+      "free": true,
+      "clip": {
+        "url": "/v1/cosmetics/assets/94229d103a981f123166aa61917de37fb6840cac11a66425c62c38fca2e798fd",
+        "sha256": "94229d103a981f123166aa61917de37fb6840cac11a66425c62c38fca2e798fd",
+        "bytes": 55843
       },
       "license": "https://polyformproject.org/licenses/noncommercial/1.0.0"
     }
