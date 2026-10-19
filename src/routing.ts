@@ -1,4 +1,5 @@
 import type { Hub } from "./hub";
+import type { HistoryRange, OnlineHistory } from "./presence-history";
 
 /** Returns the shared presence and release hub. Sharding also needs global lookups and release fan-out. */
 export function hubFor(env: Env): DurableObjectStub<Hub> {
@@ -21,4 +22,19 @@ export function cachedOnlineCount(env: Env): Promise<number> {
     onlineCount = entry;
   }
   return onlineCount.value;
+}
+
+const historyCache = new Map<HistoryRange, { at: number; value: Promise<OnlineHistory> }>();
+
+/** Shares each range's read for one minute, including concurrent visitor requests. */
+export function cachedOnlineHistory(env: Env, range: HistoryRange): Promise<OnlineHistory> {
+  const now = Date.now();
+  let entry = historyCache.get(range);
+  if (!entry || now < entry.at || now - entry.at >= 60_000) {
+    const next = { at: now, value: hubFor(env).onlineHistory(range) };
+    next.value.catch(() => { if (historyCache.get(range) === next) historyCache.delete(range); });
+    historyCache.set(range, next);
+    entry = next;
+  }
+  return entry.value;
 }
