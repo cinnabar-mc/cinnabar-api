@@ -21,7 +21,14 @@ app.get("/v1/presence/count", async (c) => {
   });
 });
 
+app.get("/v1/presence/players", async (c) => {
+  c.header("Cache-Control", "no-store");
+  if (!(await bearerMatches(c.req.header("Authorization"), c.env.PRESENCE_READ_SECRET))) return c.body(null, 401);
+  return c.json({ names: await hubFor(c.env).onlineNames() });
+});
+
 app.get("/v1/cosmetics/catalog", (c) => catalogResponse(c.req.raw, c.env.COSMETIC_ASSETS));
+
 app.get("/v1/presence/history", async (c) => {
   c.header("Access-Control-Allow-Origin", "*");
   const range = c.req.query("range") ?? "24h";

@@ -41,13 +41,14 @@ type Session =
       deadline: number;
       nonce: string;
       xuid: string;
+      displayName: string;
       cpk: string;
       clientVersion: string;
       clientBuild?: number;
       channel: Channel;
       visible: boolean;
     }
-  | { stage: "ready"; xuid: string; uuid: string; channel: Channel; visible: boolean; lastSeen?: number;
+  | { stage: "ready"; xuid: string; displayName: string; uuid: string; channel: Channel; visible: boolean; lastSeen?: number;
       loadout?: LoadoutState;
       watching?: string[]; emote?: { id: string; elapsed: number; updated: number } };
 
@@ -101,6 +102,10 @@ export class Hub extends DurableObject<Env> {
       const attachment = ws.deserializeAttachment() as Attachment | typeof CLOSED | null;
       // Handshaking sockets are restored too, so the alarm still closes them at their deadline.
       if (attachment && attachment.stage !== "closed" && ws.readyState === WebSocket.OPEN) {
+        if ((attachment.stage === "ready" || attachment.stage === "proof") && !attachment.displayName) {
+          this.close(ws, 1012, "identity refresh required");
+          continue;
+        }
         this.save(ws, attachment, false);
       }
     }
@@ -108,19 +113,29 @@ export class Hub extends DurableObject<Env> {
 
   /** Counts unique visible accounts with a fresh authenticated socket, excluding retained presence. */
   onlineCount(): number {
+    return this.onlineAccounts().length;
+  }
+
+  /** Returns only verified names for the authenticated administrative directory. */
+  onlineNames(): string[] {
+    return this.onlineAccounts().map((session) => session.displayName).sort();
+  }
+
+  /** Selects one fresh, visible authenticated session per account, without retained presence. */
+  private onlineAccounts(): Ready[] {
     const now = Date.now();
-    let count = 0;
+    const accounts: Ready[] = [];
     for (const sockets of this.byXuid.values()) {
       for (const ws of sockets) {
         const session = this.sessions.get(ws);
         if (ws.readyState === WebSocket.OPEN && session?.stage === "ready" && session.visible
           && this.idleDeadline(ws, session) > now) {
-          count++;
+          accounts.push(session);
           break;
         }
       }
     }
-    return count;
+    return accounts;
   }
 
   /** Records the current authoritative count independently of website visitors. */
@@ -342,6 +357,7 @@ export class Hub extends DurableObject<Env> {
       deadline,
       nonce,
       xuid: identity.xuid,
+      displayName: identity.displayName,
       cpk: identity.cpk,
       clientVersion: hello.client_version,
       clientBuild: hello.client_build,
@@ -356,7 +372,7 @@ export class Hub extends DurableObject<Env> {
     const valid = await verifyProof(pending.cpk, pending.nonce, signature);
     if (!this.sessions.has(ws)) return;
     if (!valid) return this.reject(ws);
-    const { xuid, channel, visible } = pending;
+    const { xuid, displayName, channel, visible } = pending;
     const uuid = await identityUuid(xuid);
     await this.scheduleAlarm(Date.now() + SESSION_IDLE_TIMEOUT_MS);
     // Read before indexing so a concurrent recordRelease reaches this socket exactly once, via one path or the other.
@@ -381,8 +397,9 @@ export class Hub extends DurableObject<Env> {
       .filter((session): session is Ready => session?.stage === "ready")
       .map((session) => session.loadout).filter((value): value is LoadoutState => value !== undefined)
       .sort((a, b) => b.revision - a.revision)[0];
-    this.save(ws, { stage: "ready", xuid, uuid, channel, visible, loadout, lastSeen: now });
+    this.save(ws, { stage: "ready", xuid, displayName, uuid, channel, visible, loadout, lastSeen: now });
     send(ws, { type: "welcome", xuid, loadout_revision: loadout?.revision ?? 0, owned_cosmetics: this.ownedCosmetics(xuid), ...SERVER_PARAMETERS });
+
     if (latest && compareReleases(latest.version, latest.build, pending.clientVersion, pending.clientBuild) > 0) {
       send(ws, { type: "release", ...latest });
     }

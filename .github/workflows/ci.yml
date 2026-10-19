@@ -62,4 +62,11 @@ jobs:
       - if: steps.head.outputs.current == 'true'
         run: pnpm install --frozen-lockfile
       - if: steps.head.outputs.current == 'true'
+        name: Configure private presence access
+        env:
+          PRESENCE_READ_SECRET: ${{ secrets.PRESENCE_READ_SECRET }}
+        run: |
+          : "${PRESENCE_READ_SECRET:?Missing PRESENCE_READ_SECRET}"
+          printf '%s' "$PRESENCE_READ_SECRET" | pnpm exec wrangler secret put PRESENCE_READ_SECRET
+      - if: steps.head.outputs.current == 'true'
         run: pnpm exec wrangler deploy

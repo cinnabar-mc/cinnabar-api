@@ -11,6 +11,7 @@ messages against it.
 | --- | --- |
 | `GET /v1/health` | `{"ok":true,"api":"v1"}` |
 | `GET /v1/presence/count` | Public `{"online":0}` count of unique connected, authenticated accounts with visibility on. Allows cross-origin reads and caching for 30 seconds. No identifiers or retained offline presence. |
+| `GET /v1/presence/players` | Private `{"names":[]}` list of verified names for those same online accounts. Requires a bearer token matching the `PRESENCE_READ_SECRET` Worker secret; never cached or exposed through CORS. |
 | `GET /v1/presence/history?range=24h` | Public anonymous player-count history. Ranges: `24h` (one minute), `7d` (ten minutes), `30d` (one hour). Allows cross-origin reads and caching for 60 seconds. |
 | `POST /v1/releases` | Release hook. `Authorization: Bearer <RELEASE_HOOK_SECRET>`, body `{"channel","version","build"}`; records and broadcasts only a newer (version, build) pair. Repeats and older records are no-ops. Omitted v1 builds mean zero. |
 | `GET /v1/connect` | WebSocket. The client authenticates with a Minecraft multiplayer token plus an ES384 proof of its key, then can toggle visibility, look up which XUIDs or UUIDs recently used Cinnabar, and receives release pushes. |
@@ -27,6 +28,8 @@ online count excludes expired sessions even before their sockets close; alarm ma
 them with `1001`. Automatic heartbeat timestamps survive hibernation.
 Reconnects reclaim expired account slots before the per-account connection limit is checked.
 The public online count retains its 30-second cache.
+Deploying verified-name retention closes older authenticated sockets once with `1012`
+so reconnecting clients supply their signed identity again.
 
 - Connections: at most 20,000 per Hub, including closing sockets; at most 8 pending handshakes
   per IPv4 address or IPv6 /64, and at most 4 ready sockets per XUID. Ready sockets do not count
@@ -59,8 +62,9 @@ The public online count retains its 30-second cache.
 - Presence UUIDs are derived from the verified XUID, never supplied by the client at login.
 - Connection attachments survive hibernation and hold the XUID, UUID, visibility, channel, and socket
   flood counters and latest client-message time. Handshakes (at most 10 s) temporarily hold the
-  nonce, public key, client version and build. Display names and tokens are not stored in
-  attachments or sent in welcome.
+  nonce, public key, client version and build. Verified display names stay with active
+  connection attachments for administrative queries; tokens are never stored. Neither
+  display names nor tokens are sent in welcome.
 - Account lookup budgets survive reconnects and hibernation in Durable Object storage. Each
   record holds only an XUID, remaining token count and refill timestamp; an alarm removes records
   unused for five minutes. Requested rosters and lookup results are not retained.
@@ -105,10 +109,13 @@ cp .dev.vars.example .dev.vars && pnpm dev
 
 CI deploys every push to `main` after the tests pass: it uploads cosmetic assets missing from R2, then runs
 `wrangler deploy`. The job runs in the `production` environment, whose `CLOUDFLARE_API_TOKEN` secret only
-`main` can read. A manual deploy runs the same two steps:
+`main` can read. CI also copies the repository's `PRESENCE_READ_SECRET` Actions secret
+into the Worker before deployment; configure the same value in the administrative consumer.
+A manual deploy runs the asset upload and Worker deployment after configuring secrets:
 
 ```sh
 pnpm exec wrangler secret put RELEASE_HOOK_SECRET   # once
+pnpm exec wrangler secret put PRESENCE_READ_SECRET  # same value as the consumer
 node scripts/sync-cosmetic-assets.mjs
 pnpm exec wrangler deploy
 ```
