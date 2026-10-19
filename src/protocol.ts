@@ -101,7 +101,8 @@ export interface ReleaseHookRequest {
 export type ServerMessage =
   | ({ xuid: string; uuid: string } & LoadoutState)
   | { type: "challenge"; nonce: string }
-  | ({ type: "welcome"; xuid: string; loadout_revision?: number } & WelcomeParameters)
+  | { type: "cosmetic_ownership"; owned_cosmetics: string[] }
+  | ({ type: "welcome"; xuid: string; loadout_revision?: number; owned_cosmetics?: string[] } & WelcomeParameters)
   | { type: "error"; code: "unauthorized" | "invalid_loadout" }
   | { type: "error"; code: "rate_limited"; id: number }
   | { type: "lookup_result"; id: number; cinnabar: string[]; cinnabar_uuids?: string[] }

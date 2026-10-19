@@ -1,4 +1,5 @@
-import { admitLoadout } from "./cosmetics";
+import { catalog, admitLoadout } from "./cosmetics";
+import { loadCatalog, type Catalog } from "./catalog-store";
 import { DurableObject } from "cloudflare:workers";
 import { PresenceHistory, type HistoryRange, type OnlineHistory } from "./presence-history";
 import { IssuerUnavailable, encodeBase64Url, identityUuid, issuerKeys, verifyProof } from "./identity";
@@ -83,6 +84,7 @@ export class Hub extends DurableObject<Env> {
   private readonly ipBySocket = new Map<WebSocket, string>();
   private readonly ipSalt: string;
   private alarmDeadline = Infinity;
+  private cosmeticCatalog: Catalog = catalog;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -201,6 +203,7 @@ export class Hub extends DurableObject<Env> {
   }
 
   override async alarm(): Promise<void> {
+    this.cosmeticCatalog = await loadCatalog(this.env.COSMETIC_ASSETS);
     this.alarmDeadline = Infinity;
     const now = Date.now();
     let next = this.expireHandshakes(now);
@@ -253,6 +256,7 @@ export class Hub extends DurableObject<Env> {
   }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    this.cosmeticCatalog = await loadCatalog(this.env.COSMETIC_ASSETS);
     try {
       await this.handleMessage(ws, message);
     } catch {
@@ -319,6 +323,7 @@ export class Hub extends DurableObject<Env> {
   }
 
   override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+    this.cosmeticCatalog = await loadCatalog(this.env.COSMETIC_ASSETS);
     this.sockets.delete(ws);
     this.forget(ws);
     try {
@@ -329,6 +334,7 @@ export class Hub extends DurableObject<Env> {
   }
 
   override async webSocketError(ws: WebSocket): Promise<void> {
+    this.cosmeticCatalog = await loadCatalog(this.env.COSMETIC_ASSETS);
     this.sockets.delete(ws);
     this.forget(ws);
   }
@@ -395,7 +401,8 @@ export class Hub extends DurableObject<Env> {
       .map((session) => session.loadout).filter((value): value is LoadoutState => value !== undefined)
       .sort((a, b) => b.revision - a.revision)[0];
     this.save(ws, { stage: "ready", xuid, displayName, uuid, channel, visible, loadout, lastSeen: now });
-    send(ws, { type: "welcome", xuid, loadout_revision: loadout?.revision ?? 0, ...SERVER_PARAMETERS });
+    send(ws, { type: "welcome", xuid, loadout_revision: loadout?.revision ?? 0, owned_cosmetics: this.ownedCosmetics(xuid), ...SERVER_PARAMETERS });
+
     if (latest && compareReleases(latest.version, latest.build, pending.clientVersion, pending.clientBuild) > 0) {
       send(ws, { type: "release", ...latest });
     }
@@ -497,6 +504,33 @@ export class Hub extends DurableObject<Env> {
       valid_for_ms: active ? EMOTE_TTL_MS - age : 0 };
   }
 
+  /** Reads paid ownership from the durable database, including after hibernation. */
+  private ownedCosmetics(xuid: string): string[] {
+    return this.ctx.storage.sql.exec<{ item_id: string }>(
+      "SELECT item_id FROM cosmetic_entitlements WHERE xuid = ? ORDER BY item_id", xuid,
+    ).toArray().map((row) => row.item_id);
+  }
+
+  /** Applies a validated administrative grant or revocation atomically and updates connected accounts. */
+  async setCosmeticEntitlements(xuid: string, ids: string[], owned: boolean): Promise<string[] | null> {
+    this.cosmeticCatalog = await loadCatalog(this.env.COSMETIC_ASSETS, Date.now(), true);
+    if (!/^[0-9]{1,20}$/.test(xuid) || ids.length < 1 || ids.length > 256
+      || ids.some((id) => !this.cosmeticCatalog.items.some((item) => item.id === id && !item.free))) return null;
+    this.ctx.storage.transactionSync(() => {
+      for (const id of new Set(ids)) {
+        if (owned) this.ctx.storage.sql.exec("INSERT OR IGNORE INTO cosmetic_entitlements (xuid, item_id) VALUES (?, ?)", xuid, id);
+        else this.ctx.storage.sql.exec("DELETE FROM cosmetic_entitlements WHERE xuid = ? AND item_id = ?", xuid, id);
+      }
+    });
+    const items = this.ownedCosmetics(xuid);
+    for (const ws of this.byXuid.get(xuid) ?? []) {
+      send(ws, { type: "cosmetic_ownership", owned_cosmetics: items });
+      const state = this.sessions.get(ws);
+      if (state?.stage === "ready") this.broadcastLoadout(state);
+    }
+    return items;
+  }
+
   /** Validates ownership atomically before replacing every socket's account snapshot. */
   private onLoadout(ws: WebSocket, state: Ready, message: LoadoutState): void {
     const sources = [...(this.byXuid.get(state.xuid) ?? [])];
@@ -519,7 +553,7 @@ export class Hub extends DurableObject<Env> {
   private ownedLoadout(xuid: string, slots: Record<string, string | null>): Record<string, string | null> | null {
     return admitLoadout(slots, (id) => this.ctx.storage.sql.exec(
       "SELECT 1 FROM cosmetic_entitlements WHERE xuid = ? AND item_id = ?", xuid, id,
-    ).toArray().length !== 0);
+    ).toArray().length !== 0, this.cosmeticCatalog.items);
   }
 
   /** Recomputes the newest session snapshot for each mutually nearby watcher. */

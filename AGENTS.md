@@ -1,16 +1,12 @@
 # Repository agent instructions
 
-## Cosmetic asset ownership
+The private cinnabar-mc/cinnabar-cosmetics repository owns original cosmetic and
+emote authoring, exports, runtime objects, catalog checks and R2 publication.
+Keep geometries, animations, textures and embedded authoring projects out of this
+public repository. Public tests use synthetic fixtures and the shared schema.
 
-This repository owns the production cosmetic catalog, editable Blockbench projects,
-textures, animation sources, exports and packaged assets. Keep them in sync with
-`pnpm check:cosmetics`; CI must run this before deployment. Preserve the artwork's
-PolyForm Noncommercial license and notices.
-
-Cinnabar owns downloading, validation, caching and rendering, with small stable
-client regression fixtures. Do not duplicate each catalog item in the client.
-Use its external-catalog compatibility test for full renderer validation. Items
-using existing client features ship through this API alone. Rendering features
-require client support and focused client tests before publication.
-
-Write clear documentation comments for new helper functions.
+The API owns catalog delivery and database entitlements. Ownership belongs in the
+Hub cosmetic_entitlements table, never in username or XUID allowlists in code.
+Preserve the original free metadata fallback and the existing digest asset URLs.
+Public builds and tests must work without access to the private asset repository.
+Preserve artwork license notices. Document the contract of new helper functions.

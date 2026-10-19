@@ -1,4 +1,5 @@
 import { catalogResponse, assetResponse } from "./cosmetics";
+import { authorizePublisher, entitlementCommand } from "./cosmetics-admin";
 import { Hono } from "hono";
 import { isReleaseHookRequest } from "./protocol";
 import { cachedOnlineCount, cachedOnlineHistory, hubFor } from "./routing";
@@ -26,7 +27,8 @@ app.get("/v1/presence/players", async (c) => {
   return c.json({ names: await hubFor(c.env).onlineNames() });
 });
 
-app.get("/v1/cosmetics/catalog", (c) => catalogResponse(c.req.raw));
+app.get("/v1/cosmetics/catalog", (c) => catalogResponse(c.req.raw, c.env.COSMETIC_ASSETS));
+
 app.get("/v1/presence/history", async (c) => {
   c.header("Access-Control-Allow-Origin", "*");
   const range = c.req.query("range") ?? "24h";
@@ -36,6 +38,18 @@ app.get("/v1/presence/history", async (c) => {
   });
 });
 app.get("/v1/cosmetics/assets/:hash", (c) => assetResponse(c.req.param("hash"), c.env.COSMETIC_ASSETS));
+
+app.post("/v1/cosmetics/entitlements", async (c) => {
+  if (!(await authorizePublisher(c.req.header("Authorization"), c.env))) return c.body(null, 401);
+  const text = await readBounded(c.req.raw.body, 40_000);
+  if (text === null) return c.body(null, 400);
+  let value: unknown;
+  try { value = JSON.parse(text); } catch { return c.body(null, 400); }
+  const command = entitlementCommand(value);
+  if (!command) return c.body(null, 400);
+  const result = await hubFor(c.env).setCosmeticEntitlements(command.xuid, command.item_ids, command.owned);
+  return result === null ? c.body(null, 400) : c.json({ owned_cosmetics: result });
+});
 
 app.post("/v1/releases", async (c) => {
   if (!(await bearerMatches(c.req.header("Authorization"), c.env.RELEASE_HOOK_SECRET))) return c.body(null, 401);

@@ -40,7 +40,7 @@ describe("handshake", () => {
     expect(challenge.type).toBe("challenge");
     client.send({ type: "proof", signature: await sign(key, challenge.nonce as string) });
     expect(await client.next()).toEqual({
-      type: "welcome", xuid: "2535412345678901", loadout_revision: 0,
+      type: "welcome", xuid: "2535412345678901", loadout_revision: 0, owned_cosmetics: [],
       lookup_batch_max: 128, lookup_bucket_capacity: 1024, lookup_refill_per_min: 512,
       cache_ttl_ms: 120_000, ping_interval_ms: 30_000, reconnect_max_ms: 300_000,
     });

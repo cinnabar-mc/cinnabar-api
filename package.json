@@ -19,8 +19,7 @@
     "deploy": "wrangler deploy",
     "cf-typegen": "wrangler types --strict-vars false",
     "typecheck": "wrangler types --strict-vars false && tsc --noEmit",
-    "test": "vitest run",
-    "check:cosmetics": "python3 art/cosmetics/check.py"
+    "test": "vitest run"
   },
   "dependencies": {
     "@cfworker/json-schema": "^4.1.1",

@@ -25,7 +25,6 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: pnpm check:cosmetics
       - run: pnpm typecheck
       - run: pnpm test
 
@@ -62,9 +61,6 @@ jobs:
           cache: pnpm
       - if: steps.head.outputs.current == 'true'
         run: pnpm install --frozen-lockfile
-      # Assets go up before the Worker so a new catalog never names a missing object.
-      - if: steps.head.outputs.current == 'true'
-        run: node scripts/sync-cosmetic-assets.mjs
       - if: steps.head.outputs.current == 'true'
         name: Configure private presence access
         env:

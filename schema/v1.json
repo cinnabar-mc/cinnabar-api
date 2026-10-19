@@ -276,6 +276,9 @@
         },
         {
           "$ref": "#/$defs/Loadout"
+        },
+        {
+          "$ref": "#/$defs/CosmeticOwnership"
         }
       ]
     },
@@ -341,6 +344,14 @@
         },
         "loadout_revision": {
           "$ref": "#/$defs/Build"
+        },
+        "owned_cosmetics": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/CosmeticItemId"
+          }
         }
       }
     },
@@ -1125,6 +1136,26 @@
                 "minimum": 1
               }
             }
+          }
+        }
+      }
+    },
+    "CosmeticOwnership": {
+      "type": "object",
+      "required": [
+        "type",
+        "owned_cosmetics"
+      ],
+      "properties": {
+        "type": {
+          "const": "cosmetic_ownership"
+        },
+        "owned_cosmetics": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/CosmeticItemId"
           }
         }
       }

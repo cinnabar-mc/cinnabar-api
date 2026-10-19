@@ -144,11 +144,13 @@ clients must support both before displaying this item.
 The original artwork retains Cinnabar's [PolyForm Noncommercial 1.0.0 license](LICENSES/cosmetics.md).
 The Worker code remains MIT-licensed.
 
-Assets live in the `COSMETIC_ASSETS` R2 bucket, keyed by their SHA-256 digest. The
-same-origin `/v1/cosmetics/assets/:hash` route streams only catalog-listed objects
-with immutable cache headers. Before deploying, create the configured bucket and
-upload each file in `assets/cosmetics/` under its filename. No bucket or deployment
-is created by the tests.
+Runtime assets and `cosmetics/catalog.json` live in the `COSMETIC_ASSETS` R2
+bucket. The private cosmetics repository publishes hash-addressed objects first,
+verifies their bytes, then promotes the catalog atomically. This Worker reads the
+catalog with a one-minute isolate cache and serves the existing same-origin
+`/v1/cosmetics/assets/:hash` URLs. The bundled metadata fallback preserves the
+original free catalog when no valid R2 release is available. Authoring files and
+production asset bytes are not bundled in this public repository.
 
 Authenticated clients send `{type:"loadout", revision, slots:{head:"cinnabar:bunny_ears"}}`.
 This replaces the account's connected-session loadout. Strictly newer revisions win
@@ -163,10 +165,18 @@ opt-out, departure and the final socket closing withdraw them with empty slots.
 A visibility or nearby change may repeat the same revision. Emotes keep their own
 lease and no longer carry cosmetic state; `hat_id` and `cosmetic` are removed.
 
-Free catalog items are owned by everyone. The Hub's `cosmetic_entitlements` table
-holds `(xuid,item_id)` grants for non-free items, checked before broadcasting. There
-is no purchase or payment path. Payments, additional items and moderation remain
-future work. Roll out the R2 assets and API first, then the matching client.
+Free catalog items are owned by everyone. The Hub SQL `cosmetic_entitlements`
+table owns `(xuid,item_id)` grants for paid items. The authenticated welcome sends
+`owned_cosmetics`; grants and revocations send `cosmetic_ownership` to connected
+account sockets. Loadout admission and replay check the database again, including
+after hibernation. Display names never authorize ownership.
+
+`POST /v1/cosmetics/entitlements` accepts `{xuid,item_ids,owned}` for explicit,
+idempotent grants or revocations. Only a signed GitHub Actions OIDC identity from
+the configured private repository ID, exact administration workflow, main branch
+and manual dispatch is accepted. Ordinary client authentication cannot call it.
+Use the private repository entitlement workflow; it writes database rows rather
+than changing an account allowlist. No payment processing is implemented.
 
 Optional animation JSON currently describes `wind` motion: an axis (`x`, `y` or `z`),
 `max_degrees`, forward `speed` in blocks/second, `rise` and `fall` response rates,
@@ -183,21 +193,16 @@ Effects may use the installed particle atlas or a 16x16 sprite region from the i
 
 ## Cosmetic ownership
 
-This repository owns the complete cosmetic catalog, editable Blockbench projects,
-textures, animations, exporter and deployable assets. See [art/cosmetics](art/cosmetics/README.md)
-for editing instructions. Run `pnpm check:cosmetics` before publishing; CI checks
-every project against its exports and the catalog's packaged hashes and byte counts.
-Keep the artwork's PolyForm Noncommercial license and attribution.
+[The private cosmetics repository](https://github.com/cinnabar-mc/cinnabar-cosmetics)
+owns editable Blockbench projects, textures, geometry, animation, emote sources,
+exports, production catalog metadata and publication checks. Preserve artwork
+license notices. This public Worker owns delivery and durable SQL entitlements;
+its tests use shared synthetic fixtures and need no private repository access.
 
-Cinnabar downloads, validates, caches and renders these assets. Its repository owns
-renderer behavior and small stable regression fixtures, not a copy of each catalog
-item. New items using supported features ship here alone. New rendering features
-need client support and focused client tests before the catalog uses them.
-
-For a full renderer compatibility check, point the client's
-`api_catalog_assets_admit_through_client_validation` test at this checkout with
-`CINNABAR_API_CHECKOUT`. This uses the actual API catalog and assets without copying
-them into the client. It complements API export checks and client feature tests.
+Cinnabar owns downloading, validation, caching, rendering and focused regression
+fixtures. Full catalog compatibility runs against the private checkout with
+`CINNABAR_COSMETICS_CHECKOUT` and the client test
+`api_catalog_assets_admit_through_client_validation`.
 
 ## Catalog emote clips
 
@@ -205,7 +210,7 @@ The optional catalog `emotes` array lists each clip's ID, display name, free
 ownership, license and hash-addressed `clip` asset. Assets use the existing
 cosmetics R2 route and immutable cache policy. Free clips are owned by everyone.
 The catalog includes the original Breakdance sequence; authoring, sampling and
-export checks live in [art/emotes](art/emotes/README.md).
+export checks live in the private cosmetics repository.
 
 `schema/v1.json` owns the version 1 clip format and limits: duration and loop
 metadata, fixed articulated joints, quaternion XYZW rotations and local offsets
