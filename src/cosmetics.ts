@@ -1,5 +1,6 @@
 import catalogJson from "./catalog.json";
 import schema from "../schema/v1.json";
+import { loadCatalog } from "./catalog-store";
 
 export const catalog = catalogJson;
 export type Item = typeof catalog.items[number];
@@ -22,8 +23,8 @@ export function admitLoadout(
 }
 
 /** Serves a versioned catalog whose ETag binds every item and asset digest. */
-export async function catalogResponse(request: Request): Promise<Response> {
-  const body = JSON.stringify(catalog);
+export async function catalogResponse(request: Request, bucket?: R2Bucket): Promise<Response> {
+  const body = JSON.stringify(bucket ? await loadCatalog(bucket) : catalog);
   const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body)));
   const etag = `"${Array.from(hash, (b) => b.toString(16).padStart(2, "0")).join("")}"`;
   const headers = { ETag: etag, "Cache-Control": "public, max-age=300", "Content-Type": "application/json" };
@@ -36,9 +37,10 @@ const assetBytes = new Map<string, ArrayBuffer>();
 
 /** Serves only reviewed, catalog-addressed R2 objects; clients verify the declared digest and size. */
 export async function assetResponse(hash: string, bucket: R2Bucket): Promise<Response> {
+  const current = await loadCatalog(bucket);
   const assets = [
-    ...catalog.items.flatMap((item) => Object.entries(item.assets).map(([kind, asset]) => ({ kind, asset, license: item.license }))),
-    ...catalog.emotes.map((item) => ({ kind: "clip", asset: item.clip, license: item.license })),
+    ...current.items.flatMap((item) => Object.entries(item.assets).map(([kind, asset]) => ({ kind, asset, license: item.license }))),
+    ...current.emotes.map((item) => ({ kind: "clip", asset: item.clip, license: item.license })),
   ];
   const entry = assets.find(({ asset }) => asset.sha256 === hash);
   if (!entry) return new Response(null, { status: 404 });

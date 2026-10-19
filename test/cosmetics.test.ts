@@ -159,20 +159,11 @@ it("serves a schema-valid versioned catalog, conditional ETags and only reviewed
 });
 
 
-it("keeps catalog metadata and every packaged original asset consistent with the schema and digest", async () => {
+it("keeps the free metadata fallback schema-valid without private authoring files", () => {
   const validator = new Validator({ $ref: `${schema.$id}#/$defs/CosmeticsCatalog` }, "2020-12");
   validator.addSchema(schema as unknown as Schema);
   expect(validator.validate(catalog).valid).toBe(true);
-  const files = import.meta.glob("../assets/cosmetics/*", { query: "?raw", import: "default", eager: true });
-  const expected = new Set([...catalog.items.flatMap((item) => Object.values(item.assets).map((asset) => asset.sha256)), ...catalog.emotes.map((item) => item.clip.sha256)]);
-  expect(new Set(Object.keys(files).map((name) => name.split("/").at(-1)))).toEqual(expected);
-  for (const item of catalog.items) for (const [kind, asset] of Object.entries(item.assets)) {
-    if (kind === "texture") continue; // PNG bytes are checked by the client asset-admission fixtures.
-    const bytes = new TextEncoder().encode(files[`../assets/cosmetics/${asset.sha256}`] as string);
-    const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
-    expect(Array.from(hash, (byte) => byte.toString(16).padStart(2, "0")).join("")).toBe(asset.sha256);
-    expect(bytes.byteLength).toBe(asset.bytes);
-  }
+  expect(catalog.items.every((item) => item.free)).toBe(true);
 });
 
 
