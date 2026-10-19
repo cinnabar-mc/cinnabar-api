@@ -9,6 +9,7 @@ import {
   FLOOD_FRAME_MAX,
   FLOOD_BYTE_MAX,
   HANDSHAKE_TIMEOUT_MS,
+  SESSION_IDLE_TIMEOUT_MS,
   MAX_CONNECTIONS_PER_XUID,
   LOOKUP_BUDGET_TTL_MS,
   RATE_LIMITED_REPLY_MAX,
@@ -44,7 +45,7 @@ type Session =
       channel: Channel;
       visible: boolean;
     }
-  | { stage: "ready"; xuid: string; uuid: string; channel: Channel; visible: boolean;
+  | { stage: "ready"; xuid: string; uuid: string; channel: Channel; visible: boolean; lastSeen?: number;
       loadout?: LoadoutState;
       watching?: string[]; emote?: { id: string; elapsed: number; updated: number } };
 
@@ -100,13 +101,15 @@ export class Hub extends DurableObject<Env> {
     }
   }
 
-  /** Counts unique visible accounts with an open authenticated socket, excluding retained presence. */
+  /** Counts unique visible accounts with a fresh authenticated socket, excluding retained presence. */
   onlineCount(): number {
+    const now = Date.now();
     let count = 0;
     for (const sockets of this.byXuid.values()) {
       for (const ws of sockets) {
         const session = this.sessions.get(ws);
-        if (ws.readyState === WebSocket.OPEN && session?.stage === "ready" && session.visible) {
+        if (ws.readyState === WebSocket.OPEN && session?.stage === "ready" && session.visible
+          && this.idleDeadline(ws, session) > now) {
           count++;
           break;
         }
@@ -173,6 +176,8 @@ export class Hub extends DurableObject<Env> {
     this.alarmDeadline = Infinity;
     const now = Date.now();
     let next = this.expireHandshakes(now);
+    const idle = this.expireIdleSessions(now);
+    if (idle !== null) next = next === null ? idle : Math.min(next, idle);
     this.ctx.storage.sql.exec("DELETE FROM lookup_budgets WHERE updated_at <= ?", now - LOOKUP_BUDGET_TTL_MS);
     const expiry = this.ctx.storage.sql.exec<{ expiry: number | null }>(
       "SELECT MIN(updated_at) + ? AS expiry FROM lookup_budgets", LOOKUP_BUDGET_TTL_MS,
@@ -200,6 +205,25 @@ export class Hub extends DurableObject<Env> {
     return next;
   }
 
+  /** Uses runtime heartbeat timestamps even while hibernating; older attachments retain their original age. */
+  private idleDeadline(ws: WebSocket, session: Ready): number {
+    const heartbeat = this.ctx.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? 0;
+    return Math.max(session.lastSeen ?? session.traffic.startedAt, heartbeat) + SESSION_IDLE_TIMEOUT_MS;
+  }
+
+  /** Closes silent authenticated sockets and returns the next deadline, optionally restricted to one account. */
+  private expireIdleSessions(now: number, sockets: Iterable<WebSocket> = this.sessions.keys()): number | null {
+    let next: number | null = null;
+    for (const ws of sockets) {
+      const session = this.sessions.get(ws);
+      if (session?.stage !== "ready") continue;
+      const deadline = this.idleDeadline(ws, session);
+      if (deadline <= now) this.close(ws, 1001, "heartbeat timeout");
+      else next = next === null ? deadline : Math.min(next, deadline);
+    }
+    return next;
+  }
+
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     try {
       await this.handleMessage(ws, message);
@@ -213,6 +237,7 @@ export class Hub extends DurableObject<Env> {
     let attachment = this.sessions.get(ws);
     if (!attachment) return;
     if (message === "ping") {
+      if (attachment.stage === "ready") this.save(ws, { ...attachment, lastSeen: Date.now() });
       try {
         ws.send("pong");
       } catch {
@@ -237,7 +262,7 @@ export class Hub extends DurableObject<Env> {
       this.count("overload_closed");
       return this.close(ws, Close.policyViolation, "message budget exceeded");
     }
-    attachment = { ...attachment, traffic };
+    attachment = attachment.stage === "ready" ? { ...attachment, traffic, lastSeen: now } : { ...attachment, traffic };
     this.save(ws, attachment);
     const decoded = decodeClientMessage(message);
     switch (decoded.kind) {
@@ -317,14 +342,17 @@ export class Hub extends DurableObject<Env> {
     if (!valid) return this.reject(ws);
     const { xuid, channel, visible } = pending;
     const uuid = await identityUuid(xuid);
+    await this.scheduleAlarm(Date.now() + SESSION_IDLE_TIMEOUT_MS);
     // Read before indexing so a concurrent recordRelease reaches this socket exactly once, via one path or the other.
     const latest = await this.latestRelease(channel);
     if (!this.sessions.has(ws)) return;
     // The alarm skips sockets it can't see as handshaking, so a proof that outlived its deadline is refused here.
-    if (pending.deadline <= Date.now()) {
+    const now = Date.now();
+    if (pending.deadline <= now) {
       this.count("authentication_failed");
       return this.close(ws, Close.unauthorized, "handshake timeout");
     }
+    this.expireIdleSessions(now, this.byXuid.get(xuid) ?? []);
     if ((this.byXuid.get(xuid)?.size ?? 0) >= MAX_CONNECTIONS_PER_XUID) {
       this.count("admission_refused");
       return this.close(ws, Close.stayAway, `retry_after=${CONNECTION_RETRY_AFTER_S}`);
@@ -337,7 +365,7 @@ export class Hub extends DurableObject<Env> {
       .filter((session): session is Ready => session?.stage === "ready")
       .map((session) => session.loadout).filter((value): value is LoadoutState => value !== undefined)
       .sort((a, b) => b.revision - a.revision)[0];
-    this.save(ws, { stage: "ready", xuid, uuid, channel, visible, loadout });
+    this.save(ws, { stage: "ready", xuid, uuid, channel, visible, loadout, lastSeen: now });
     send(ws, { type: "welcome", xuid, loadout_revision: loadout?.revision ?? 0, ...SERVER_PARAMETERS });
     if (latest && compareReleases(latest.version, latest.build, pending.clientVersion, pending.clientBuild) > 0) {
       send(ws, { type: "release", ...latest });

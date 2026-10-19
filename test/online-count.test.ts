@@ -6,13 +6,18 @@ import { ONLINE_COUNT_TTL_MS } from "../src/routing";
 import { connect, hub, installFakeIssuer, login, type Client } from "./helpers";
 
 const open: Client[] = [];
+const authenticated = new Set<Client>();
 beforeAll(installFakeIssuer);
-afterEach(() => Promise.all(open.splice(0).map((client) => (client.close(), client.closed))));
+afterEach(async () => {
+  authenticated.clear();
+  await Promise.all(open.splice(0).map((client) => (client.close(), client.closed)));
+});
 
 /** Logs in a test account and registers its socket for cleanup. */
 async function player(options: Parameters<typeof login>[0] = {}) {
   const { client } = await login(options);
   open.push(client);
+  authenticated.add(client);
   return client;
 }
 
@@ -29,7 +34,16 @@ async function count() {
 /** Reads the aggregate with the clock moved `offset` ms ahead, leaving any cached count in place. */
 async function cachedCount(offset: number) {
   const clock = vi.spyOn(Date, "now").mockReturnValue(base + offset);
-  const response = await exports.default.fetch("https://api.test/v1/presence/count").finally(() => clock.mockRestore());
+  let response: Response;
+  try {
+    // These fixtures stay active while the clock advances through successive cache lifetimes.
+    for (const client of authenticated) {
+      if (client.ws.readyState === WebSocket.OPEN) await client.lookup([]);
+    }
+    response = await exports.default.fetch("https://api.test/v1/presence/count");
+  } finally {
+    clock.mockRestore();
+  }
   expect(response.status).toBe(200);
   expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
   expect(response.headers.get("Cache-Control")).toBe("public, max-age=30");
