@@ -21,9 +21,11 @@ is `retry_after=<seconds>`. Clients wait at least that long plus jitter before r
 and honour HTTP 429 `Retry-After` on dial. Unknown fields are ignored; unknown message types
 are ignored after authentication. During the handshake only the expected message is accepted.
 The text frame `ping` gets `pong` without waking the Hub.
-Authenticated sockets expire after 30 minutes without a heartbeat or other client traffic. The
+Authenticated sockets expire after three missed heartbeat intervals (90 seconds by default). The
 online count excludes expired sessions even before their sockets close; alarm maintenance closes
 them with `1001`. Automatic heartbeat timestamps survive hibernation.
+Reconnects reclaim expired account slots before the per-account connection limit is checked.
+The public online count retains its 30-second cache.
 
 - Connections: at most 20,000 per Hub, including closing sockets; at most 8 pending handshakes
   per IPv4 address or IPv6 /64, and at most 4 ready sockets per XUID. Ready sockets do not count

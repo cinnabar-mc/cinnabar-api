@@ -1,8 +1,8 @@
 import { runInDurableObject } from "cloudflare:test";
-import { env } from "cloudflare:workers";
+import { env, exports } from "cloudflare:workers";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
 import { Hub } from "../src/hub";
-import { SESSION_IDLE_TIMEOUT_MS } from "../src/protocol";
+import { MAX_CONNECTIONS_PER_XUID, SESSION_IDLE_TIMEOUT_MS } from "../src/protocol";
 import { hub, installFakeIssuer, login, type Client } from "./helpers";
 
 const open: Client[] = [];
@@ -87,4 +87,44 @@ it("keeps recent client traffic online and closes silent sockets during maintena
   });
   expect((await active.next()).type).toBe("lookup_result");
   expect((await silent.closed).code).toBe(1001);
+});
+
+it("refreshes the public count without retaining an expired account", async () => {
+  await player();
+  const response = await exports.default.fetch("https://api.test/v1/presence/count");
+  expect(await response.json()).toEqual({ online: 1 });
+  const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + SESSION_IDLE_TIMEOUT_MS);
+  try {
+    const expired = await exports.default.fetch("https://api.test/v1/presence/count");
+    expect(await expired.json()).toEqual({ online: 0 });
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+it.each([true, false])("ignores a stale visible duplicate when a fresh socket is visible=%s", async (visible) => {
+  const now = Date.now();
+  const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+  try {
+    await player();
+    clock.mockReturnValue(now + SESSION_IDLE_TIMEOUT_MS - 1);
+    await player("101", visible);
+    clock.mockReturnValue(now + SESSION_IDLE_TIMEOUT_MS);
+    await runInDurableObject(hub(), (instance: Hub) => {
+      expect(instance.onlineCount()).toBe(visible ? 1 : 0);
+    });
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+it("reclaims stale account slots before admitting a reconnect", async () => {
+  for (let i = 0; i < MAX_CONNECTIONS_PER_XUID; i++) await player();
+  const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + SESSION_IDLE_TIMEOUT_MS);
+  try {
+    await player();
+    await runInDurableObject(hub(), (instance: Hub) => expect(instance.onlineCount()).toBe(1));
+  } finally {
+    clock.mockRestore();
+  }
 });

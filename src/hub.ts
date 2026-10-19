@@ -211,11 +211,12 @@ export class Hub extends DurableObject<Env> {
     return Math.max(session.lastSeen ?? session.traffic.startedAt, heartbeat) + SESSION_IDLE_TIMEOUT_MS;
   }
 
-  /** Closes silent authenticated sockets and returns the next heartbeat deadline. */
-  private expireIdleSessions(now: number): number | null {
+  /** Closes silent authenticated sockets and returns the next deadline, optionally restricted to one account. */
+  private expireIdleSessions(now: number, sockets: Iterable<WebSocket> = this.sessions.keys()): number | null {
     let next: number | null = null;
-    for (const [ws, session] of this.sessions) {
-      if (session.stage !== "ready") continue;
+    for (const ws of sockets) {
+      const session = this.sessions.get(ws);
+      if (session?.stage !== "ready") continue;
       const deadline = this.idleDeadline(ws, session);
       if (deadline <= now) this.close(ws, 1001, "heartbeat timeout");
       else next = next === null ? deadline : Math.min(next, deadline);
@@ -341,14 +342,17 @@ export class Hub extends DurableObject<Env> {
     if (!valid) return this.reject(ws);
     const { xuid, channel, visible } = pending;
     const uuid = await identityUuid(xuid);
+    await this.scheduleAlarm(Date.now() + SESSION_IDLE_TIMEOUT_MS);
     // Read before indexing so a concurrent recordRelease reaches this socket exactly once, via one path or the other.
     const latest = await this.latestRelease(channel);
     if (!this.sessions.has(ws)) return;
     // The alarm skips sockets it can't see as handshaking, so a proof that outlived its deadline is refused here.
-    if (pending.deadline <= Date.now()) {
+    const now = Date.now();
+    if (pending.deadline <= now) {
       this.count("authentication_failed");
       return this.close(ws, Close.unauthorized, "handshake timeout");
     }
+    this.expireIdleSessions(now, this.byXuid.get(xuid) ?? []);
     if ((this.byXuid.get(xuid)?.size ?? 0) >= MAX_CONNECTIONS_PER_XUID) {
       this.count("admission_refused");
       return this.close(ws, Close.stayAway, `retry_after=${CONNECTION_RETRY_AFTER_S}`);
@@ -361,9 +365,7 @@ export class Hub extends DurableObject<Env> {
       .filter((session): session is Ready => session?.stage === "ready")
       .map((session) => session.loadout).filter((value): value is LoadoutState => value !== undefined)
       .sort((a, b) => b.revision - a.revision)[0];
-    const lastSeen = Date.now();
-    this.save(ws, { stage: "ready", xuid, uuid, channel, visible, loadout, lastSeen });
-    await this.scheduleAlarm(lastSeen + SESSION_IDLE_TIMEOUT_MS);
+    this.save(ws, { stage: "ready", xuid, uuid, channel, visible, loadout, lastSeen: now });
     send(ws, { type: "welcome", xuid, loadout_revision: loadout?.revision ?? 0, ...SERVER_PARAMETERS });
     if (latest && compareReleases(latest.version, latest.build, pending.clientVersion, pending.clientBuild) > 0) {
       send(ws, { type: "release", ...latest });

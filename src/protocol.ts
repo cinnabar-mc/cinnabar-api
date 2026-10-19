@@ -25,8 +25,8 @@ export const FLOOD_WINDOW_MS = 10_000;
 export const FLOOD_FRAME_MAX = 30;
 export const FLOOD_BYTE_MAX = 64 * 1024;
 export const HANDSHAKE_TIMEOUT_MS = 10_000;
-/** How long a socket may be silent before its online status and connection expire. */
-export const SESSION_IDLE_TIMEOUT_MS = 30 * 60_000;
+/** Ready sockets expire after three missed client heartbeat intervals. */
+export const SESSION_IDLE_TIMEOUT_MS = 3 * SERVER_PARAMETERS.ping_interval_ms;
 export const MAX_CONNECTIONS = 20_000;
 export const MAX_CONNECTIONS_PER_IP = 8;
 export const CONNECTION_RETRY_AFTER_S = 10;
