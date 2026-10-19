@@ -91,13 +91,18 @@ export class Hub extends DurableObject<Env> {
     ctx.storage.sql.exec("INSERT OR IGNORE INTO hub_config (key, value) VALUES ('ip_salt', ?)", crypto.randomUUID());
     this.ipSalt = ctx.storage.sql.exec<{ value: string }>("SELECT value FROM hub_config WHERE key = 'ip_salt'").one().value;
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+    let nextIdle = Infinity;
     for (const ws of ctx.getWebSockets()) {
       this.sockets.add(ws);
       const attachment = ws.deserializeAttachment() as Attachment | typeof CLOSED | null;
       // Handshaking sockets are restored too, so the alarm still closes them at their deadline.
       if (attachment && attachment.stage !== "closed" && ws.readyState === WebSocket.OPEN) {
         this.save(ws, attachment, false);
+        if (attachment.stage === "ready") nextIdle = Math.min(nextIdle, this.idleDeadline(ws, attachment));
       }
+    }
+    if (Number.isFinite(nextIdle)) {
+      ctx.blockConcurrencyWhile(() => this.scheduleAlarm(nextIdle));
     }
   }
 

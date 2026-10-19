@@ -1,4 +1,4 @@
-import { runInDurableObject } from "cloudflare:test";
+import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
 import { Hub } from "../src/hub";
@@ -127,4 +127,23 @@ it("reclaims stale account slots before admitting a reconnect", async () => {
   } finally {
     clock.mockRestore();
   }
+});
+
+it("restores idle cleanup for legacy sessions after their previous alarms have drained", async () => {
+  const client = await player();
+  await runInDurableObject(hub(), async (_, state) => {
+    const ws = state.getWebSockets().find((socket) => socket.deserializeAttachment()?.xuid === "101")!;
+    const attachment = ws.deserializeAttachment();
+    delete attachment.lastSeen;
+    attachment.traffic.startedAt = Date.now() - SESSION_IDLE_TIMEOUT_MS;
+    ws.serializeAttachment(attachment);
+    await state.storage.deleteAlarm();
+  });
+  await evictDurableObject(hub());
+  await runInDurableObject(hub(), async (instance: Hub, state) => {
+    expect(instance.onlineCount()).toBe(0);
+    expect(await state.storage.getAlarm()).not.toBeNull();
+  });
+  await runDurableObjectAlarm(hub());
+  expect((await client.closed).code).toBe(1001);
 });
