@@ -46,6 +46,10 @@ The text frame `ping` gets `pong` without waking the Hub.
 
 - The public online count includes each visible connected account once, even with several sockets.
   Visibility off excludes that socket; an account counts while any of its open sockets is visible.
+  Ready sockets stop counting after three missed heartbeat intervals (90 seconds by default).
+  Client messages and the runtime's automatic ping replies renew activity across hibernation.
+  Maintenance closes idle sockets with `1001`; reconnects reclaim their stale account slots.
+  The public count still uses its 30-second cache.
 - Lookups answer “uses Cinnabar,” rather than providing an exact online status. Visible accounts
   linger in Hub memory for `PRESENCE_LINGER_MS` (30 minutes) after their last socket closes.
   Visibility off clears retained presence immediately; another visible socket can still make

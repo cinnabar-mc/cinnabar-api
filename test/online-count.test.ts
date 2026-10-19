@@ -16,19 +16,14 @@ async function player(options: Parameters<typeof login>[0] = {}) {
   return client;
 }
 
-/** Fixed base for the mocked clock, so cache ages are exactly the offset differences. */
-const base = Date.now();
-let skipped = 0;
-
-/** Reads the public aggregate without authentication, past any count this isolate has cached. */
+/** Reads the live aggregate without advancing the clock used for socket liveness. */
 async function count() {
-  skipped += ONLINE_COUNT_TTL_MS;
-  return cachedCount(skipped);
+  return { online: await hub().onlineCount() };
 }
 
-/** Reads the aggregate with the clock moved `offset` ms ahead, leaving any cached count in place. */
-async function cachedCount(offset: number) {
-  const clock = vi.spyOn(Date, "now").mockReturnValue(base + offset);
+/** Reads the public aggregate at `now`, leaving any cached count in place. */
+async function cachedCount(now: number) {
+  const clock = vi.spyOn(Date, "now").mockReturnValue(now);
   const response = await exports.default.fetch("https://api.test/v1/presence/count").finally(() => clock.mockRestore());
   expect(response.status).toBe(200);
   expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
@@ -84,8 +79,9 @@ it("does not restore a server-closed account before its close completes", async 
 });
 
 it("reuses a count for its time to live, then asks the hub again", async () => {
-  expect(await count()).toEqual({ online: 0 });
+  const now = Date.now();
+  expect(await cachedCount(now)).toEqual({ online: 0 });
   await player({ xuid: "101" });
-  expect(await cachedCount(skipped + ONLINE_COUNT_TTL_MS - 1)).toEqual({ online: 0 });
-  expect(await count()).toEqual({ online: 1 });
+  expect(await cachedCount(now + ONLINE_COUNT_TTL_MS - 1)).toEqual({ online: 0 });
+  expect(await cachedCount(now + ONLINE_COUNT_TTL_MS)).toEqual({ online: 1 });
 });

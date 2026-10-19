@@ -31,6 +31,8 @@ export const CONNECTION_RETRY_AFTER_S = 10;
 export const JWKS_REFETCH_INTERVAL_MS = 60_000;
 export const MAX_CONNECTIONS_PER_XUID = 4;
 export const PRESENCE_LINGER_MS = 30 * 60_000;
+/** Ready sockets expire after three missed client heartbeat intervals. */
+export const SESSION_IDLE_TIMEOUT_MS = 3 * SERVER_PARAMETERS.ping_interval_ms;
 export const LOOKUP_BUDGET_TTL_MS = 300_000;
 export const RATE_LIMITED_REPLY_MAX = 3;
 export const PROOF_CONTEXT = "cinnabar-api/v1/auth:";
