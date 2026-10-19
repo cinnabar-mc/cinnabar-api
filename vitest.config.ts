@@ -6,7 +6,7 @@ export default defineConfig({
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },
       miniflare: {
-        bindings: { ISSUER: "https://issuer.test", RELEASE_HOOK_SECRET: "test-hook-secret" },
+        bindings: { ISSUER: "https://issuer.test", RELEASE_HOOK_SECRET: "test-hook-secret", PRESENCE_READ_SECRET: "test-presence-secret" },
       },
     }),
   ],

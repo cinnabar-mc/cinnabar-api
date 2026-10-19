@@ -1,1 +1,2 @@
 RELEASE_HOOK_SECRET=local-dev-secret
+PRESENCE_READ_SECRET=local-presence-read-secret
