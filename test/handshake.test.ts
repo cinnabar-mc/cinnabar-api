@@ -19,13 +19,16 @@ async function expectRejectedToken(token: string) {
 }
 
 describe("handshake", () => {
-  it("keeps display names out of handshake attachments", async () => {
+  it("retains verified display names without retaining identity tokens", async () => {
     const key = await clientKey();
     const client = track(await connect());
-    client.send(hello(await mintToken({ cpk: key.cpk, xname: "Alex" })));
+    const token = await mintToken({ cpk: key.cpk, xname: "Alex" });
+    client.send(hello(token));
     await client.next();
     await runInDurableObject(hub(), (_: Hub, state) => {
-      expect(JSON.stringify(state.getWebSockets().map((ws) => ws.deserializeAttachment()))).not.toContain("Alex");
+      const attachments = state.getWebSockets().map((ws) => ws.deserializeAttachment());
+      expect(attachments).toContainEqual(expect.objectContaining({ displayName: "Alex", stage: "proof" }));
+      expect(JSON.stringify(attachments)).not.toContain(token);
     });
   });
 
