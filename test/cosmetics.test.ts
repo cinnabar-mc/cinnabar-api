@@ -103,11 +103,10 @@ it.each([
     const sent = vi.spyOn(receiver, "send");
     try {
       const rebuilt = new Hub(state, env);
-      const closing = rebuilt.webSocketClose(publisher, 1000, "");
+      await rebuilt.webSocketClose(publisher, 1000, "");
       expect(sent.mock.calls.map(([frame]) => JSON.parse(frame as string))).toEqual([
         { type: "loadout", xuid: A, uuid: await identityUuid(A), revision: 4, slots: remaining ? { head: item.id } : {} },
       ]);
-      await closing;
       sent.mockClear();
       await rebuilt.webSocketClose(publisher, 1000, "");
       expect(sent).not.toHaveBeenCalled();

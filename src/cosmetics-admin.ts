@@ -1,8 +1,10 @@
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey, type JWTPayload } from "jose";
+import schema from "../schema/v1.json";
 
 const ISSUER = "https://token.actions.githubusercontent.com";
 export const COSMETICS_ADMIN_AUDIENCE = "cinnabar:cosmetics-entitlements";
 const keys = createRemoteJWKSet(new URL(`${ISSUER}/.well-known/jwks`));
+const itemIdPattern = new RegExp(schema.$defs.CosmeticItemId.pattern);
 
 /** Checks immutable repository identity and the exact private main-branch administration workflow. */
 export function trustedPublisher(claims: JWTPayload, env: Pick<Env, "COSMETICS_REPOSITORY_ID" | "COSMETICS_ADMIN_WORKFLOW">): boolean {
@@ -34,6 +36,6 @@ export function entitlementCommand(value: unknown): { xuid: string; item_ids: st
   if (Object.keys(command).some((key) => !["xuid", "item_ids", "owned"].includes(key))) return null;
   if (typeof command.xuid !== "string" || !/^[0-9]{1,20}$/.test(command.xuid) || typeof command.owned !== "boolean"
     || !Array.isArray(command.item_ids) || command.item_ids.length < 1 || command.item_ids.length > 256
-    || command.item_ids.some((id) => typeof id !== "string" || !/^[a-z0-9_.:-]{1,128}$/.test(id))) return null;
+    || command.item_ids.some((id) => typeof id !== "string" || id.length > schema.$defs.CosmeticItemId.maxLength || !itemIdPattern.test(id))) return null;
   return { xuid: command.xuid, item_ids: [...new Set(command.item_ids as string[])], owned: command.owned };
 }

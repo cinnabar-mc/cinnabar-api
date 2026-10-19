@@ -203,6 +203,7 @@ export class Hub extends DurableObject<Env> {
   }
 
   override async alarm(): Promise<void> {
+    this.cosmeticCatalog = await loadCatalog(this.env.COSMETIC_ASSETS);
     this.alarmDeadline = Infinity;
     const now = Date.now();
     let next = this.expireHandshakes(now);
@@ -322,6 +323,7 @@ export class Hub extends DurableObject<Env> {
   }
 
   override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+    this.cosmeticCatalog = await loadCatalog(this.env.COSMETIC_ASSETS);
     this.sockets.delete(ws);
     this.forget(ws);
     try {
@@ -332,6 +334,7 @@ export class Hub extends DurableObject<Env> {
   }
 
   override async webSocketError(ws: WebSocket): Promise<void> {
+    this.cosmeticCatalog = await loadCatalog(this.env.COSMETIC_ASSETS);
     this.sockets.delete(ws);
     this.forget(ws);
   }
@@ -503,10 +506,9 @@ export class Hub extends DurableObject<Env> {
 
   /** Reads paid ownership from the durable database, including after hibernation. */
   private ownedCosmetics(xuid: string): string[] {
-    const paid = new Set(this.cosmeticCatalog.items.filter((item) => !item.free).map((item) => item.id));
     return this.ctx.storage.sql.exec<{ item_id: string }>(
       "SELECT item_id FROM cosmetic_entitlements WHERE xuid = ? ORDER BY item_id", xuid,
-    ).toArray().map((row) => row.item_id).filter((id) => paid.has(id));
+    ).toArray().map((row) => row.item_id);
   }
 
   /** Applies a validated administrative grant or revocation atomically and updates connected accounts. */

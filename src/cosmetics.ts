@@ -1,6 +1,6 @@
 import catalogJson from "./catalog.json";
 import schema from "../schema/v1.json";
-import { loadCatalog } from "./catalog-store";
+import { loadCatalog, refreshCatalogOnMiss, type Catalog } from "./catalog-store";
 
 export const catalog = catalogJson;
 export type Item = typeof catalog.items[number];
@@ -37,12 +37,14 @@ const assetBytes = new Map<string, ArrayBuffer>();
 
 /** Serves only reviewed, catalog-addressed R2 objects; clients verify the declared digest and size. */
 export async function assetResponse(hash: string, bucket: R2Bucket): Promise<Response> {
-  const current = await loadCatalog(bucket);
-  const assets = [
+  if (!/^[a-f0-9]{64}$/.test(hash)) return new Response(null, { status: 404 });
+  /** Finds the immutable descriptor and its delivery headers in an admitted release. */
+  const find = (current: Catalog) => [
     ...current.items.flatMap((item) => Object.entries(item.assets).map(([kind, asset]) => ({ kind, asset, license: item.license }))),
     ...current.emotes.map((item) => ({ kind: "clip", asset: item.clip, license: item.license })),
-  ];
-  const entry = assets.find(({ asset }) => asset.sha256 === hash);
+  ].find(({ asset }) => asset.sha256 === hash);
+  const current = await loadCatalog(bucket);
+  const entry = find(current) ?? find(await refreshCatalogOnMiss(bucket));
   if (!entry) return new Response(null, { status: 404 });
   let bytes = assetBytes.get(hash);
   if (!bytes) {
