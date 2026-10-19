@@ -25,6 +25,8 @@ export const FLOOD_WINDOW_MS = 10_000;
 export const FLOOD_FRAME_MAX = 30;
 export const FLOOD_BYTE_MAX = 64 * 1024;
 export const HANDSHAKE_TIMEOUT_MS = 10_000;
+/** Three missed keepalives expire a connected account's online status and socket. */
+export const SESSION_IDLE_TIMEOUT_MS = 3 * SERVER_PARAMETERS.ping_interval_ms;
 export const MAX_CONNECTIONS = 20_000;
 export const MAX_CONNECTIONS_PER_IP = 8;
 export const CONNECTION_RETRY_AFTER_S = 10;

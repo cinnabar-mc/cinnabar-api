@@ -21,6 +21,9 @@ is `retry_after=<seconds>`. Clients wait at least that long plus jitter before r
 and honour HTTP 429 `Retry-After` on dial. Unknown fields are ignored; unknown message types
 are ignored after authentication. During the handshake only the expected message is accepted.
 The text frame `ping` gets `pong` without waking the Hub.
+Authenticated sockets expire after three advertised ping intervals without a heartbeat or other
+client traffic. The online count excludes expired sessions even before their sockets close;
+alarm maintenance closes them with `1001`. Automatic heartbeat timestamps survive hibernation.
 
 - Connections: at most 20,000 per Hub, including closing sockets; at most 8 pending handshakes
   per IPv4 address or IPv6 /64, and at most 4 ready sockets per XUID. Ready sockets do not count
@@ -45,15 +48,16 @@ The text frame `ping` gets `pong` without waking the Hub.
 ## Privacy
 
 - The public online count includes each visible connected account once, even with several sockets.
-  Visibility off excludes that socket; an account counts while any of its open sockets is visible.
+  Visibility off excludes that socket; an account counts while any of its fresh open sockets is visible.
 - Lookups answer “uses Cinnabar,” rather than providing an exact online status. Visible accounts
   linger in Hub memory for `PRESENCE_LINGER_MS` (30 minutes) after their last socket closes.
   Visibility off clears retained presence immediately; another visible socket can still make
   the account visible. Linger is best effort and is lost when the Hub hibernates or restarts.
 - Presence UUIDs are derived from the verified XUID, never supplied by the client at login.
 - Connection attachments survive hibernation and hold the XUID, UUID, visibility, channel, and socket
-  flood counters. Handshakes (at most 10 s) temporarily hold the nonce, public key, client version
-  and build. Display names and tokens are not stored in attachments or sent in welcome.
+  flood counters and latest client-message time. Handshakes (at most 10 s) temporarily hold the
+  nonce, public key, client version and build. Display names and tokens are not stored in
+  attachments or sent in welcome.
 - Account lookup budgets survive reconnects and hibernation in Durable Object storage. Each
   record holds only an XUID, remaining token count and refill timestamp; an alarm removes records
   unused for five minutes. Requested rosters and lookup results are not retained.

@@ -71,12 +71,14 @@ describe("UUID lookup", () => {
       const ws = state.getWebSockets().find((ws) => ws.deserializeAttachment()?.stage === "ready")!;
       const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 30 * 60_000 + 1);
       try {
+        await instance.webSocketMessage(ws, "ping");
         await instance.alarm();
         await instance.webSocketMessage(ws, JSON.stringify({ type: "lookup", id: 8, xuids: [ALEX], uuids: [ALEX_UUID] }));
       } finally {
         clock.mockRestore();
       }
     });
+    expect(await me.next()).toEqual({ type: "pong" });
     expect(await me.next()).toEqual({ type: "lookup_result", id: 8, cinnabar: [], cinnabar_uuids: [] });
   });
 
