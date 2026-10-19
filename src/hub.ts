@@ -1,5 +1,6 @@
 import { admitLoadout } from "./cosmetics";
 import { DurableObject } from "cloudflare:workers";
+import { PresenceHistory, type HistoryRange, type OnlineHistory } from "./presence-history";
 import { IssuerUnavailable, encodeBase64Url, identityUuid, issuerKeys, verifyProof } from "./identity";
 import {
   Close,
@@ -69,6 +70,7 @@ const releaseKey = (channel: Channel) => `release:${channel}`;
  * authenticated, so lookups and broadcasts go through in-memory indexes rebuilt from attachments on each wake.
  */
 export class Hub extends DurableObject<Env> {
+  private readonly history: PresenceHistory;
   private readonly sessions = new Map<WebSocket, Attachment>();
   private readonly byXuid = new Map<string, Set<WebSocket>>();
   private readonly byUuid = new Map<string, Set<WebSocket>>();
@@ -83,6 +85,7 @@ export class Hub extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.history = new PresenceHistory(ctx.storage.sql);
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS lookup_budgets (
       xuid TEXT PRIMARY KEY, tokens REAL NOT NULL, updated_at INTEGER NOT NULL
     )`);
@@ -116,6 +119,16 @@ export class Hub extends DurableObject<Env> {
       }
     }
     return count;
+  }
+
+  /** Records the current authoritative count independently of website visitors. */
+  recordOnlineCount(): void {
+    this.history.record(Date.now(), this.onlineCount());
+  }
+
+  /** Reads anonymous samples for a supported chart window. */
+  onlineHistory(range: HistoryRange): OnlineHistory {
+    return this.history.read(Date.now(), range);
   }
 
   override async fetch(request: Request): Promise<Response> {

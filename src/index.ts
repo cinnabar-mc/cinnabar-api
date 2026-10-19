@@ -1,7 +1,8 @@
 import { catalogResponse, assetResponse } from "./cosmetics";
 import { Hono } from "hono";
 import { isReleaseHookRequest } from "./protocol";
-import { cachedOnlineCount, hubFor } from "./routing";
+import { cachedOnlineCount, cachedOnlineHistory, hubFor } from "./routing";
+import { HISTORY_RANGES, type HistoryRange } from "./presence-history";
 
 export { Hub } from "./hub";
 
@@ -20,6 +21,14 @@ app.get("/v1/presence/count", async (c) => {
 });
 
 app.get("/v1/cosmetics/catalog", (c) => catalogResponse(c.req.raw));
+app.get("/v1/presence/history", async (c) => {
+  c.header("Access-Control-Allow-Origin", "*");
+  const range = c.req.query("range") ?? "24h";
+  if (!Object.hasOwn(HISTORY_RANGES, range)) return c.json({ error: "unsupported range" }, 400);
+  return c.json(await cachedOnlineHistory(c.env, range as HistoryRange), 200, {
+    "Cache-Control": "public, max-age=60",
+  });
+});
 app.get("/v1/cosmetics/assets/:hash", (c) => assetResponse(c.req.param("hash"), c.env.COSMETIC_ASSETS));
 
 app.post("/v1/releases", async (c) => {
@@ -85,4 +94,10 @@ async function bearerMatches(header: string | undefined, secret: string | undefi
   return diff === 0;
 }
 
-export default app;
+export default {
+  fetch: app.fetch,
+  /** Samples at execution time, so delayed cron delivery cannot fabricate past counts. */
+  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    await hubFor(env).recordOnlineCount();
+  },
+} satisfies ExportedHandler<Env>;

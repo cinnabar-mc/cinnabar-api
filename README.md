@@ -11,6 +11,7 @@ messages against it.
 | --- | --- |
 | `GET /v1/health` | `{"ok":true,"api":"v1"}` |
 | `GET /v1/presence/count` | Public `{"online":0}` count of unique connected, authenticated accounts with visibility on. Allows cross-origin reads and caching for 30 seconds. No identifiers or retained offline presence. |
+| `GET /v1/presence/history?range=24h` | Public anonymous player-count history. Ranges: `24h` (one minute), `7d` (ten minutes), `30d` (one hour). Allows cross-origin reads and caching for 60 seconds. |
 | `POST /v1/releases` | Release hook. `Authorization: Bearer <RELEASE_HOOK_SECRET>`, body `{"channel","version","build"}`; records and broadcasts only a newer (version, build) pair. Repeats and older records are no-ops. Omitted v1 builds mean zero. |
 | `GET /v1/connect` | WebSocket. The client authenticates with a Minecraft multiplayer token plus an ES384 proof of its key, then can toggle visibility, look up which XUIDs or UUIDs recently used Cinnabar, and receives release pushes. |
 
@@ -205,3 +206,16 @@ in leg-height units. Clients reject unsupported versions, malformed channels and
 oversized clips. Shared synthetic conformance cases in `schema/fixtures` exercise
 the server validator and client parser. Publish the API assets before the client
 that consumes them; older clients ignore the additional catalog field.
+
+### Player-count history
+
+A cron trigger records the authoritative online count once per minute, even when nobody visits the
+website. Each minute keeps its first observation; delayed runs use their actual execution time.
+Samples survive hub hibernation and are retained for 90 days. No account identifiers are stored.
+History begins when collection is deployed; it cannot reconstruct earlier counts.
+
+The history response includes `from`, `to`, and `interval_ms` in milliseconds. Each point contains
+its bucket start (`at`), the average observed count (`online`), the highest observation (`peak`),
+and the number of observations (`samples`). The current bucket can be incomplete. Missing buckets
+are omitted and must be shown as gaps, not zero. Averages and peaks cover observed minutes only;
+a minute sample is not a record of every join and departure.
