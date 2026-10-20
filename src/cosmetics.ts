@@ -1,5 +1,6 @@
 import catalogJson from "./catalog.json";
 import schema from "../schema/v1.json";
+import type { MiddlewareHandler } from "hono";
 import { loadCatalog, refreshCatalogOnMiss, type Catalog } from "./catalog-store";
 
 export const catalog = catalogJson;
@@ -23,17 +24,21 @@ export function admitLoadout(
 }
 
 /** Serves a versioned catalog whose ETag binds every item and asset digest. */
-export async function catalogResponse(request: Request, bucket?: R2Bucket): Promise<Response> {
+export async function catalogResponse(bucket?: R2Bucket): Promise<Response> {
   const body = JSON.stringify(bucket ? await loadCatalog(bucket) : catalog);
   const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body)));
   const etag = `"${Array.from(hash, (b) => b.toString(16).padStart(2, "0")).join("")}"`;
-  const headers = { ETag: etag, "Cache-Control": "public, max-age=300", "Content-Type": "application/json" };
-  const matches = request.headers.get("If-None-Match")?.split(",").some((value) => value.trim().replace(/^W\//, "") === etag || value.trim() === "*");
-  return new Response(matches ? null : body, { status: matches ? 304 : 200, headers });
+  return new Response(body, { headers: { ETag: etag, "Content-Type": "application/json" } });
 }
 
-/** Catalog asset bytes read in this isolate; the assets are small and immutable, so each is read from R2 once. */
-const assetBytes = new Map<string, ArrayBuffer>();
+/** Applies conditional GETs after cache lookup, so cold and cached catalog responses share ETag behavior. */
+export const revalidateCatalog: MiddlewareHandler = async (c, next) => {
+  await next();
+  if (c.res.status !== 200) return;
+  const etag = c.res.headers.get("ETag");
+  const matches = c.req.header("If-None-Match")?.split(",").some((value) => value.trim().replace(/^W\//, "") === etag || value.trim() === "*");
+  if (matches) c.res = new Response(null, { status: 304, headers: c.res.headers });
+};
 
 /** Serves only reviewed, catalog-addressed R2 objects; clients verify the declared digest and size. */
 export async function assetResponse(hash: string, bucket: R2Bucket): Promise<Response> {
@@ -46,16 +51,11 @@ export async function assetResponse(hash: string, bucket: R2Bucket): Promise<Res
   const current = await loadCatalog(bucket);
   const entry = find(current) ?? find(await refreshCatalogOnMiss(bucket));
   if (!entry) return new Response(null, { status: 404 });
-  let bytes = assetBytes.get(hash);
-  if (!bytes) {
-    const object = await bucket.get(hash);
-    if (!object || object.size !== entry.asset.bytes) return new Response(null, { status: 404 });
-    bytes = await object.arrayBuffer();
-    assetBytes.set(hash, bytes);
-  }
-  return new Response(bytes, { headers: {
+  const object = await bucket.get(hash);
+  if (!object || object.size !== entry.asset.bytes) return new Response(null, { status: 404 });
+  return new Response(object.body, { headers: {
     "Content-Type": entry.kind === "texture" ? "image/png" : "application/json",
-    "Cache-Control": "public, max-age=31536000, immutable", ETag: `"${hash}"`,
+    ETag: `"${hash}"`,
     "X-Content-Type-Options": "nosniff", Link: `<${entry.license}>; rel="license"`,
   } });
 }
