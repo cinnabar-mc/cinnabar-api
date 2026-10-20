@@ -40,7 +40,7 @@ it("revalidates an older isolate catalog before rejecting a newly promoted diges
   } }] };
   const get = vi.fn(async (key: string) => key === CATALOG_KEY
     ? { size: 1, json: async () => next }
-    : { size: bytes.byteLength, arrayBuffer: async () => bytes });
+    : { size: bytes.byteLength, body: new Response(bytes).body });
   const bucket = { get } as unknown as R2Bucket;
   get.mockResolvedValueOnce({ size: 1, json: async () => catalog } as never);
   await loadCatalog(bucket, Date.now() - 2_000);

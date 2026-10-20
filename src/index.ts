@@ -1,8 +1,9 @@
-import { catalogResponse, assetResponse } from "./cosmetics";
+import { catalogResponse, assetResponse, revalidateCatalog } from "./cosmetics";
 import { authorizePublisher, entitlementCommand } from "./cosmetics-admin";
 import { Hono } from "hono";
+import { cache } from "hono/cache";
 import { isReleaseHookRequest } from "./protocol";
-import { cachedOnlineCount, cachedOnlineHistory, hubFor } from "./routing";
+import { hubFor } from "./routing";
 import { HISTORY_RANGES, type HistoryRange } from "./presence-history";
 
 export { Hub } from "./hub";
@@ -11,13 +12,13 @@ const MAX_HOOK_BODY_BYTES = 1024;
 
 const app = new Hono<{ Bindings: Env }>();
 
-app.get("/v1/health", (c) => c.json({ ok: true, api: "v1" }));
+app.get("/v1/health", cache({ cacheName: "cinnabar-api-v1", cacheControl: "public, max-age=60" }),
+  (c) => c.json({ ok: true, api: "v1" }));
 
-app.get("/v1/presence/count", async (c) => {
-  const online = await cachedOnlineCount(c.env);
+app.get("/v1/presence/count", cache({ cacheName: "cinnabar-api-v1", cacheControl: "public, max-age=30" }), async (c) => {
+  const online = await hubFor(c.env).onlineCount();
   return c.json({ online }, 200, {
     "Access-Control-Allow-Origin": "*",
-    "Cache-Control": "public, max-age=30",
   });
 });
 
@@ -27,17 +28,19 @@ app.get("/v1/presence/players", async (c) => {
   return c.json({ names: await hubFor(c.env).onlineNames() });
 });
 
-app.get("/v1/cosmetics/catalog", (c) => catalogResponse(c.req.raw, c.env.COSMETIC_ASSETS));
+app.get("/v1/cosmetics/catalog", revalidateCatalog,
+  cache({ cacheName: "cinnabar-api-v1", cacheControl: "public, max-age=300" }),
+  (c) => catalogResponse(c.env.COSMETIC_ASSETS));
 
-app.get("/v1/presence/history", async (c) => {
+app.get("/v1/presence/history", cache({ cacheName: "cinnabar-api-v1", cacheControl: "public, max-age=60" }), async (c) => {
   c.header("Access-Control-Allow-Origin", "*");
   const range = c.req.query("range") ?? "24h";
   if (!Object.hasOwn(HISTORY_RANGES, range)) return c.json({ error: "unsupported range" }, 400);
-  return c.json(await cachedOnlineHistory(c.env, range as HistoryRange), 200, {
-    "Cache-Control": "public, max-age=60",
-  });
+  return c.json(await hubFor(c.env).onlineHistory(range as HistoryRange));
 });
-app.get("/v1/cosmetics/assets/:hash", (c) => assetResponse(c.req.param("hash"), c.env.COSMETIC_ASSETS));
+app.get("/v1/cosmetics/assets/:hash",
+  cache({ cacheName: "cinnabar-api-v1", cacheControl: "public, max-age=31536000, immutable" }),
+  (c) => assetResponse(c.req.param("hash"), c.env.COSMETIC_ASSETS));
 
 app.post("/v1/cosmetics/entitlements", async (c) => {
   if (!(await authorizePublisher(c.req.header("Authorization"), c.env))) return c.body(null, 401);

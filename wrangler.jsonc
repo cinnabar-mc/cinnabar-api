@@ -5,6 +5,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-09-29",
   "workers_dev": true,
+  "routes": [{ "pattern": "api.cinnabar.gg", "custom_domain": true }],
   "triggers": { "crons": ["* * * * *"] },
   // Invocation logs would record request metadata such as client IPs, which the API promises not to keep.
   "observability": { "enabled": false },

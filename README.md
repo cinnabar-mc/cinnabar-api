@@ -16,6 +16,19 @@ messages against it.
 | `POST /v1/releases` | Release hook. `Authorization: Bearer <RELEASE_HOOK_SECRET>`, body `{"channel","version","build"}`; records and broadcasts only a newer (version, build) pair. Repeats and older records are no-ops. Omitted v1 builds mean zero. |
 | `GET /v1/connect` | WebSocket. The client authenticates with a Minecraft multiplayer token plus an ES384 proof of its key, then can toggle visibility, look up which XUIDs or UUIDs recently used Cinnabar, and receives release pushes. |
 
+Public GET responses use Hono's Cache API middleware with lifetimes declared beside each route:
+
+| Route | Cache lifetime |
+| --- | --- |
+| `/v1/health` | 60 seconds |
+| `/v1/presence/count` | 30 seconds |
+| `/v1/presence/history` | 60 seconds, separately for each query string |
+| `/v1/cosmetics/catalog` | 300 seconds, with `If-None-Match` revalidation on cache hits and misses |
+| `/v1/cosmetics/assets/:hash` | One year, immutable |
+
+The cache is local to each Cloudflare location. Only successful public GET responses are stored;
+requests with `Authorization`, private routes, writes and WebSocket connections bypass it.
+
 Close codes: `4401` failed or timed-out authentication, `1009` frame over 16 KiB, `1007` frame
 that isn't a JSON object with a `type`, `1008` invalid messages, binary frames, flood control or
 repeated lookup rate limiting, and `1011` issuer unreachable. `4429` means stay away: its reason
@@ -106,6 +119,11 @@ cp .dev.vars.example .dev.vars && pnpm dev
 `<issuer>/.well-known/openid-configuration`.
 
 ## Deploy
+
+The Worker is configured for the `api.cinnabar.gg` custom domain and keeps
+`cinnabar-api.cinnabar-api.workers.dev` available during migration. Deploying the domain requires
+a Cloudflare token that can manage the zone. After the domain is live, update the Cinnabar client's
+`CINNABAR_API_BASE_URL` and the website's API origin in their own repositories.
 
 CI deploys every push to `main` after the tests pass: it uploads cosmetic assets missing from R2, then runs
 `wrangler deploy`. The job runs in the `production` environment, whose `CLOUDFLARE_API_TOKEN` secret only
