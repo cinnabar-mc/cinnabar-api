@@ -50,7 +50,12 @@ type Session =
     }
   | { stage: "ready"; xuid: string; displayName: string; uuid: string; channel: Channel; visible: boolean; lastSeen?: number;
       loadout?: LoadoutState;
-      watching?: string[]; emote?: { id: string; elapsed: number; updated: number } };
+      watching?: string[]; emote?: { id: string; elapsed: number; updated: number }; lookupBudget?: LookupBudget };
+
+interface LookupBudget {
+  tokens: number;
+  updatedAt: number;
+}
 
 interface Traffic {
   startedAt: number;
@@ -84,6 +89,11 @@ export class Hub extends DurableObject<Env> {
   private readonly ipBySocket = new Map<WebSocket, string>();
   private readonly ipSalt: string;
   private alarmDeadline = Infinity;
+  /**
+   * Per-account lookup buckets. Socket attachments carry them across hibernation; a SQL row is written only when
+   * the account's last socket leaves with a spent bucket, since a row per lookup exhausts the daily write quota.
+   */
+  private readonly lookupBudgets = new Map<string, LookupBudget>();
   private cosmeticCatalog: Catalog = catalog;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -209,10 +219,17 @@ export class Hub extends DurableObject<Env> {
     let next = this.expireHandshakes(now);
     const idle = this.expireIdleSessions(now);
     if (idle !== null) next = next === null ? idle : Math.min(next, idle);
+    let oldest: number | null = null;
+    for (const [xuid, budget] of this.lookupBudgets) {
+      if (budget.updatedAt <= now - LOOKUP_BUDGET_TTL_MS) this.lookupBudgets.delete(xuid);
+      else oldest = oldest === null ? budget.updatedAt : Math.min(oldest, budget.updatedAt);
+    }
     this.ctx.storage.sql.exec("DELETE FROM lookup_budgets WHERE updated_at <= ?", now - LOOKUP_BUDGET_TTL_MS);
-    const expiry = this.ctx.storage.sql.exec<{ expiry: number | null }>(
-      "SELECT MIN(updated_at) + ? AS expiry FROM lookup_budgets", LOOKUP_BUDGET_TTL_MS,
-    ).one().expiry;
+    const stored = this.ctx.storage.sql.exec<{ oldest: number | null }>(
+      "SELECT MIN(updated_at) AS oldest FROM lookup_budgets",
+    ).one().oldest;
+    if (stored !== null) oldest = oldest === null ? stored : Math.min(oldest, stored);
+    const expiry = oldest === null ? null : oldest + LOOKUP_BUDGET_TTL_MS;
     for (const [xuid, deadline] of this.linger) {
       if (deadline <= now) this.linger.delete(xuid);
       else next = next === null ? deadline : Math.min(next, deadline);
@@ -591,22 +608,15 @@ export class Hub extends DurableObject<Env> {
     const xuids = [...new Set(lookup.xuids)];
     const uuids = [...new Set(lookup.uuids)];
     const cost = xuids.length + uuids.length;
-    const bucket = this.ctx.storage.sql.exec<{ tokens: number; updated_at: number }>(
-      "SELECT tokens, updated_at FROM lookup_budgets WHERE xuid = ?", state.xuid,
-    ).toArray()[0];
-    const capacity = SERVER_PARAMETERS.lookup_bucket_capacity;
-    const tokens = bucket
-      ? Math.min(capacity, bucket.tokens + Math.max(0, now - bucket.updated_at) * SERVER_PARAMETERS.lookup_refill_per_min / 60_000)
-      : capacity;
+    const tokens = this.lookupTokens(state.xuid, now);
     const admitted = tokens >= cost;
-    this.ctx.storage.sql.exec(
-      "INSERT OR REPLACE INTO lookup_budgets (xuid, tokens, updated_at) VALUES (?, ?, ?)",
-      state.xuid, admitted ? tokens - cost : tokens, now,
-    );
+    const lookupBudget = { tokens: admitted ? tokens - cost : tokens, updatedAt: now };
+    this.lookupBudgets.set(state.xuid, lookupBudget);
     this.ctx.waitUntil(this.scheduleAlarm(now + LOOKUP_BUDGET_TTL_MS));
+    if (admitted) this.save(ws, { ...state, lookupBudget });
     if (!admitted) {
       const traffic = { ...state.traffic, rateLimited: state.traffic.rateLimited + 1 };
-      this.save(ws, { ...state, traffic });
+      this.save(ws, { ...state, lookupBudget, traffic });
       send(ws, { type: "error", code: "rate_limited", id: lookup.id });
       if (traffic.rateLimited >= RATE_LIMITED_REPLY_MAX) {
         this.count("overload_closed");
@@ -672,6 +682,16 @@ export class Hub extends DurableObject<Env> {
     }
   }
 
+  /** Returns the account's refilled lookup tokens, from memory or the row its last departure stored. */
+  private lookupTokens(xuid: string, now: number): number {
+    const capacity = SERVER_PARAMETERS.lookup_bucket_capacity;
+    const bucket = this.lookupBudgets.get(xuid) ?? this.ctx.storage.sql.exec<{ tokens: number; updatedAt: number }>(
+      "SELECT tokens, updated_at AS updatedAt FROM lookup_budgets WHERE xuid = ?", xuid,
+    ).toArray()[0];
+    if (!bucket) return capacity;
+    return Math.min(capacity, bucket.tokens + Math.max(0, now - bucket.updatedAt) * SERVER_PARAMETERS.lookup_refill_per_min / 60_000);
+  }
+
   /** Updates socket state and retains its flood budget across handshake transitions and wakes. */
   private save(ws: WebSocket, session: Session & { traffic?: Traffic; ipHash?: string }, persist = true): void {
     const attachment: Attachment = {
@@ -695,6 +715,10 @@ export class Hub extends DurableObject<Env> {
       index(this.byUuid, attachment.uuid, ws);
       index(this.byChannel, attachment.channel, ws);
       for (const id of attachment.watching ?? []) index(this.emoteWatchers, id, ws);
+      const budget = attachment.lookupBudget;
+      if (budget && budget.updatedAt > (this.lookupBudgets.get(attachment.xuid)?.updatedAt ?? -Infinity)) {
+        this.lookupBudgets.set(attachment.xuid, budget);
+      }
     }
   }
 
@@ -726,6 +750,14 @@ export class Hub extends DurableObject<Env> {
       unindex(this.byXuid, attachment.xuid, ws);
       unindex(this.byUuid, attachment.uuid, ws);
       unindex(this.byChannel, attachment.channel, ws);
+      const budget = this.lookupBudgets.get(attachment.xuid);
+      if (!this.byXuid.has(attachment.xuid) && budget
+        && this.lookupTokens(attachment.xuid, Date.now()) < SERVER_PARAMETERS.lookup_bucket_capacity) {
+        this.ctx.storage.sql.exec(
+          "INSERT OR REPLACE INTO lookup_budgets (xuid, tokens, updated_at) VALUES (?, ?, ?)",
+          attachment.xuid, budget.tokens, budget.updatedAt,
+        );
+      }
       if (attachment.visible || (!this.byXuid.has(attachment.xuid) && this.linger.has(attachment.xuid))) {
         const deadline = Date.now() + PRESENCE_LINGER_MS;
         this.linger.set(attachment.xuid, deadline);

@@ -82,6 +82,16 @@ describe("per-account lookup bucket", () => {
     expect((await (await player("2")).lookup(roster)).type).toBe("lookup_result");
   });
 
+  it("stores a bucket row only when the account's last socket leaves", async () => {
+    const first = await player();
+    await drain(first);
+    const rows = () => runInDurableObject(hub(), (_, state) => state.storage.sql.exec("SELECT xuid FROM lookup_budgets").toArray());
+    expect(await rows()).toEqual([]);
+    first.close();
+    await first.closed;
+    expect(await rows()).toHaveLength(1);
+  });
+
   it("keeps a spent bucket after the last disconnect and hibernation", async () => {
     const first = await player();
     await drain(first);
