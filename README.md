@@ -249,3 +249,34 @@ its bucket start (`at`), the average observed count (`online`), the highest obse
 and the number of observations (`samples`). The current bucket can be incomplete. Missing buckets
 are omitted and must be shown as gaps, not zero. Averages and peaks cover observed minutes only;
 a minute sample is not a record of every join and departure.
+
+## Crash reports
+
+`POST /v1/crash-reports` accepts schema-1 gzip JSON from consented clients. It limits the wire body
+to 64 KiB and the inflated JSON to 512 KiB. Invalid framing, fields, native frame indices and deep
+objects are rejected before storage. Workers bindings limit each IP to 30 requests per minute and
+each random install id to 6 per minute. These are Cloudflare's local rate limits; counters are not
+Durable Object rows. IP addresses are used only by the transient limiter and never stored with a
+report. Invocation logging stays disabled.
+
+R2 holds each payload under its random report id. D1 holds one index row and a fixed set of indexes.
+A retry with identical content completes an interrupted write or returns success without storing
+another report. Reusing an id with different content fails validation. Owner-only routes require
+`Authorization: Bearer <CRASH_OWNER_SECRET>`: `GET /v1/crash-reports` lists recent reports,
+`?groups=1` groups by signature, version, OS, GPU and backend, and `/:id` reads one report.
+Responses are never cached. Lists contain at most 100 rows; pass `next_cursor` as the `cursor` parameter for another page.
+
+Expired reports disappear from owner routes after 90 days. The hourly cron deletes expired R2
+objects before their D1 index rows in bounded batches. Configure an R2 90-day object lifecycle
+as an additional storage safeguard. No report ingestion or retention call uses a Durable Object.
+
+Before deployment, explicitly provision the private report R2 bucket and D1 database, replace the
+placeholder D1 id, apply `migrations/`, configure both rate-limit namespaces and the owner secret,
+and set the R2 retention rule. Provision a separate private symbols bucket for the client's release
+workflow, with bucket-scoped CI upload credentials and account/bucket variables. This source change
+does not provision resources or install secrets. Symbol archives and caches never belong in public
+release assets. The client repository documents offline symbolication with `symbolic`.
+
+For local testing, use `wrangler d1 migrations apply CRASH_INDEX --local` and `wrangler dev --local`.
+The client accepts `CINNABAR_CRASH_UPLOAD_URL=http://127.0.0.1:8787`; plain HTTP is restricted to
+loopback. Use a synthetic local owner secret when testing authenticated routes.
