@@ -2,6 +2,7 @@
 interface CrashBindings {
   CRASH_REPORTS: R2Bucket;
   CRASH_INDEX: D1Database;
+  CRASH_GLOBAL_LIMIT: RateLimit;
   CRASH_IP_LIMIT: RateLimit;
   CRASH_INSTALL_LIMIT: RateLimit;
 }

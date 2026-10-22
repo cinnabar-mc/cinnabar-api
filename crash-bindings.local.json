@@ -22,6 +22,14 @@
   ],
   "ratelimits": [
     {
+      "name": "CRASH_GLOBAL_LIMIT",
+      "namespace_id": "1003",
+      "simple": {
+        "limit": 600,
+        "period": 60
+      }
+    },
+    {
       "name": "CRASH_IP_LIMIT",
       "namespace_id": "1001",
       "simple": {

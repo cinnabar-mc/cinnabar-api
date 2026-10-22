@@ -12,19 +12,24 @@ function objectKey(id: string): string { return `reports/${id}.json`; }
 
 /** True only after every crash storage and rate-limit binding has been configured. */
 function configured(env: Env): env is Env & CrashBindings {
-  return !!(env.CRASH_REPORTS && env.CRASH_INDEX && env.CRASH_IP_LIMIT && env.CRASH_INSTALL_LIMIT);
+  return !!(env.CRASH_REPORTS && env.CRASH_INDEX && env.CRASH_GLOBAL_LIMIT && env.CRASH_IP_LIMIT && env.CRASH_INSTALL_LIMIT);
 }
 
 /** Accepts one consented client payload without invoking a Durable Object. */
 export async function receive(request: Request, env: Env, now = Date.now()): Promise<Response> {
   if (env.CRASH_INGESTION_DISABLED !== "false") return new Response(null, { status: 503 });
+  if (!env.CRASH_GLOBAL_LIMIT) return new Response(null, { status: 503 });
+  if (!(await env.CRASH_GLOBAL_LIMIT.limit({ key: "crash-reports" })).success) return new Response(null, { status: 202 });
   if (!configured(env)) return new Response(null, { status: 503 });
   const limits = budget(env);
   if (!limits) return new Response(null, { status: 503 });
+  if (limits.reports === 0) return new Response(null, { status: 202 });
   const ip = request.headers.get("CF-Connecting-IP") ?? "local";
   if (!(await env.CRASH_IP_LIMIT.limit({ key: ip })).success) return limited();
   const db = env.CRASH_INDEX.withSession("first-primary");
-  if (!(await admitIp(db, ip, Math.floor(now / DAY_MS)))) return limited(86400 - Math.floor(now % DAY_MS / 1000));
+  const admission = await admitIp(db, ip, Math.floor(now / DAY_MS), limits.reports);
+  if (admission === "daily-limit") return new Response(null, { status: 202 });
+  if (admission === "ip-limit") return limited(86400 - Math.floor(now % DAY_MS / 1000));
   const decoded = await readPayload(request);
   if (typeof decoded === "number") return new Response(null, { status: decoded });
   if (!validPayload(decoded.value)) return new Response(null, { status: 422 });
@@ -36,7 +41,8 @@ export async function receive(request: Request, env: Env, now = Date.now()): Pro
   if (!published) return new Response(null, { status: 422 });
   const digest = await crypto.subtle.digest("SHA-256", decoded.json);
   const hash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-  const { row, counted } = await reserve(db, payload, hash, decoded.json.byteLength, now, limits);
+  const { row, counted, capped } = await reserve(db, payload, hash, decoded.json.byteLength, now, limits);
+  if (capped) return new Response(null, { status: 202 });
   if (!row) return counted ? new Response(null, { status: 202 }) : limited();
   const lookup = db.prepare("SELECT install_id, payload_hash, received_at, stored FROM crash_reports WHERE id = ?").bind(payload.report_id);
   if (row?.install_id !== payload.install_id || row.payload_hash !== hash) return new Response(null, { status: 422 });
