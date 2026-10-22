@@ -32,6 +32,6 @@ export async function readPayload(request: Request): Promise<{ value: unknown; j
     const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream("gzip"));
     const json = await bounded(stream, MAX_JSON_BYTES);
     if (!json) return 413;
-    return { value: JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(json)), json };
+    return { value: JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(json)), json };
   } catch { return 400; }
 }

@@ -18,7 +18,7 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "cf-typegen": "wrangler types --strict-vars false",
-    "typecheck": "wrangler types --strict-vars false && tsc --noEmit",
+    "typecheck": "wrangler types --strict-vars false && tsc -p tsconfig.worker.json && tsc --noEmit",
     "test": "vitest run && node --test tools/tests/*.test.mjs",
     "dev:crashes": "node tools/crash-local.mjs && wrangler dev --local --config .wrangler.crash-local.json"
   },
