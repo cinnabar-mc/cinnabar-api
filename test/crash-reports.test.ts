@@ -3,20 +3,24 @@ import { env, exports } from "cloudflare:workers";
 import worker from "../src/index";
 import local from "../crash-bindings.local.json";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import migration from "../migrations/0001_crash_reports.sql?raw";
+import { applyD1Migrations } from "cloudflare:test";
 import { receive, expire, listing, report } from "../src/crash-reports";
+import { DAY_MS } from "../src/crash-reports/admission";
+import { RELEASE_CACHE_KEY, RELEASE_CACHE_NAME } from "../src/crash-reports/releases";
 import { validPayload, MAX_COMPRESSED_BYTES, MAX_JSON_BYTES, RETENTION_MS } from "../src/crash-reports/schema";
 
 // The fixture configuration supplies every optional crash binding.
 const crashEnv = env as Env & CrashBindings;
 
 beforeAll(async () => {
-  for (const sql of migration.replace(/^--.*$/gm, "").split(";").filter((sql) => sql.trim())) {
-    await crashEnv.CRASH_INDEX.prepare(sql).run();
-  }
+  const fixture = env as Env & { TEST_CRASH_MIGRATIONS: { name: string; queries: string[] }[] };
+  await applyD1Migrations(crashEnv.CRASH_INDEX, fixture.TEST_CRASH_MIGRATIONS);
 });
 beforeEach(async () => {
-  await crashEnv.CRASH_INDEX.prepare("DELETE FROM crash_reports").run();
+  await crashEnv.CRASH_INDEX.batch(["crash_reports", "crash_groups", "crash_ips", "crash_days"].map((table) =>
+    crashEnv.CRASH_INDEX.prepare(`DELETE FROM ${table}`)));
+  await (await caches.open(RELEASE_CACHE_NAME)).put(RELEASE_CACHE_KEY, Response.json({ versions: ["1.2.3", "1.2.3-beta", "1.2.3-nightly"] },
+    { headers: { "Cache-Control": "public, max-age=300" } }));
   const objects = await crashEnv.CRASH_REPORTS.list();
   if (objects.objects.length) await crashEnv.CRASH_REPORTS.delete(objects.objects.map((object) => object.key));
 });
@@ -62,7 +66,9 @@ describe("crash reports", { timeout: 30000 }, () => {
     const other = { ...value, report_id: payload().report_id };
     expect((await receive(await request(other), bindings())).status).toBe(201);
     const groups = await (await owner("?groups=1")).json();
-    expect(groups).toMatchObject({ groups: [{ signature: value.signature, version: "1.2.3", os: "linux", gpu: "test GPU", backend: "vulkan", count: 2 }] });
+    expect(groups).toMatchObject({ groups: [{ signature: value.signature, version: "1.2.3", count: 2, samples: 2 }] });
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT os, gpu, backend FROM crash_reports LIMIT 1").first())
+      .toEqual({ os: "linux", gpu: "other", backend: "vulkan" });
     expect((await (await owner(`/${value.report_id}`)).json())).toEqual(value);
     expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(2);
   });
@@ -81,7 +87,7 @@ describe("crash reports", { timeout: 30000 }, () => {
     const put = vi.spyOn(broken.CRASH_REPORTS, "put").mockRejectedValueOnce(new Error("unavailable"));
     await expect(receive(await request(value), broken)).rejects.toThrow("unavailable");
     put.mockRestore();
-    expect(await (await owner("?groups=1")).json()).toEqual({ groups: [], next_cursor: null });
+    expect(await (await owner("?groups=1")).json()).toMatchObject({ groups: [{ count: 1, samples: 1 }] });
     expect((await receive(await request(value), bindings())).status).toBe(201);
     expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(1);
   });
@@ -132,7 +138,7 @@ describe("crash reports", { timeout: 30000 }, () => {
       headers: { "Content-Type": "application/json", "Content-Encoding": "gzip" } }), bindings())).status).toBe(400);
   });
 
-  it("enforces each rate limit before any storage write", async () => {
+  it("enforces each minute rate limit before any payload or group write", async () => {
     for (const name of ["CRASH_IP_LIMIT", "CRASH_INSTALL_LIMIT"] as const) {
       const limited = bindings();
       limited[name].limit.mockResolvedValue({ success: false });
@@ -149,7 +155,7 @@ describe("crash reports", { timeout: 30000 }, () => {
     await receive(await request(old), bindings(), now - RETENTION_MS - 1);
     await receive(await request(fresh), bindings(), now);
     expect((await owner(`/${old.report_id}`)).status).toBe(404);
-    expect(await expire(env, now)).toBe(1);
+    expect(await expire(env, now)).toBeGreaterThanOrEqual(1);
     expect(await expire(env, now)).toBe(0);
     expect((await crashEnv.CRASH_REPORTS.list()).objects.filter((object) => object.size > 0)).toHaveLength(1);
     expect(await (await owner("?groups=1")).json()).toMatchObject({ groups: [{ count: 1 }] });
@@ -235,7 +241,7 @@ describe("crash reports", { timeout: 30000 }, () => {
       expect((await receive(await request(value), bindings(), received + RETENTION_MS - 1)).status).toBe(503);
     } finally { put.mockRestore(); }
     expect(await crashEnv.CRASH_INDEX.prepare("SELECT stored FROM crash_reports WHERE id = ?").bind(value.report_id).first("stored")).toBe(0);
-    expect(await (await owner("?groups=1")).json()).toMatchObject({ groups: [] });
+    expect(await (await owner("?groups=1")).json()).toMatchObject({ groups: [{ count: 1 }] });
   });
 
   it("returns not found when retention replaces a payload during an owner read", async () => {
@@ -253,10 +259,9 @@ describe("crash reports", { timeout: 30000 }, () => {
   it("paginates every crash group with tied timestamps", async () => {
     const received = Date.now();
     await crashEnv.CRASH_INDEX.batch(Array.from({ length: 101 }, (_, index) =>
-      crashEnv.CRASH_INDEX.prepare(`INSERT INTO crash_reports
-        (id, install_id, payload_hash, received_at, signature, version, os, gpu, backend, stored)
-        VALUES (?, 'install', 'hash', ?, ?, 'release', 'os', 'gpu', 'backend', 1)`)
-        .bind(index.toString(16).padStart(32, "0"), received, `group-${index}`)));
+      crashEnv.CRASH_INDEX.prepare(`INSERT INTO crash_groups
+        (day, signature, version, cursor_id, count, latest_at) VALUES (?, ?, 'release', ?, 1, ?)`)
+        .bind(Math.floor(received / DAY_MS), `group-${index}`, index.toString(16).padStart(32, "0"), received)));
     const first = await (await owner("?groups=1")).json() as { groups: { signature: string }[]; next_cursor: string };
     expect(first.groups).toHaveLength(100);
     expect(first.next_cursor).toEqual(expect.any(String));
@@ -286,11 +291,189 @@ describe("crash reports", { timeout: 30000 }, () => {
 
   it("uses the configured per-IP limiter even for malformed bodies", async () => {
     const ip = crypto.randomUUID();
-    for (let i = 0; i < 31; i++) {
+    for (let i = 0; i < 6; i++) {
       const req = new Request("https://api.test/v1/crash-reports", { method: "POST", body: "invalid",
         headers: { "CF-Connecting-IP": ip } });
-      expect((await receive(req, env)).status).toBe(i < 30 ? 415 : 429);
+      expect((await receive(req, env)).status).toBe(i < 5 ? 415 : 429);
     }
+  });
+
+  it("stores 20 daily samples and counts further reports without R2 writes or report rows", async () => {
+    const put = vi.spyOn(crashEnv.CRASH_REPORTS, "put");
+    try {
+      for (let i = 0; i < 25; i++) {
+        expect((await receive(await request(payload()), bindings())).status).toBe(i < 20 ? 201 : 202);
+      }
+      expect(put).toHaveBeenCalledTimes(20);
+    } finally { put.mockRestore(); }
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) AS count FROM crash_reports").first("count")).toBe(20);
+    expect(await (await owner("?groups=1")).json()).toMatchObject({ groups: [{ count: 25, samples: 20 }] });
+  });
+
+  it("enforces the sample cap under concurrent uploads and device string rotation", async () => {
+    const limited = { ...bindings(), CRASH_SAMPLES_PER_GROUP: "3" };
+    const responses = await Promise.all(Array.from({ length: 12 }, async (_, index) => receive(await request({
+      ...payload(), signature: index % 2 ? " PANIC:  A.RS:1: boom\u200b " : "panic: a.rs:1: boom",
+      os: `invented-${index}`, gpu: `invented-${index}`, backend: `invented-${index}`,
+    }), limited)));
+    expect(responses.filter((response) => response.status === 201)).toHaveLength(3);
+    expect(responses.filter((response) => response.status === 202)).toHaveLength(9);
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) FROM crash_groups").first("COUNT(*)")).toBe(1);
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT DISTINCT os, gpu, backend FROM crash_reports").all())
+      .toMatchObject({ results: [{ os: "other", gpu: "other", backend: "other" }] });
+    expect(await (await owner("?groups=1")).json()).toMatchObject({ groups: [{ count: 12, samples: 3 }] });
+  });
+
+  it("reserves a global byte budget atomically using inflated payload sizes", async () => {
+    const value = payload();
+    const bytes = new TextEncoder().encode(JSON.stringify(value)).byteLength;
+    const limited = { ...bindings(), CRASH_DAILY_MAX_BYTES: String(bytes * 2) };
+    const responses = await Promise.all(Array.from({ length: 8 }, async () =>
+      receive(await request({ ...value, report_id: payload().report_id }), limited)));
+    expect(responses.filter((response) => response.status === 201)).toHaveLength(2);
+    expect(responses.filter((response) => response.status === 202)).toHaveLength(6);
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT bytes FROM crash_days").first("bytes")).toBe(bytes * 2);
+    expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(2);
+  });
+
+  it("caps new groups concurrently but keeps counting admitted groups", async () => {
+    const limited = { ...bindings(), CRASH_DAILY_MAX_GROUPS: "2", CRASH_SAMPLES_PER_GROUP: "0" };
+    const responses = await Promise.all(Array.from({ length: 10 }, async (_, index) =>
+      receive(await request({ ...payload(), signature: `panic: site-${index}` }), limited)));
+    expect(responses.filter((response) => response.status === 202)).toHaveLength(2);
+    expect(responses.filter((response) => response.status === 429)).toHaveLength(8);
+    const group = await crashEnv.CRASH_INDEX.prepare("SELECT signature FROM crash_groups LIMIT 1").first<string>("signature");
+    expect((await receive(await request({ ...payload(), signature: group! }), limited)).status).toBe(202);
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT groups FROM crash_days").first("groups")).toBe(2);
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT SUM(count) FROM crash_groups").first("SUM(count)")).toBe(3);
+    expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(0);
+  });
+
+  it("starts new daily sample, byte and group allowances at UTC midnight", async () => {
+    const start = Math.floor(Date.now() / DAY_MS) * DAY_MS;
+    const limited = { ...bindings(), CRASH_SAMPLES_PER_GROUP: "1", CRASH_DAILY_MAX_GROUPS: "1" };
+    expect((await receive(await request(payload()), limited, start + DAY_MS - 1)).status).toBe(201);
+    expect((await receive(await request(payload()), limited, start + DAY_MS - 1)).status).toBe(202);
+    expect((await receive(await request(payload()), limited, start + DAY_MS)).status).toBe(201);
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) FROM crash_groups").first("COUNT(*)")).toBe(2);
+  });
+
+  it("limits daily attempts across install rotation and concurrent requests, then resets", async () => {
+    const start = Math.floor(Date.now() / DAY_MS) * DAY_MS;
+    const ip = "192.0.2.50";
+    const limited = { ...bindings(), CRASH_SAMPLES_PER_GROUP: "0" };
+    const responses = await Promise.all(Array.from({ length: 55 }, async () => {
+      const req = await request(payload());
+      req.headers.set("CF-Connecting-IP", ip);
+      return receive(req, limited, start);
+    }));
+    expect(responses.filter((response) => response.status === 202)).toHaveLength(50);
+    expect(responses.filter((response) => response.status === 429)).toHaveLength(5);
+    expect(responses.find((response) => response.status === 429)?.headers.get("Retry-After")).toBe("86400");
+    const req = await request(payload());
+    req.headers.set("CF-Connecting-IP", ip);
+    expect((await receive(req, limited, start + DAY_MS)).status).toBe(202);
+    const rows = await crashEnv.CRASH_INDEX.prepare("SELECT day, ip_hash, count FROM crash_ips ORDER BY day").all();
+    expect(rows.results.map((row) => row.count)).toEqual([50, 1]);
+    expect(rows.results[0]!.ip_hash).not.toBe(rows.results[1]!.ip_hash);
+    expect(JSON.stringify(rows.results)).not.toContain(ip);
+  });
+
+  it("bounds daily IP cardinality while preserving existing IP allowances", async () => {
+    const ip = "192.0.2.51", now = Date.now();
+    const req = await request(payload());
+    req.headers.set("CF-Connecting-IP", ip);
+    expect((await receive(req, bindings(), now)).status).toBe(201);
+    await crashEnv.CRASH_INDEX.prepare("UPDATE crash_days SET ips = 65536").run();
+    expect((await receive(await request(payload()), bindings(), now)).status).toBe(429);
+    const retry = await request(payload());
+    retry.headers.set("CF-Connecting-IP", ip);
+    expect((await receive(retry, bindings(), now)).status).toBe(201);
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) FROM crash_ips").first("COUNT(*)")).toBe(1);
+  });
+
+  it("counts malformed bodies against the daily limit", async () => {
+    const ip = "192.0.2.52";
+    for (let index = 0; index < 51; index++) {
+      const req = new Request("https://api.test/v1/crash-reports", { method: "POST", body: "invalid",
+        headers: { "CF-Connecting-IP": ip } });
+      expect((await receive(req, bindings())).status).toBe(index < 50 ? 415 : 429);
+    }
+  });
+
+  it("keeps failed reservations within the cap and does not charge retries twice", async () => {
+    const value = payload();
+    const limited = { ...bindings(), CRASH_SAMPLES_PER_GROUP: "1" };
+    const put = vi.spyOn(crashEnv.CRASH_REPORTS, "put").mockRejectedValueOnce(new Error("offline"));
+    try { await expect(receive(await request(value), limited)).rejects.toThrow("offline"); }
+    finally { put.mockRestore(); }
+    const reserved = await crashEnv.CRASH_INDEX.prepare("SELECT bytes FROM crash_days").first("bytes");
+    expect((await receive(await request(payload()), limited)).status).toBe(202);
+    expect((await receive(await request(value), limited)).status).toBe(201);
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT bytes FROM crash_days").first("bytes")).toBe(reserved);
+    expect(await (await owner("?groups=1")).json()).toMatchObject({ groups: [{ count: 2, samples: 1 }] });
+  });
+
+  it("rejects unshipped versions, implausible commits and empty or oversized signatures", async () => {
+    for (const change of [{ release: "9.9.9" }, { release: "custom-build" }, { commit: "local-debug" },
+      { signature: " \u200b " }, { signature: "x".repeat(241) }]) {
+      expect((await receive(await request({ ...payload(), ...change }), bindings())).status).toBe(422);
+    }
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) FROM crash_groups").first("COUNT(*)")).toBe(0);
+    for (const release of ["1.2.3", "1.2.3-beta", "1.2.3-nightly", "v1.2.3"]) {
+      expect((await receive(await request({ ...payload(), release }), bindings())).status).toBe(201);
+    }
+  });
+
+  it("disables ingestion before limiter, decoding, release lookup or storage", async () => {
+    for (const disabled of ["true", "", "invalid"]) {
+      const limited = { ...bindings(), CRASH_INGESTION_DISABLED: disabled };
+      expect((await receive(await request(payload()), limited)).status).toBe(503);
+      expect(limited.CRASH_IP_LIMIT.limit).not.toHaveBeenCalled();
+    }
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) FROM crash_days").first("COUNT(*)")).toBe(0);
+  });
+
+  it("fails closed for invalid budgets and supports a zero-byte counting-only budget", async () => {
+    for (const setting of ["CRASH_DAILY_MAX_BYTES", "CRASH_DAILY_MAX_GROUPS", "CRASH_SAMPLES_PER_GROUP"] as const) {
+      for (const value of ["", " ", "bad", "-1", "1.5", "Infinity", "9007199254740992"]) {
+        expect((await receive(await request(payload()), { ...bindings(), [setting]: value })).status).toBe(503);
+      }
+    }
+    expect((await receive(await request(payload()), { ...bindings(), CRASH_DAILY_MAX_BYTES: "0" })).status).toBe(202);
+    expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(0);
+  });
+
+  it("retains counting-only groups for 90 days and prunes old IP counters in bounded batches", async () => {
+    const now = Date.now();
+    const limited = { ...bindings(), CRASH_SAMPLES_PER_GROUP: "0" };
+    await receive(await request(payload()), limited, now - RETENTION_MS - DAY_MS);
+    await receive(await request(payload()), limited, now);
+    expect(await (await owner("?groups=1")).json()).toMatchObject({ groups: [{ count: 1 }] });
+    while (await expire(crashEnv, now)) { /* Drain bounded cleanup batches. */ }
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) FROM crash_groups").first("COUNT(*)")).toBe(1);
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) FROM crash_days").first("COUNT(*)")).toBe(1);
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) FROM crash_ips").first("COUNT(*)")).toBe(1);
+  });
+
+  it("returns 503 without a payload or group write when publication is unavailable", async () => {
+    await (await caches.open(RELEASE_CACHE_NAME)).put(RELEASE_CACHE_KEY, Response.json({ versions: null },
+      { headers: { "Cache-Control": "public, max-age=30" } }));
+    expect((await receive(await request(payload()), bindings())).status).toBe(503);
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) FROM crash_groups").first("COUNT(*)")).toBe(0);
+    expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(0);
+  });
+
+  it("bounds past-day IP cleanup without needing any stored reports", async () => {
+    const day = Math.floor(Date.now() / DAY_MS) - 1;
+    await crashEnv.CRASH_INDEX.prepare("INSERT INTO crash_days (day, salt) VALUES (?, 'fixture')").bind(day).run();
+    await crashEnv.CRASH_INDEX.prepare(`WITH RECURSIVE ids(id) AS
+      (SELECT 1 UNION ALL SELECT id + 1 FROM ids WHERE id < 1001)
+      INSERT INTO crash_ips (day, ip_hash, count) SELECT ?, CAST(id AS TEXT), 1 FROM ids`).bind(day).run();
+    expect(await expire(crashEnv)).toBe(1000);
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) FROM crash_ips").first("COUNT(*)")).toBe(1);
+    expect(await expire(crashEnv)).toBe(1);
+    expect(await expire(crashEnv)).toBe(0);
   });
 
 });

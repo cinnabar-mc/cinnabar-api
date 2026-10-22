@@ -1,5 +1,7 @@
 import { readPayload } from "./body";
 import { RETENTION_MS, validPayload } from "./schema";
+import { admitIp, budget, DAY_MS, reserve, signature } from "./admission";
+import { publishedRelease } from "./releases";
 
 const PAGE_SIZE = 100;
 // Empty objects fence conditional uploads after payload retention removes their index rows.
@@ -15,24 +17,28 @@ function configured(env: Env): env is Env & CrashBindings {
 
 /** Accepts one consented client payload without invoking a Durable Object. */
 export async function receive(request: Request, env: Env, now = Date.now()): Promise<Response> {
+  if (env.CRASH_INGESTION_DISABLED !== "false") return new Response(null, { status: 503 });
   if (!configured(env)) return new Response(null, { status: 503 });
+  const limits = budget(env);
+  if (!limits) return new Response(null, { status: 503 });
   const ip = request.headers.get("CF-Connecting-IP") ?? "local";
   if (!(await env.CRASH_IP_LIMIT.limit({ key: ip })).success) return limited();
+  const db = env.CRASH_INDEX.withSession("first-primary");
+  if (!(await admitIp(db, ip, Math.floor(now / DAY_MS)))) return limited(86400 - Math.floor(now % DAY_MS / 1000));
   const decoded = await readPayload(request);
   if (typeof decoded === "number") return new Response(null, { status: decoded });
   if (!validPayload(decoded.value)) return new Response(null, { status: 422 });
   const payload = decoded.value;
   if (!(await env.CRASH_INSTALL_LIMIT.limit({ key: payload.install_id })).success) return limited();
+  if (!/^[0-9a-f]{6,40}$/i.test(payload.commit) || !signature(payload.signature)) return new Response(null, { status: 422 });
+  const published = await publishedRelease(payload.release);
+  if (published === null) return new Response(null, { status: 503 });
+  if (!published) return new Response(null, { status: 422 });
   const digest = await crypto.subtle.digest("SHA-256", decoded.json);
   const hash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-  const db = env.CRASH_INDEX;
-  // Reserve first. A failed R2 write leaves a pending row that the same report can complete.
-  await db.prepare(`INSERT OR IGNORE INTO crash_reports
-    (id, install_id, payload_hash, received_at, signature, version, os, gpu, backend) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(payload.report_id, payload.install_id, hash, now, payload.signature,
-      payload.release, payload.os, payload.gpu ?? "", payload.backend ?? "").run();
+  const { row, counted } = await reserve(db, payload, hash, decoded.json.byteLength, now, limits);
+  if (!row) return counted ? new Response(null, { status: 202 }) : limited();
   const lookup = db.prepare("SELECT install_id, payload_hash, received_at, stored FROM crash_reports WHERE id = ?").bind(payload.report_id);
-  const row = await lookup.first<{ install_id: string; payload_hash: string; received_at: number; stored: number }>();
   if (row?.install_id !== payload.install_id || row.payload_hash !== hash) return new Response(null, { status: 422 });
   // Retention may already be deleting this reservation. An expired retry cannot revive its object.
   if (row.received_at <= now - RETENTION_MS) return new Response(null, { status: 422 });
@@ -64,7 +70,7 @@ export async function receive(request: Request, env: Env, now = Date.now()): Pro
 }
 
 /** Signals a temporary refusal and lets the sender respect its persisted backoff. */
-function limited(): Response { return new Response(null, { status: 429, headers: { "Retry-After": "60" } }); }
+function limited(seconds = 60): Response { return new Response(null, { status: 429, headers: { "Retry-After": String(seconds) } }); }
 
 /** Lists groups or reports only after the caller has authenticated the owner bearer token. */
 export async function listing(url: URL, env: Env): Promise<Response> {
@@ -77,9 +83,9 @@ export async function listing(url: URL, env: Env): Promise<Response> {
   const beforeId = match?.[2] ?? "z";
   if (!Number.isSafeInteger(before)) return new Response(null, { status: 400 });
   if (url.searchParams.get("groups") === "1") {
-    const rows = await env.CRASH_INDEX.prepare(`SELECT signature, version, os, gpu, backend,
-      COUNT(*) AS count, MAX(received_at) AS latest_at, MIN(id) AS cursor_id FROM crash_reports
-      WHERE stored = 1 AND received_at > ? GROUP BY signature, version, os, gpu, backend
+    const rows = await env.CRASH_INDEX.prepare(`SELECT signature, version,
+      SUM(count) AS count, SUM(samples) AS samples, MAX(latest_at) AS latest_at, MIN(cursor_id) AS cursor_id FROM crash_groups
+      WHERE latest_at > ? GROUP BY signature, version
       HAVING latest_at < ? OR (latest_at = ? AND cursor_id < ?)
       ORDER BY latest_at DESC, cursor_id DESC LIMIT ?`).bind(cutoff, before, before, beforeId, PAGE_SIZE)
       .all<{ latest_at: number; cursor_id: string }>();
@@ -110,13 +116,24 @@ export async function report(id: string, env: Env): Promise<Response> {
   return new Response(object.body, { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
 }
 
-/** Replaces one bounded batch of expired payloads with empty markers before removing index rows.
- * Run hourly; pending reservations are also removed. Repeating a failed batch is safe. */
+/** Removes bounded batches of expired samples and counters, returning the number of removed rows.
+ * Payloads become empty markers before their index rows are removed. Repeating a failed batch is safe. */
 export async function expire(env: Env, now = Date.now()): Promise<number> {
   if (!configured(env)) return 0;
+  const db = env.CRASH_INDEX;
+  // IP cleanup has a larger batch because IP records can outnumber payload samples.
+  const cleanup = await db.batch([
+    db.prepare("DELETE FROM crash_ips WHERE (day, ip_hash) IN (SELECT day, ip_hash FROM crash_ips WHERE day < ? LIMIT 1000)")
+      .bind(Math.floor(now / DAY_MS)),
+    db.prepare(`DELETE FROM crash_groups WHERE (day, signature, version) IN
+      (SELECT day, signature, version FROM crash_groups WHERE day < ? LIMIT 100)`).bind(Math.floor((now - RETENTION_MS) / DAY_MS)),
+    db.prepare("DELETE FROM crash_days WHERE day IN (SELECT day FROM crash_days WHERE day < ? LIMIT 100)")
+      .bind(Math.floor((now - RETENTION_MS) / DAY_MS)),
+  ]);
+  const cleaned = cleanup.reduce((sum, result) => sum + result.meta.changes, 0);
   const rows = await env.CRASH_INDEX.prepare("SELECT id FROM crash_reports WHERE received_at <= ? ORDER BY received_at LIMIT 100")
     .bind(now - RETENTION_MS).all<{ id: string }>();
-  if (!rows.results.length) return 0;
+  if (!rows.results.length) return cleaned;
   const ids = rows.results.map((row) => row.id);
   // A delayed conditional put cannot recreate a payload after this overwrite. R2 lifecycle
   // removes the empty markers later; they contain no report fields or installation identity.
@@ -124,5 +141,5 @@ export async function expire(env: Env, now = Date.now()): Promise<number> {
   await Promise.all(ids.map((id) => reports.put(objectKey(id), "", { customMetadata: EXPIRED_METADATA })));
   await env.CRASH_INDEX.prepare(`DELETE FROM crash_reports WHERE id IN (${ids.map(() => "?").join(",")})`)
     .bind(...ids).run();
-  return ids.length;
+  return ids.length + cleaned;
 }

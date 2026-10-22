@@ -25,7 +25,7 @@
       "name": "CRASH_IP_LIMIT",
       "namespace_id": "1001",
       "simple": {
-        "limit": 30,
+        "limit": 5,
         "period": 60
       }
     },

@@ -254,19 +254,55 @@ a minute sample is not a record of every join and departure.
 
 `POST /v1/crash-reports` accepts schema-1 gzip JSON from consented clients. It limits the wire body
 to 64 KiB and the inflated JSON to 512 KiB. Invalid framing, fields, native frame indices and deep
-objects are rejected before storage. Workers bindings limit each IP to 30 requests per minute and
-each random install id to 6 per minute. These are Cloudflare's local rate limits; counters are not
-Durable Object rows. IP addresses are used only by the transient limiter and never stored with a
-report. Invocation logging stays disabled.
+objects are rejected before payload storage. Workers bindings limit each IP to 5 requests per minute
+and each random install id to 6 per minute. The install id is advisory and does not authenticate a
+client. The minute limits are approximate and local to each Cloudflare location. D1 separately
+enforces 50 attempts per IP per UTC day, including malformed bodies. It stores only a hash using a
+random daily salt, separately from reports, and the hourly cron removes past-day IP counters. At
+most 65,536 distinct IP counters can be created per day; further new IPs receive 429. Raw IP
+addresses are never stored. Invocation logging stays disabled.
 
-R2 holds each payload under its random report id. D1 holds one index row and a fixed set of indexes.
-A retry with identical content completes an interrupted write or returns success without storing
-another report. Reusing an id with different content fails validation. Owner-only routes require
+Admission requires a version found in the 100 most recent published GitHub releases or the newest
+available nightly, beta or stable update manifest, and a 6–40 character hexadecimal commit id.
+Publication lookups have bounded response sizes and deadlines, with a five-minute location cache.
+Publication failures return 503 and are cached for 30 seconds. This checks admission only: callers
+can copy a published build identity, so it provides no authentication.
+
+Each normalised `(signature, release)` group reserves at most 20 full payload samples per UTC day.
+Further reports return 202 and increment only the group's daily count, without R2 writes or
+per-report index rows. Grouping folds case, Unicode compatibility forms and whitespace, and caps
+signatures at 240 characters. Index OS, GPU vendor and backend values use fixed buckets, with
+unknown values mapped to `other`; they do not create additional groups. Sampled payloads keep
+their original fields. A D1 transaction reserves samples, bytes and new groups before R2 writes,
+including concurrent uploads. Failed uploads keep their reservations so retries cannot reopen
+capacity. Counting-only traffic performs one group upsert, plus the separate daily IP accounting;
+the number of D1 writes per report stays constant. No crash path writes to a Durable Object.
+
+The Worker variables below control the UTC-day budgets. Byte reservations use the inflated JSON
+size, which is the size stored in R2. Exhausting bytes or a group's samples keeps counting existing
+groups; exhausting new-group capacity returns 429 for unknown groups. Zero samples or bytes permits
+counting only. Invalid settings return 503. Set `CRASH_INGESTION_DISABLED` to `true` to stop all
+ingestion before rate limiting, decoding or storage; only the exact value `false` enables ingestion.
+
+| Variable | Default |
+| --- | --- |
+| `CRASH_INGESTION_DISABLED` | `false` |
+| `CRASH_SAMPLES_PER_GROUP` | `20` |
+| `CRASH_DAILY_MAX_BYTES` | `67108864` (64 MiB) |
+| `CRASH_DAILY_MAX_GROUPS` | `1000` |
+
+R2 holds only sampled payloads under their random report ids. D1 holds one index row per reserved
+sample and bounded daily aggregates. A sampled retry with identical content completes an
+interrupted write or returns success without another sample or count. Reusing a sampled id with
+different content fails validation. Counting-only reports have no retained id, so their retries
+can increment counts again. Owner-only routes require
 `Authorization: Bearer <CRASH_OWNER_SECRET>`: `GET /v1/crash-reports` lists recent reports,
-`?groups=1` groups by signature, version, OS, GPU and backend, and `/:id` reads one report.
+`?groups=1` groups by normalised signature and release, and `/:id` reads one sampled report.
+Groups include `count` (admitted reports, including pending samples) and `samples` (reserved sample
+slots). Daily group counters expire after 90 full UTC days; a boundary day can be partially expired.
 Responses are never cached. Lists contain at most 100 rows; pass `next_cursor` as the `cursor` parameter for another page.
 
-Expired reports disappear from owner routes after 90 days. In bounded batches, the hourly cron
+Expired reports disappear from owner routes after 90 days. In at most nine batches, the hourly cron
 replaces expired R2 payloads with empty markers before deleting their D1 index rows. These markers
 contain no report fields or install identity and prevent delayed retries from recreating deleted
 payloads. The bucket lifecycle later removes the empty markers. Configure an R2 90-day object lifecycle

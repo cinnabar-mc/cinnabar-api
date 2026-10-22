@@ -1,4 +1,4 @@
-import { cloudflareTest } from "@cloudflare/vitest-plugin";
+import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
 import local from "./crash-bindings.local.json";
 
@@ -17,7 +17,8 @@ export default defineConfig({
       wrangler: { configPath: "./wrangler.jsonc" },
       miniflare: {
         r2Buckets, d1Databases, ratelimits,
-        bindings: { ISSUER: "https://issuer.test", RELEASE_HOOK_SECRET: "test-hook-secret", PRESENCE_READ_SECRET: "test-presence-secret", CRASH_OWNER_SECRET: "test-crash-owner" },
+        bindings: { TEST_CRASH_MIGRATIONS: await readD1Migrations("./migrations"),
+          ISSUER: "https://issuer.test", RELEASE_HOOK_SECRET: "test-hook-secret", PRESENCE_READ_SECRET: "test-presence-secret", CRASH_OWNER_SECRET: "test-crash-owner" },
       },
     }),
   ],

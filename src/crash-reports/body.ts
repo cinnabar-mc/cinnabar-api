@@ -1,7 +1,7 @@
 import { MAX_COMPRESSED_BYTES, MAX_JSON_BYTES } from "./schema";
 
 /** Reads a bounded stream and cancels promptly at the limit, including an inflated gzip body. */
-async function bounded(stream: ReadableStream<Uint8Array>, limit: number): Promise<Uint8Array<ArrayBuffer> | null> {
+export async function bounded(stream: ReadableStream<Uint8Array>, limit: number): Promise<Uint8Array<ArrayBuffer> | null> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;

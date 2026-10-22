@@ -133,7 +133,10 @@ export default {
   /** Samples at execution time, so delayed cron delivery cannot fabricate past counts. */
   async scheduled(controller: ScheduledController, env: Env): Promise<void> {
     if (controller.cron === "17 * * * *") {
-      while (await crashes.expire(env)) { /* Drain expired rows in bounded batches. */ }
+      // Leave room for D1 calls alongside at most 900 R2 marker writes per invocation.
+      for (let batch = 0; batch < 9; batch++) {
+        if (!(await crashes.expire(env))) break;
+      }
     }
     else await hubFor(env).recordOnlineCount();
   },

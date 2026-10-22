@@ -60,6 +60,7 @@ export interface Payload {
   signature: string;
   kind: string;
   release: string;
+  commit: string;
   os: string;
   gpu?: string | null;
   backend?: string | null;
