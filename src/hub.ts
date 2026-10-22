@@ -706,8 +706,11 @@ export class Hub extends DurableObject<Env> {
         startedAt: Date.now(), frames: 0, bytes: 0, rateLimited: 0,
       },
     };
-    if (attachment.stage === "ready") delete attachment.ipHash;
-    else attachment.ipHash ??= this.sessions.get(ws)?.ipHash;
+    if (attachment.stage === "ready") {
+      delete attachment.ipHash;
+      // A socket joining a spent account carries its bucket too, so rotating sockets can't shed it.
+      attachment.lookupBudget ??= this.lookupBudgets.get(attachment.xuid);
+    } else attachment.ipHash ??= this.sessions.get(ws)?.ipHash;
     if (persist) ws.serializeAttachment(attachment);
     if (attachment.stage === "ready") {
       this.releasePendingIp(ws);
