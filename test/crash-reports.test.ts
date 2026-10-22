@@ -1,5 +1,7 @@
 /// <reference types="vite/client" />
 import { env, exports } from "cloudflare:workers";
+import worker from "../src/index";
+import local from "../crash-bindings.local.json";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import migration from "../migrations/0001_crash_reports.sql?raw";
 import { receive, expire, listing, report } from "../src/crash-reports";
@@ -211,6 +213,18 @@ describe("crash reports", { timeout: 30000 }, () => {
     expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(1);
   });
 
+  it("returns not found when retention replaces a payload during an owner read", async () => {
+    const value = payload();
+    await receive(await request(value), bindings());
+    const original = crashEnv.CRASH_REPORTS.get.bind(crashEnv.CRASH_REPORTS);
+    const get = vi.spyOn(crashEnv.CRASH_REPORTS, "get").mockImplementationOnce(async (key, options) => {
+      await expire(crashEnv, Date.now() + RETENTION_MS + 1);
+      return original(key, options);
+    });
+    try { expect((await report(value.report_id, crashEnv)).status).toBe(404); }
+    finally { get.mockRestore(); }
+  });
+
   it("paginates every crash group with tied timestamps", async () => {
     const received = Date.now();
     await crashEnv.CRASH_INDEX.batch(Array.from({ length: 101 }, (_, index) =>
@@ -227,6 +241,14 @@ describe("crash reports", { timeout: 30000 }, () => {
     expect(second.next_cursor).toBeNull();
     expect(new Set([...first.groups, ...second.groups].map((group) => group.signature)).size).toBe(101);
     expect((await owner("?groups=1&cursor=invalid")).status).toBe(400);
+  });
+
+  it("runs retention through the configured hourly schedule", async () => {
+    const value = payload();
+    await receive(await request(value), bindings(), Date.now() - RETENTION_MS - 1);
+    await worker.scheduled({ cron: local.triggers.crons[0] } as ScheduledController, crashEnv);
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) AS count FROM crash_reports").first("count")).toBe(0);
+    expect(await (await crashEnv.CRASH_REPORTS.get(`reports/${value.report_id}.json`))?.text()).toBe("");
   });
 
   it("uses the configured per-install limiter", async () => {

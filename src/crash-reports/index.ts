@@ -103,8 +103,8 @@ export async function report(id: string, env: Env): Promise<Response> {
     .bind(id).first<{ received_at: number }>();
   if (!row || row.received_at <= Date.now() - RETENTION_MS) return new Response(null, { status: 404 });
   const object = await env.CRASH_REPORTS.get(objectKey(id));
-  return object ? new Response(object.body, { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } })
-    : new Response(null, { status: 404 });
+  if (!object || object.customMetadata?.expired === EXPIRED_METADATA.expired) return new Response(null, { status: 404 });
+  return new Response(object.body, { headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
 }
 
 /** Replaces one bounded batch of expired payloads with empty markers before removing index rows.
