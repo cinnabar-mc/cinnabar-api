@@ -1,6 +1,8 @@
 import { readPayload } from "./body";
 import { RETENTION_MS, validPayload } from "./schema";
 
+const PAGE_SIZE = 100;
+
 /** Uses a fixed key for a report id so a lost acknowledgement cannot create another object. */
 function objectKey(id: string): string { return `reports/${id}.json`; }
 
@@ -27,9 +29,11 @@ export async function receive(request: Request, env: Env, now = Date.now()): Pro
     (id, install_id, payload_hash, received_at, signature, version, os, gpu, backend) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .bind(payload.report_id, payload.install_id, hash, now, payload.signature,
       payload.release, payload.os, payload.gpu ?? "", payload.backend ?? "").run();
-  const row = await db.prepare("SELECT install_id, payload_hash, stored FROM crash_reports WHERE id = ?")
-    .bind(payload.report_id).first<{ install_id: string; payload_hash: string; stored: number }>();
+  const row = await db.prepare("SELECT install_id, payload_hash, received_at, stored FROM crash_reports WHERE id = ?")
+    .bind(payload.report_id).first<{ install_id: string; payload_hash: string; received_at: number; stored: number }>();
   if (row?.install_id !== payload.install_id || row.payload_hash !== hash) return new Response(null, { status: 422 });
+  // Retention may already be deleting this reservation. An expired retry cannot revive its object.
+  if (row.received_at <= now - RETENTION_MS) return new Response(null, { status: 422 });
   if (row.stored) return new Response(null, { status: 200 });
   const object = await env.CRASH_REPORTS.put(objectKey(payload.report_id), decoded.json, {
     onlyIf: { etagDoesNotMatch: "*" }, httpMetadata: { contentType: "application/json" },
@@ -39,7 +43,8 @@ export async function receive(request: Request, env: Env, now = Date.now()): Pro
     const previous = await env.CRASH_REPORTS.head(objectKey(payload.report_id));
     if (previous?.customMetadata?.sha256 !== hash) throw new Error("inconsistent crash object reservation");
   }
-  await db.prepare("UPDATE crash_reports SET stored = 1 WHERE id = ? AND stored = 0").bind(payload.report_id).run();
+  const confirmed = await db.prepare("UPDATE crash_reports SET stored = 1 WHERE id = ? AND stored = 0").bind(payload.report_id).run();
+  if (!confirmed.meta.changes) return new Response(null, { status: 503 });
   return new Response(null, { status: 201 });
 }
 
@@ -50,26 +55,31 @@ function limited(): Response { return new Response(null, { status: 429, headers:
 export async function listing(url: URL, env: Env): Promise<Response> {
   if (!configured(env)) return new Response(null, { status: 503 });
   const cutoff = Date.now() - RETENTION_MS;
-  if (url.searchParams.get("groups") === "1") {
-    const rows = await env.CRASH_INDEX.prepare(`SELECT signature, version, os, gpu, backend,
-      COUNT(*) AS count, MAX(received_at) AS latest_at FROM crash_reports
-      WHERE stored = 1 AND received_at > ? GROUP BY signature, version, os, gpu, backend
-      ORDER BY latest_at DESC LIMIT 100`).bind(cutoff).all();
-    return Response.json({ groups: rows.results }, { headers: { "Cache-Control": "no-store" } });
-  }
   const cursor = url.searchParams.get("cursor");
   const match = cursor?.match(/^([0-9]+):([0-9a-f]{32})$/);
   if (cursor && !match) return new Response(null, { status: 400 });
   const before = match ? Number(match[1]) : Date.now() + 1;
   const beforeId = match?.[2] ?? "z";
   if (!Number.isSafeInteger(before)) return new Response(null, { status: 400 });
+  if (url.searchParams.get("groups") === "1") {
+    const rows = await env.CRASH_INDEX.prepare(`SELECT signature, version, os, gpu, backend,
+      COUNT(*) AS count, MAX(received_at) AS latest_at, MIN(id) AS cursor_id FROM crash_reports
+      WHERE stored = 1 AND received_at > ? GROUP BY signature, version, os, gpu, backend
+      HAVING latest_at < ? OR (latest_at = ? AND cursor_id < ?)
+      ORDER BY latest_at DESC, cursor_id DESC LIMIT ?`).bind(cutoff, before, before, beforeId, PAGE_SIZE)
+      .all<{ latest_at: number; cursor_id: string }>();
+    const last = rows.results.at(-1);
+    const next = rows.results.length === PAGE_SIZE && last ? `${last.latest_at}:${last.cursor_id}` : null;
+    const groups = rows.results.map(({ cursor_id, ...group }) => group);
+    return Response.json({ groups, next_cursor: next }, { headers: { "Cache-Control": "no-store" } });
+  }
   const rows = await env.CRASH_INDEX.prepare(`SELECT id, received_at, signature, version, os, gpu, backend
     FROM crash_reports WHERE stored = 1 AND received_at > ?
     AND (received_at < ? OR (received_at = ? AND id < ?))
-    ORDER BY received_at DESC, id DESC LIMIT 100`).bind(cutoff, before, before, beforeId)
+    ORDER BY received_at DESC, id DESC LIMIT ?`).bind(cutoff, before, before, beforeId, PAGE_SIZE)
     .all<{ id: string; received_at: number }>();
   const last = rows.results.at(-1);
-  const next = rows.results.length === 100 && last ? `${last.received_at}:${last.id}` : null;
+  const next = rows.results.length === PAGE_SIZE && last ? `${last.received_at}:${last.id}` : null;
   return Response.json({ reports: rows.results, next_cursor: next }, { headers: { "Cache-Control": "no-store" } });
 }
 

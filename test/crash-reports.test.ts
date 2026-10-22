@@ -79,7 +79,7 @@ describe("crash reports", { timeout: 30000 }, () => {
     const put = vi.spyOn(broken.CRASH_REPORTS, "put").mockRejectedValueOnce(new Error("unavailable"));
     await expect(receive(await request(value), broken)).rejects.toThrow("unavailable");
     put.mockRestore();
-    expect(await (await owner("?groups=1")).json()).toEqual({ groups: [] });
+    expect(await (await owner("?groups=1")).json()).toEqual({ groups: [], next_cursor: null });
     expect((await receive(await request(value), bindings())).status).toBe(201);
     expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(1);
   });
@@ -152,6 +152,43 @@ describe("crash reports", { timeout: 30000 }, () => {
     expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(1);
     expect(await (await owner("?groups=1")).json()).toMatchObject({ groups: [{ count: 1 }] });
   });
+  it("does not resume a pending reservation while retention removes it", async () => {
+    const value = payload();
+    await receive(await request(value), bindings());
+    await crashEnv.CRASH_REPORTS.delete(`reports/${value.report_id}.json`);
+    await crashEnv.CRASH_INDEX.prepare("UPDATE crash_reports SET stored = 0, received_at = ? WHERE id = ?")
+      .bind(Date.now() - RETENTION_MS - 1, value.report_id).run();
+    const original = crashEnv.CRASH_REPORTS.put.bind(crashEnv.CRASH_REPORTS);
+    const put = vi.spyOn(crashEnv.CRASH_REPORTS, "put").mockImplementationOnce(async (key, data, options) => {
+      await expire(crashEnv);
+      return original(key, data, options);
+    });
+    try {
+      expect((await receive(await request(value), bindings())).status).toBe(422);
+    } finally { put.mockRestore(); }
+    await expire(crashEnv);
+    expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(0);
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) AS count FROM crash_reports").first("count")).toBe(0);
+  });
+
+  it("paginates every crash group with tied timestamps", async () => {
+    const received = Date.now();
+    await crashEnv.CRASH_INDEX.batch(Array.from({ length: 101 }, (_, index) =>
+      crashEnv.CRASH_INDEX.prepare(`INSERT INTO crash_reports
+        (id, install_id, payload_hash, received_at, signature, version, os, gpu, backend, stored)
+        VALUES (?, 'install', 'hash', ?, ?, 'release', 'os', 'gpu', 'backend', 1)`)
+        .bind(index.toString(16).padStart(32, "0"), received, `group-${index}`)));
+    const first = await (await owner("?groups=1")).json() as { groups: { signature: string }[]; next_cursor: string };
+    expect(first.groups).toHaveLength(100);
+    expect(first.next_cursor).toEqual(expect.any(String));
+    const second = await (await owner(`?groups=1&cursor=${encodeURIComponent(first.next_cursor)}`)).json() as
+      { groups: { signature: string }[]; next_cursor: string | null };
+    expect(second.groups).toHaveLength(1);
+    expect(second.next_cursor).toBeNull();
+    expect(new Set([...first.groups, ...second.groups].map((group) => group.signature)).size).toBe(101);
+    expect((await owner("?groups=1&cursor=invalid")).status).toBe(400);
+  });
+
   it("uses the configured per-install limiter", async () => {
     const first = payload();
     for (let i = 0; i < 7; i++) {
