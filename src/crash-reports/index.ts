@@ -4,8 +4,14 @@ import { RETENTION_MS, validPayload } from "./schema";
 /** Uses a fixed key for a report id so a lost acknowledgement cannot create another object. */
 function objectKey(id: string): string { return `reports/${id}.json`; }
 
+/** True only after every crash storage and rate-limit binding has been configured. */
+function configured(env: Env): env is Env & CrashBindings {
+  return !!(env.CRASH_REPORTS && env.CRASH_INDEX && env.CRASH_IP_LIMIT && env.CRASH_INSTALL_LIMIT);
+}
+
 /** Accepts one consented client payload without invoking a Durable Object. */
 export async function receive(request: Request, env: Env, now = Date.now()): Promise<Response> {
+  if (!configured(env)) return new Response(null, { status: 503 });
   const ip = request.headers.get("CF-Connecting-IP") ?? "local";
   if (!(await env.CRASH_IP_LIMIT.limit({ key: ip })).success) return limited();
   const decoded = await readPayload(request);
@@ -42,6 +48,7 @@ function limited(): Response { return new Response(null, { status: 429, headers:
 
 /** Lists groups or reports only after the caller has authenticated the owner bearer token. */
 export async function listing(url: URL, env: Env): Promise<Response> {
+  if (!configured(env)) return new Response(null, { status: 503 });
   const cutoff = Date.now() - RETENTION_MS;
   if (url.searchParams.get("groups") === "1") {
     const rows = await env.CRASH_INDEX.prepare(`SELECT signature, version, os, gpu, backend,
@@ -68,6 +75,7 @@ export async function listing(url: URL, env: Env): Promise<Response> {
 
 /** Reads one retained report after owner authentication; raw IP addresses are never stored. */
 export async function report(id: string, env: Env): Promise<Response> {
+  if (!configured(env)) return new Response(null, { status: 503 });
   if (!/^[0-9a-f]{32}$/.test(id)) return new Response(null, { status: 404 });
   const row = await env.CRASH_INDEX.prepare("SELECT received_at FROM crash_reports WHERE id = ? AND stored = 1")
     .bind(id).first<{ received_at: number }>();
@@ -80,6 +88,7 @@ export async function report(id: string, env: Env): Promise<Response> {
 /** Deletes one bounded batch of expired payloads before removing their index rows.
  * Run hourly; pending reservations are also removed. Repeating a failed batch is safe. */
 export async function expire(env: Env, now = Date.now()): Promise<number> {
+  if (!configured(env)) return 0;
   const rows = await env.CRASH_INDEX.prepare("SELECT id FROM crash_reports WHERE received_at <= ? ORDER BY received_at LIMIT 100")
     .bind(now - RETENTION_MS).all<{ id: string }>();
   if (!rows.results.length) return 0;

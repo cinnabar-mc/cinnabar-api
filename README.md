@@ -271,12 +271,19 @@ objects before their D1 index rows in bounded batches. Configure an R2 90-day ob
 as an additional storage safeguard. No report ingestion or retention call uses a Durable Object.
 
 Before deployment, explicitly provision the private report R2 bucket and D1 database, replace the
-placeholder D1 id, apply `migrations/`, configure both rate-limit namespaces and the owner secret,
+local example D1 id, add the crash storage/rate-limit bindings and hourly cron to the default
+production configuration, apply `migrations/`, configure unused rate-limit namespaces and the owner secret,
 and set the R2 retention rule. Provision a separate private symbols bucket for the client's release
 workflow, with bucket-scoped CI upload credentials and account/bucket variables. This source change
 does not provision resources or install secrets. Symbol archives and caches never belong in public
 release assets. The client repository documents offline symbolication with `symbolic`.
 
-For local testing, use `wrangler d1 migrations apply CRASH_INDEX --local` and `wrangler dev --local`.
+`crash-bindings.local.json` contains only local fixture bindings; the default production
+configuration has none of them. Crash routes return 503 and retention does nothing until all
+bindings are configured, so the existing API can still deploy before crash provisioning.
+
+For local testing, run `node tools/crash-local.mjs`, then
+`wrangler d1 migrations apply CRASH_INDEX --local --config .wrangler/crash-local.json` and
+`pnpm dev:crashes`. Do not deploy the generated local fixture configuration.
 The client accepts `CINNABAR_CRASH_UPLOAD_URL=http://127.0.0.1:8787`; plain HTTP is restricted to
 loopback. Use a synthetic local owner secret when testing authenticated routes.

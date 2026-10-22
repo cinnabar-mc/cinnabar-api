@@ -2,18 +2,21 @@
 import { env, exports } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import migration from "../migrations/0001_crash_reports.sql?raw";
-import { receive, expire } from "../src/crash-reports";
+import { receive, expire, listing, report } from "../src/crash-reports";
 import { validPayload, MAX_COMPRESSED_BYTES, MAX_JSON_BYTES, RETENTION_MS } from "../src/crash-reports/schema";
+
+// The fixture configuration supplies every optional crash binding.
+const crashEnv = env as Env & CrashBindings;
 
 beforeAll(async () => {
   for (const sql of migration.replace(/^--.*$/gm, "").split(";").filter((sql) => sql.trim())) {
-    await env.CRASH_INDEX.prepare(sql).run();
+    await crashEnv.CRASH_INDEX.prepare(sql).run();
   }
 });
 beforeEach(async () => {
-  await env.CRASH_INDEX.prepare("DELETE FROM crash_reports").run();
-  const objects = await env.CRASH_REPORTS.list();
-  if (objects.objects.length) await env.CRASH_REPORTS.delete(objects.objects.map((object) => object.key));
+  await crashEnv.CRASH_INDEX.prepare("DELETE FROM crash_reports").run();
+  const objects = await crashEnv.CRASH_REPORTS.list();
+  if (objects.objects.length) await crashEnv.CRASH_REPORTS.delete(objects.objects.map((object) => object.key));
 });
 
 /** A synthetic payload with no account or server identity. */
@@ -31,7 +34,7 @@ async function request(value: unknown): Promise<Request> {
 }
 /** Keeps storage real while giving each test explicit control of the rate-limit result. */
 function bindings() {
-  return { ...env, CRASH_IP_LIMIT: { limit: vi.fn(async () => ({ success: true })) },
+  return { ...crashEnv, CRASH_IP_LIMIT: { limit: vi.fn(async () => ({ success: true })) },
     CRASH_INSTALL_LIMIT: { limit: vi.fn(async () => ({ success: true })) } };
 }
 /** Calls the actual owner route with its configured fixture bearer token. */
@@ -41,6 +44,15 @@ function owner(path = "", token = "test-crash-owner") {
 }
 
 describe("crash reports", { timeout: 30000 }, () => {
+  it("keeps crash routes unavailable until storage is provisioned", async () => {
+    const unconfigured = { ...env, CRASH_REPORTS: undefined, CRASH_INDEX: undefined,
+      CRASH_IP_LIMIT: undefined, CRASH_INSTALL_LIMIT: undefined } as unknown as Env;
+    expect((await receive(await request(payload()), unconfigured)).status).toBe(503);
+    expect((await listing(new URL("https://api.test/v1/crash-reports"), unconfigured)).status).toBe(503);
+    expect((await report(payload().report_id, unconfigured)).status).toBe(503);
+    expect(await expire(unconfigured)).toBe(0);
+  });
+
   it("stores a retry once and keeps grouping counts correct", async () => {
     const value = payload();
     expect((await receive(await request(value), bindings())).status).toBe(201);
@@ -50,7 +62,7 @@ describe("crash reports", { timeout: 30000 }, () => {
     const groups = await (await owner("?groups=1")).json();
     expect(groups).toMatchObject({ groups: [{ signature: value.signature, version: "1.2.3", os: "linux", gpu: "test GPU", backend: "vulkan", count: 2 }] });
     expect((await (await owner(`/${value.report_id}`)).json())).toEqual(value);
-    expect((await env.CRASH_REPORTS.list()).objects).toHaveLength(2);
+    expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(2);
   });
 
   it("rejects id reuse with a changed payload or install", async () => {
@@ -69,15 +81,15 @@ describe("crash reports", { timeout: 30000 }, () => {
     put.mockRestore();
     expect(await (await owner("?groups=1")).json()).toEqual({ groups: [] });
     expect((await receive(await request(value), bindings())).status).toBe(201);
-    expect((await env.CRASH_REPORTS.list()).objects).toHaveLength(1);
+    expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(1);
   });
 
   it("completes an existing R2 object when index confirmation was interrupted", async () => {
     const value = payload();
     await receive(await request(value), bindings());
-    await env.CRASH_INDEX.prepare("UPDATE crash_reports SET stored = 0 WHERE id = ?").bind(value.report_id).run();
+    await crashEnv.CRASH_INDEX.prepare("UPDATE crash_reports SET stored = 0 WHERE id = ?").bind(value.report_id).run();
     expect((await receive(await request(value), bindings())).status).toBe(201);
-    expect((await env.CRASH_REPORTS.list()).objects).toHaveLength(1);
+    expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(1);
     expect(await (await owner(`/${value.report_id}`)).json()).toEqual(value);
   });
 
@@ -101,7 +113,7 @@ describe("crash reports", { timeout: 30000 }, () => {
     let nested: unknown = {};
     for (let i = 0; i < 30; i++) nested = { nested };
     expect(validPayload({ ...value, report: { message: "x", renderer: nested } })).toBe(false);
-    expect(await env.CRASH_INDEX.prepare("SELECT COUNT(*) AS count FROM crash_reports").first("count")).toBe(0);
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) AS count FROM crash_reports").first("count")).toBe(0);
   });
 
   it("caps the compressed body and gzip expansion and rejects malformed encodings", async () => {
@@ -126,7 +138,7 @@ describe("crash reports", { timeout: 30000 }, () => {
       expect(response.status).toBe(429);
       expect(response.headers.get("Retry-After")).toBe("60");
     }
-    expect(await env.CRASH_INDEX.prepare("SELECT COUNT(*) AS count FROM crash_reports").first("count")).toBe(0);
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) AS count FROM crash_reports").first("count")).toBe(0);
   });
 
   it("hides expired reports and deletes their objects and index rows", async () => {
@@ -137,7 +149,7 @@ describe("crash reports", { timeout: 30000 }, () => {
     expect((await owner(`/${old.report_id}`)).status).toBe(404);
     expect(await expire(env, now)).toBe(1);
     expect(await expire(env, now)).toBe(0);
-    expect((await env.CRASH_REPORTS.list()).objects).toHaveLength(1);
+    expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(1);
     expect(await (await owner("?groups=1")).json()).toMatchObject({ groups: [{ count: 1 }] });
   });
   it("uses the configured per-install limiter", async () => {

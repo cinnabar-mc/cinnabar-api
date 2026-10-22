@@ -6,7 +6,7 @@
   "compatibility_date": "2026-09-29",
   "workers_dev": true,
   "routes": [{ "pattern": "api.cinnabar.gg", "custom_domain": true }],
-  "triggers": { "crons": ["* * * * *", "17 * * * *"] },
+  "triggers": { "crons": ["* * * * *"] },
   // Invocation logs would record request metadata such as client IPs, which the API promises not to keep.
   "observability": { "enabled": false },
   "vars": {
@@ -16,15 +16,7 @@
     "ISSUER": "https://authorization.franchise.minecraft-services.net/"
   },
   "analytics_engine_datasets": [{ "binding": "METRICS", "dataset": "cinnabar_api_events" }],
-  "r2_buckets": [{ "binding": "COSMETIC_ASSETS", "bucket_name": "cinnabar-cosmetics" },
-    { "binding": "CRASH_REPORTS", "bucket_name": "cinnabar-crash-reports", "remote": false }],
-  // Provision these explicitly before deployment; this change creates no remote resources.
-  "d1_databases": [{ "binding": "CRASH_INDEX", "database_name": "cinnabar-crash-index",
-    "database_id": "00000000-0000-0000-0000-000000000000", "migrations_dir": "migrations", "remote": false }],
-  "ratelimits": [
-    { "name": "CRASH_IP_LIMIT", "namespace_id": "1001", "simple": { "limit": 30, "period": 60 } },
-    { "name": "CRASH_INSTALL_LIMIT", "namespace_id": "1002", "simple": { "limit": 6, "period": 60 } }
-  ],
+  "r2_buckets": [{ "binding": "COSMETIC_ASSETS", "bucket_name": "cinnabar-cosmetics" }],
   "durable_objects": {
     "bindings": [{ "name": "HUB", "class_name": "Hub" }]
   },

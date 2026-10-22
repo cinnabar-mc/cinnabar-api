@@ -1,0 +1,41 @@
+{
+  "triggers": {
+    "crons": [
+      "17 * * * *"
+    ]
+  },
+  "r2_buckets": [
+    {
+      "binding": "CRASH_REPORTS",
+      "bucket_name": "cinnabar-crash-reports",
+      "remote": false
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "CRASH_INDEX",
+      "database_name": "cinnabar-crash-index",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations",
+      "remote": false
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "CRASH_IP_LIMIT",
+      "namespace_id": "1001",
+      "simple": {
+        "limit": 30,
+        "period": 60
+      }
+    },
+    {
+      "name": "CRASH_INSTALL_LIMIT",
+      "namespace_id": "1002",
+      "simple": {
+        "limit": 6,
+        "period": 60
+      }
+    }
+  ]
+}
