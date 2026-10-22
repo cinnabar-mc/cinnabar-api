@@ -72,6 +72,15 @@ describe("crash reports", { timeout: 30000 }, () => {
     expect((await env.CRASH_REPORTS.list()).objects).toHaveLength(1);
   });
 
+  it("completes an existing R2 object when index confirmation was interrupted", async () => {
+    const value = payload();
+    await receive(await request(value), bindings());
+    await env.CRASH_INDEX.prepare("UPDATE crash_reports SET stored = 0 WHERE id = ?").bind(value.report_id).run();
+    expect((await receive(await request(value), bindings())).status).toBe(201);
+    expect((await env.CRASH_REPORTS.list()).objects).toHaveLength(1);
+    expect(await (await owner(`/${value.report_id}`)).json()).toEqual(value);
+  });
+
   it("requires the owner secret for both listing and payload access", async () => {
     const value = payload();
     await receive(await request(value), bindings());
