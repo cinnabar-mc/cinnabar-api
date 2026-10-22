@@ -1,5 +1,5 @@
 /** Builds an ignored local Wrangler configuration without adding unprovisioned production bindings. */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
@@ -17,5 +17,4 @@ const config = {
   d1_databases: local.d1_databases.map((entry) => ({ ...entry, migrations_dir: resolve(root, entry.migrations_dir) })),
   ratelimits: local.ratelimits,
 };
-mkdirSync(resolve(root, ".wrangler"), { recursive: true });
-writeFileSync(resolve(root, ".wrangler/crash-local.json"), JSON.stringify(config, null, 2) + "\n");
+writeFileSync(resolve(root, ".wrangler.crash-local.json"), JSON.stringify(config, null, 2) + "\n");

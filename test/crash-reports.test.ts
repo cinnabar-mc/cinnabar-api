@@ -213,6 +213,31 @@ describe("crash reports", { timeout: 30000 }, () => {
     expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(1);
   });
 
+  it("does not confirm a replacement reservation after its original expires", async () => {
+    const value = payload();
+    const received = Date.now();
+    await receive(await request(value), bindings(), received);
+    await crashEnv.CRASH_INDEX.prepare("UPDATE crash_reports SET stored = 0 WHERE id = ?").bind(value.report_id).run();
+    await crashEnv.CRASH_REPORTS.delete(`reports/${value.report_id}.json`);
+    const saved = await crashEnv.CRASH_INDEX.prepare("SELECT install_id, payload_hash FROM crash_reports WHERE id = ?")
+      .bind(value.report_id).first<{ install_id: string; payload_hash: string }>();
+    const original = crashEnv.CRASH_REPORTS.put.bind(crashEnv.CRASH_REPORTS);
+    const put = vi.spyOn(crashEnv.CRASH_REPORTS, "put").mockImplementationOnce(async (key, data, options) => {
+      const object = await original(key, data, options);
+      await expire(crashEnv, received + RETENTION_MS + 1);
+      await crashEnv.CRASH_INDEX.prepare(`INSERT INTO crash_reports
+        (id, install_id, payload_hash, received_at, signature, version, os, gpu, backend)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(value.report_id, saved!.install_id, saved!.payload_hash,
+          received + RETENTION_MS + 2, value.signature, value.release, value.os, value.gpu, value.backend).run();
+      return object;
+    });
+    try {
+      expect((await receive(await request(value), bindings(), received + RETENTION_MS - 1)).status).toBe(503);
+    } finally { put.mockRestore(); }
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT stored FROM crash_reports WHERE id = ?").bind(value.report_id).first("stored")).toBe(0);
+    expect(await (await owner("?groups=1")).json()).toMatchObject({ groups: [] });
+  });
+
   it("returns not found when retention replaces a payload during an owner read", async () => {
     const value = payload();
     await receive(await request(value), bindings());

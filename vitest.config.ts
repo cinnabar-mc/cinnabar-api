@@ -11,6 +11,7 @@ const ratelimits = Object.fromEntries(local.ratelimits.map(
 ));
 
 export default defineConfig({
+  test: { include: ["test/**/*.test.ts"] },
   plugins: [
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },

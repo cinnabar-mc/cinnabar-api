@@ -19,8 +19,8 @@
     "deploy": "wrangler deploy",
     "cf-typegen": "wrangler types --strict-vars false",
     "typecheck": "wrangler types --strict-vars false && tsc --noEmit",
-    "test": "vitest run",
-    "dev:crashes": "node tools/crash-local.mjs && wrangler dev --local --config .wrangler/crash-local.json"
+    "test": "vitest run && node --test tools/tests/*.test.mjs",
+    "dev:crashes": "node tools/crash-local.mjs && wrangler dev --local --config .wrangler.crash-local.json"
   },
   "dependencies": {
     "@cfworker/json-schema": "^4.1.1",

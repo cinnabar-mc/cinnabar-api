@@ -50,10 +50,13 @@ export async function receive(request: Request, env: Env, now = Date.now()): Pro
     }
     if (previous?.customMetadata?.sha256 !== hash) throw new Error("inconsistent crash object reservation");
   }
-  const confirmed = await db.prepare("UPDATE crash_reports SET stored = 1 WHERE id = ? AND stored = 0").bind(payload.report_id).run();
+  const confirmed = await db.prepare(`UPDATE crash_reports SET stored = 1
+    WHERE id = ? AND stored = 0 AND received_at = ? AND install_id = ? AND payload_hash = ?`)
+    .bind(payload.report_id, row.received_at, payload.install_id, hash).run();
   if (!confirmed.meta.changes) {
     const latest = await lookup.first<NonNullable<typeof row>>();
-    if (latest?.stored && latest.install_id === payload.install_id && latest.payload_hash === hash
+    if (latest?.stored && latest.received_at === row.received_at
+      && latest.install_id === payload.install_id && latest.payload_hash === hash
       && latest.received_at > now - RETENTION_MS) return new Response(null, { status: 200 });
     return new Response(null, { status: 503 });
   }

@@ -285,7 +285,7 @@ configuration has none of them. Crash routes return 503 and retention does nothi
 bindings are configured, so the existing API can still deploy before crash provisioning.
 
 For local testing, run `node tools/crash-local.mjs`, then
-`wrangler d1 migrations apply CRASH_INDEX --local --config .wrangler/crash-local.json` and
+`wrangler d1 migrations apply CRASH_INDEX --local --config .wrangler.crash-local.json` and
 `pnpm dev:crashes`. Do not deploy the generated local fixture configuration.
 The client accepts `CINNABAR_CRASH_UPLOAD_URL=http://127.0.0.1:8787`; plain HTTP is restricted to
 loopback. Use a synthetic local owner secret when testing authenticated routes.
