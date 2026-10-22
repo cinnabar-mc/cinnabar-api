@@ -2,6 +2,8 @@ import { readPayload } from "./body";
 import { RETENTION_MS, validPayload } from "./schema";
 
 const PAGE_SIZE = 100;
+// Empty objects fence conditional uploads after payload retention removes their index rows.
+const EXPIRED_METADATA = { expired: "1" };
 
 /** Uses a fixed key for a report id so a lost acknowledgement cannot create another object. */
 function objectKey(id: string): string { return `reports/${id}.json`; }
@@ -29,8 +31,8 @@ export async function receive(request: Request, env: Env, now = Date.now()): Pro
     (id, install_id, payload_hash, received_at, signature, version, os, gpu, backend) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .bind(payload.report_id, payload.install_id, hash, now, payload.signature,
       payload.release, payload.os, payload.gpu ?? "", payload.backend ?? "").run();
-  const row = await db.prepare("SELECT install_id, payload_hash, received_at, stored FROM crash_reports WHERE id = ?")
-    .bind(payload.report_id).first<{ install_id: string; payload_hash: string; received_at: number; stored: number }>();
+  const lookup = db.prepare("SELECT install_id, payload_hash, received_at, stored FROM crash_reports WHERE id = ?").bind(payload.report_id);
+  const row = await lookup.first<{ install_id: string; payload_hash: string; received_at: number; stored: number }>();
   if (row?.install_id !== payload.install_id || row.payload_hash !== hash) return new Response(null, { status: 422 });
   // Retention may already be deleting this reservation. An expired retry cannot revive its object.
   if (row.received_at <= now - RETENTION_MS) return new Response(null, { status: 422 });
@@ -41,10 +43,20 @@ export async function receive(request: Request, env: Env, now = Date.now()): Pro
   });
   if (!object) {
     const previous = await env.CRASH_REPORTS.head(objectKey(payload.report_id));
+    if (previous?.customMetadata?.expired === EXPIRED_METADATA.expired) {
+      await db.prepare("DELETE FROM crash_reports WHERE id = ? AND stored = 0 AND install_id = ? AND payload_hash = ?")
+        .bind(payload.report_id, payload.install_id, hash).run();
+      return new Response(null, { status: 422 });
+    }
     if (previous?.customMetadata?.sha256 !== hash) throw new Error("inconsistent crash object reservation");
   }
   const confirmed = await db.prepare("UPDATE crash_reports SET stored = 1 WHERE id = ? AND stored = 0").bind(payload.report_id).run();
-  if (!confirmed.meta.changes) return new Response(null, { status: 503 });
+  if (!confirmed.meta.changes) {
+    const latest = await lookup.first<NonNullable<typeof row>>();
+    if (latest?.stored && latest.install_id === payload.install_id && latest.payload_hash === hash
+      && latest.received_at > now - RETENTION_MS) return new Response(null, { status: 200 });
+    return new Response(null, { status: 503 });
+  }
   return new Response(null, { status: 201 });
 }
 
@@ -95,7 +107,7 @@ export async function report(id: string, env: Env): Promise<Response> {
     : new Response(null, { status: 404 });
 }
 
-/** Deletes one bounded batch of expired payloads before removing their index rows.
+/** Replaces one bounded batch of expired payloads with empty markers before removing index rows.
  * Run hourly; pending reservations are also removed. Repeating a failed batch is safe. */
 export async function expire(env: Env, now = Date.now()): Promise<number> {
   if (!configured(env)) return 0;
@@ -103,7 +115,10 @@ export async function expire(env: Env, now = Date.now()): Promise<number> {
     .bind(now - RETENTION_MS).all<{ id: string }>();
   if (!rows.results.length) return 0;
   const ids = rows.results.map((row) => row.id);
-  await env.CRASH_REPORTS.delete(ids.map(objectKey));
+  // A delayed conditional put cannot recreate a payload after this overwrite. R2 lifecycle
+  // removes the empty markers later; they contain no report fields or installation identity.
+  const reports = env.CRASH_REPORTS;
+  await Promise.all(ids.map((id) => reports.put(objectKey(id), "", { customMetadata: EXPIRED_METADATA })));
   await env.CRASH_INDEX.prepare(`DELETE FROM crash_reports WHERE id IN (${ids.map(() => "?").join(",")})`)
     .bind(...ids).run();
   return ids.length;

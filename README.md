@@ -266,8 +266,10 @@ another report. Reusing an id with different content fails validation. Owner-onl
 `?groups=1` groups by signature, version, OS, GPU and backend, and `/:id` reads one report.
 Responses are never cached. Lists contain at most 100 rows; pass `next_cursor` as the `cursor` parameter for another page.
 
-Expired reports disappear from owner routes after 90 days. The hourly cron deletes expired R2
-objects before their D1 index rows in bounded batches. Configure an R2 90-day object lifecycle
+Expired reports disappear from owner routes after 90 days. In bounded batches, the hourly cron
+replaces expired R2 payloads with empty markers before deleting their D1 index rows. These markers
+contain no report fields or install identity and prevent delayed retries from recreating deleted
+payloads. The bucket lifecycle later removes the empty markers. Configure an R2 90-day object lifecycle
 as an additional storage safeguard. No report ingestion or retention call uses a Durable Object.
 
 Before deployment, explicitly provision the private report R2 bucket and D1 database, replace the

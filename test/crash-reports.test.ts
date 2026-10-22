@@ -149,7 +149,7 @@ describe("crash reports", { timeout: 30000 }, () => {
     expect((await owner(`/${old.report_id}`)).status).toBe(404);
     expect(await expire(env, now)).toBe(1);
     expect(await expire(env, now)).toBe(0);
-    expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(1);
+    expect((await crashEnv.CRASH_REPORTS.list()).objects.filter((object) => object.size > 0)).toHaveLength(1);
     expect(await (await owner("?groups=1")).json()).toMatchObject({ groups: [{ count: 1 }] });
   });
   it("does not resume a pending reservation while retention removes it", async () => {
@@ -167,8 +167,48 @@ describe("crash reports", { timeout: 30000 }, () => {
       expect((await receive(await request(value), bindings())).status).toBe(422);
     } finally { put.mockRestore(); }
     await expire(crashEnv);
-    expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(0);
+    expect((await crashEnv.CRASH_REPORTS.list()).objects.filter((object) => object.size > 0)).toHaveLength(0);
     expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) AS count FROM crash_reports").first("count")).toBe(0);
+  });
+
+  it("fences an in-flight retry when its pending reservation reaches retention", async () => {
+    const value = payload();
+    const received = Date.now();
+    await receive(await request(value), bindings(), received);
+    await crashEnv.CRASH_REPORTS.delete(`reports/${value.report_id}.json`);
+    await crashEnv.CRASH_INDEX.prepare("UPDATE crash_reports SET stored = 0 WHERE id = ?").bind(value.report_id).run();
+    const original = crashEnv.CRASH_REPORTS.put.bind(crashEnv.CRASH_REPORTS);
+    const put = vi.spyOn(crashEnv.CRASH_REPORTS, "put").mockImplementationOnce(async (key, data, options) => {
+      await expire(crashEnv, received + RETENTION_MS + 1);
+      return original(key, data, options);
+    });
+    try {
+      const response = await receive(await request(value), bindings(), received + RETENTION_MS - 1);
+      const object = await crashEnv.CRASH_REPORTS.get(`reports/${value.report_id}.json`);
+      expect(await object?.text()).toBe("");
+      expect([422, 503]).toContain(response.status);
+    } finally { put.mockRestore(); }
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) AS count FROM crash_reports").first("count")).toBe(0);
+  });
+
+  it("acknowledges both identical retries finalized concurrently", async () => {
+    const value = payload();
+    const original = crashEnv.CRASH_REPORTS.put.bind(crashEnv.CRASH_REPORTS);
+    let release!: () => void;
+    const both = new Promise<void>((resolve) => { release = resolve; });
+    let arrived = 0;
+    const put = vi.spyOn(crashEnv.CRASH_REPORTS, "put").mockImplementation(async (key, data, options) => {
+      if (++arrived === 2) release();
+      await both;
+      return original(key, data, options);
+    });
+    try {
+      const responses = await Promise.all([
+        receive(await request(value), bindings()), receive(await request(value), bindings()),
+      ]);
+      expect(responses.map((response) => response.status).sort()).toEqual([200, 201]);
+    } finally { put.mockRestore(); }
+    expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(1);
   });
 
   it("paginates every crash group with tied timestamps", async () => {
