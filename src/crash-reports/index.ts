@@ -25,10 +25,10 @@ export async function receive(request: Request, env: Env, now = Date.now()): Pro
   if (!limits) return new Response(null, { status: 503 });
   if (limits.reports === 0) return new Response(null, { status: 202 });
   const ip = request.headers.get("CF-Connecting-IP") ?? "local";
-  if (!(await env.CRASH_IP_LIMIT.limit({ key: ip })).success) return limited();
   const db = env.CRASH_INDEX.withSession("first-primary");
-  const admission = await admitIp(db, ip, Math.floor(now / DAY_MS), limits.reports);
+  const admission = await admitIp(db, env.CRASH_IP_LIMIT, ip, Math.floor(now / DAY_MS), limits.reports);
   if (admission === "daily-limit") return new Response(null, { status: 202 });
+  if (admission === "minute-limit") return limited();
   if (admission === "ip-limit") return limited(86400 - Math.floor(now % DAY_MS / 1000));
   const decoded = await readPayload(request);
   if (typeof decoded === "number") return new Response(null, { status: decoded });

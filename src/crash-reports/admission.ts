@@ -37,10 +37,12 @@ export function dimensions(payload: Payload): { os: string; gpu: string; backend
   };
 }
 
-/** Enforces daily IP limits, refusing all accounting writes once the daily report cap is reached. */
-export async function admitIp(db: D1DatabaseSession, ip: string, day: number, maxReports: number): Promise<"admitted" | "ip-limit" | "daily-limit"> {
+/** Checks daily report saturation before IP limits, without accounting writes at either ceiling. */
+export async function admitIp(db: D1DatabaseSession, limiter: RateLimit, ip: string, day: number,
+  maxReports: number): Promise<"admitted" | "minute-limit" | "ip-limit" | "daily-limit"> {
   let daily = await db.prepare("SELECT salt, reports FROM crash_days WHERE day = ?").bind(day).first<{ salt: string; reports: number }>();
   if (daily && daily.reports >= maxReports) return "daily-limit";
+  if (!(await limiter.limit({ key: ip })).success) return "minute-limit";
   if (!daily) {
     daily = await db.prepare(`INSERT INTO crash_days (day, salt) VALUES (?, ?)
       ON CONFLICT(day) DO UPDATE SET salt = salt WHERE reports < ? RETURNING salt, reports`)

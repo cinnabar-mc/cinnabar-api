@@ -435,6 +435,18 @@ describe("crash reports", { timeout: 30000 }, () => {
     expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(3);
   });
 
+  it("silently drops a full day even when the per-IP minute limiter refuses", async () => {
+    const limited = { ...bindings(), CRASH_DAILY_MAX_REPORTS: "1" };
+    expect((await receive(await request(payload()), limited)).status).toBe(201);
+    limited.CRASH_IP_LIMIT.limit.mockResolvedValue({ success: false });
+    const response = await receive(await request(payload()), limited);
+    expect(response.status).toBe(202);
+    expect(response.headers.has("Retry-After")).toBe(false);
+    expect(limited.CRASH_IP_LIMIT.limit).toHaveBeenCalledTimes(1);
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT reports, ips FROM crash_days").first())
+      .toEqual({ reports: 1, ips: 1 });
+  });
+
   it("resets the daily report cap exactly at UTC midnight", async () => {
     const start = Math.floor(Date.now() / DAY_MS) * DAY_MS;
     const limited = { ...bindings(), CRASH_SAMPLES_PER_GROUP: "0", CRASH_DAILY_MAX_REPORTS: "1" };
