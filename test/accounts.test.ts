@@ -82,6 +82,26 @@ describe("per-account lookup bucket", () => {
     expect((await (await player("2")).lookup(roster)).type).toBe("lookup_result");
   });
 
+  it("keeps a spent bucket when its socket closes before a sibling hibernates", async () => {
+    const first = await player();
+    const second = await player();
+    await drain(first);
+    first.close();
+    await first.closed;
+    await evictDurableObject(hub());
+    expect((await second.lookup(["9"])).code).toBe("rate_limited");
+  });
+
+  it("keeps a spent bucket on a socket that joins after the spend", async () => {
+    const first = await player();
+    await drain(first);
+    const second = await player();
+    first.close();
+    await first.closed;
+    await evictDurableObject(hub());
+    expect((await second.lookup(["9"])).code).toBe("rate_limited");
+  });
+
   it("stores a bucket row only when the account's last socket leaves", async () => {
     const first = await player();
     await drain(first);

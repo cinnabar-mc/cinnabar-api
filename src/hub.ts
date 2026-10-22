@@ -92,6 +92,7 @@ export class Hub extends DurableObject<Env> {
   /**
    * Per-account lookup buckets. Socket attachments carry them across hibernation; a SQL row is written only when
    * the account's last socket leaves with a spent bucket, since a row per lookup exhausts the daily write quota.
+   * A shutdown that skips close handlers, such as a deploy, refills the buckets of connected accounts.
    */
   private readonly lookupBudgets = new Map<string, LookupBudget>();
   private cosmeticCatalog: Catalog = catalog;
@@ -613,6 +614,11 @@ export class Hub extends DurableObject<Env> {
     const lookupBudget = { tokens: admitted ? tokens - cost : tokens, updatedAt: now };
     this.lookupBudgets.set(state.xuid, lookupBudget);
     this.ctx.waitUntil(this.scheduleAlarm(now + LOOKUP_BUDGET_TTL_MS));
+    // Every socket of the account carries the latest bucket, so closing any one of them keeps it.
+    for (const peer of this.byXuid.get(state.xuid) ?? []) {
+      const session = this.sessions.get(peer);
+      if (peer !== ws && session?.stage === "ready") this.save(peer, { ...session, lookupBudget });
+    }
     if (admitted) this.save(ws, { ...state, lookupBudget });
     if (!admitted) {
       const traffic = { ...state.traffic, rateLimited: state.traffic.rateLimited + 1 };
@@ -700,8 +706,11 @@ export class Hub extends DurableObject<Env> {
         startedAt: Date.now(), frames: 0, bytes: 0, rateLimited: 0,
       },
     };
-    if (attachment.stage === "ready") delete attachment.ipHash;
-    else attachment.ipHash ??= this.sessions.get(ws)?.ipHash;
+    if (attachment.stage === "ready") {
+      delete attachment.ipHash;
+      // A socket joining a spent account carries its bucket too, so rotating sockets can't shed it.
+      attachment.lookupBudget ??= this.lookupBudgets.get(attachment.xuid);
+    } else attachment.ipHash ??= this.sessions.get(ws)?.ipHash;
     if (persist) ws.serializeAttachment(attachment);
     if (attachment.stage === "ready") {
       this.releasePendingIp(ws);
@@ -716,7 +725,9 @@ export class Hub extends DurableObject<Env> {
       index(this.byChannel, attachment.channel, ws);
       for (const id of attachment.watching ?? []) index(this.emoteWatchers, id, ws);
       const budget = attachment.lookupBudget;
-      if (budget && budget.updatedAt > (this.lookupBudgets.get(attachment.xuid)?.updatedAt ?? -Infinity)) {
+      const current = this.lookupBudgets.get(attachment.xuid);
+      if (budget && (!current || budget.updatedAt > current.updatedAt
+        || (budget.updatedAt === current.updatedAt && budget.tokens < current.tokens))) {
         this.lookupBudgets.set(attachment.xuid, budget);
       }
     }
