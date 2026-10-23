@@ -1,11 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { publishedRelease, RELEASE_CACHE_KEY, RELEASE_CACHE_NAME } from "../src/crash-reports/releases";
+import { RELEASE_CACHE_KEY, RELEASE_CACHE_NAME } from "../src/crash-reports/releases";
 
 const LIST = "https://api.github.com/repos/cinnabar-mc/cinnabar/releases?per_page=100";
 const RELEASES = "https://github.com/cinnabar-mc/cinnabar/releases/";
 const CHANNELS = "https://raw.githubusercontent.com/cinnabar-mc/cinnabar/dev/packaging/release-assets.json";
 
+let publishedRelease: typeof import("../src/crash-reports/releases").publishedRelease;
+
 beforeEach(async () => {
+  vi.resetModules();
+  ({ publishedRelease } = await import("../src/crash-reports/releases"));
   const cache = await caches.open(RELEASE_CACHE_NAME);
   await cache.delete(RELEASE_CACHE_KEY);
   await cache.delete(`${RELEASE_CACHE_KEY}/refresh`);
@@ -104,6 +108,28 @@ describe("crash release admission", () => {
     expect(lookups).toBe(1);
   });
 
+  it("preserves a success another isolate writes before a pending lookup fails", async () => {
+    const { fetcher } = publisher();
+    const started = Promise.withResolvers<void>();
+    const fail = Promise.withResolvers<void>();
+    fetcher.mockImplementation(async () => {
+      started.resolve();
+      await fail.promise;
+      return new Response(null, { status: 503 });
+    });
+    const pending = publishedRelease("1.2.3");
+    await started.promise;
+    // A separate isolate publishes to the same cache while this lookup is pending.
+    const cache = await caches.open(RELEASE_CACHE_NAME);
+    await cache.put(RELEASE_CACHE_KEY, Response.json({ versions: ["1.2.3"] },
+      { headers: { "Cache-Control": "public, max-age=300" } }));
+    fail.resolve();
+    expect(await pending).toBe(true);
+    expect(await publishedRelease("1.2.3")).toBe(true);
+    expect(await (await cache.match(RELEASE_CACHE_KEY))?.json()).toEqual({ versions: ["1.2.3"] });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
   it("admits the current nightly when its rolling release is beyond the first 100 releases", async () => {
     const { releases, fetcher } = publisher();
     releases.unshift(...Array.from({ length: 100 }, (_, index) => ({
@@ -127,22 +153,38 @@ describe("crash release admission", () => {
     expect(await publishedRelease("1.2.5-nightly")).toBe(false);
   });
 
-  it("fails closed during publication outages and caches failures briefly", async () => {
+  it("fails closed during publication outages and backs off only in isolate memory", async () => {
     const { fetcher } = publisher();
     fetcher.mockResolvedValue(new Response(null, { status: 503 }));
     expect(await publishedRelease("1.2.3")).toBeNull();
     expect(await publishedRelease("1.2.4")).toBeNull();
     expect(fetcher).toHaveBeenCalledTimes(1);
-    expect((await (await caches.open(RELEASE_CACHE_NAME)).match(RELEASE_CACHE_KEY))?.headers.get("Cache-Control"))
-      .toBe("public, max-age=30");
-    await (await caches.open(RELEASE_CACHE_NAME)).delete(RELEASE_CACHE_KEY);
+    expect(await (await caches.open(RELEASE_CACHE_NAME)).match(RELEASE_CACHE_KEY)).toBeUndefined();
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now + 30_001);
     fetcher.mockRestore();
     publisher();
     expect(await publishedRelease("1.2.3")).toBe(true);
+    clock.mockRestore();
+  });
+
+  it("lets another isolate refresh during the first isolate's failure backoff", async () => {
+    const { fetcher } = publisher();
+    const fetchPublication = fetcher.getMockImplementation()!;
+    fetcher.mockResolvedValue(new Response(null, { status: 503 }));
+    expect(await publishedRelease("1.2.3")).toBeNull();
+    expect(await (await caches.open(RELEASE_CACHE_NAME)).match(RELEASE_CACHE_KEY)).toBeUndefined();
+
+    vi.resetModules();
+    const otherIsolate = await import("../src/crash-reports/releases");
+    fetcher.mockImplementation(fetchPublication);
+    expect(await otherIsolate.publishedRelease("1.2.3")).toBe(true);
+    expect(await publishedRelease("1.2.3")).toBe(true);
+    expect(fetcher).toHaveBeenCalledTimes(5);
   });
 
   it.each([CHANNELS, `${RELEASES}download/nightly/update-nightly.json`])(
-    "fails closed and caches an outage fetching %s", async (url) => {
+    "fails closed and backs off after an outage fetching %s", async (url) => {
       const { fetcher } = publisher();
       const fetchPublication = fetcher.getMockImplementation()!;
       fetcher.mockImplementation(async (input, init) => String(input) === url
@@ -151,8 +193,7 @@ describe("crash release admission", () => {
       const calls = fetcher.mock.calls.length;
       expect(await publishedRelease("1.2.3")).toBeNull();
       expect(fetcher).toHaveBeenCalledTimes(calls);
-      expect((await (await caches.open(RELEASE_CACHE_NAME)).match(RELEASE_CACHE_KEY))?.headers.get("Cache-Control"))
-        .toBe("public, max-age=30");
+      expect(await (await caches.open(RELEASE_CACHE_NAME)).match(RELEASE_CACHE_KEY)).toBeUndefined();
     },
   );
 
@@ -171,7 +212,7 @@ describe("crash release admission", () => {
     const { releases, assets, manifests, fetcher } = publisher();
     manifests.set("download/nightly/update-nightly.json", { version: "1.2.5-nightly", channel: "stable" });
     expect(await publishedRelease("1.2.3")).toBeNull();
-    await (await caches.open(RELEASE_CACHE_NAME)).delete(RELEASE_CACHE_KEY);
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 30_001);
     fetcher.mockResolvedValueOnce(Response.json(releases)).mockResolvedValueOnce(Response.json(assets))
       .mockResolvedValueOnce(Response.json({ manifest: "not base64" }));
     expect(await publishedRelease("1.2.3")).toBeNull();

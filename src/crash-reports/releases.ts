@@ -7,6 +7,7 @@ const CHANNELS = `https://raw.githubusercontent.com/${REPOSITORY}/dev/packaging/
 const RELEASES = "https://api.github.com/repos/cinnabar-mc/cinnabar/releases?per_page=100";
 const VERSION = /^v?(\d{1,5}\.\d{1,5}\.\d{1,5}(?:-(?:nightly|beta|alpha|rc)(?:[.-]\d{1,10})?)?)$/;
 let refreshInFlight: Promise<string[] | null> | undefined;
+let retryAfter = 0;
 
 /** Returns the canonical published version, excluding arbitrary tags and build metadata. */
 function version(value: unknown): string | null {
@@ -76,17 +77,19 @@ async function publishedVersions(): Promise<string[]> {
 /** Shares one refresh and cache write among waiters, preserving existing admission on failure. */
 function refreshVersions(cache: Cache, hasEntry: boolean): Promise<string[] | null> {
   return refreshInFlight ??= (async () => {
-    if (hasEntry) {
-      const refreshKey = `${RELEASE_CACHE_KEY}/refresh`;
-      if (await cache.match(refreshKey)) return null;
-      await cache.put(refreshKey, new Response(null, { headers: { "Cache-Control": "public, max-age=60" } }));
+    if (Date.now() < retryAfter) return null;
+    const refreshKey = `${RELEASE_CACHE_KEY}/refresh`;
+    if (hasEntry && await cache.match(refreshKey)) return null;
+    let versions: string[];
+    try { versions = await publishedVersions(); }
+    catch {
+      retryAfter = Date.now() + 30_000;
+      return null;
     }
-    let versions: string[] | null = null;
-    try { versions = await publishedVersions(); } catch { /* Refuse ingestion while publication cannot be checked. */ }
-    // A failed refresh must not remove admission for versions already in the cache.
-    if (versions || !hasEntry) {
-      await cache.put(RELEASE_CACHE_KEY, Response.json({ versions },
-        { headers: { "Cache-Control": `public, max-age=${versions ? 300 : 30}` } }));
+    await cache.put(RELEASE_CACHE_KEY, Response.json({ versions },
+      { headers: { "Cache-Control": "public, max-age=300" } }));
+    if (hasEntry) {
+      await cache.put(refreshKey, new Response(null, { headers: { "Cache-Control": "public, max-age=60" } }));
     }
     return versions;
   })().finally(() => { refreshInFlight = undefined; });
@@ -105,5 +108,9 @@ export async function publishedRelease(release: string): Promise<boolean | null>
   }
   // A cached absence cannot permanently reject a release published since the lookup.
   const versions = await refreshVersions(cache, !!entry);
-  return versions ? versions.includes(canonical) : null;
+  if (versions) return versions.includes(canonical);
+  // Another isolate may have published a success while this lookup was pending.
+  const latest = await cache.match(RELEASE_CACHE_KEY);
+  const cached = latest ? await latest.json<{ versions: string[] | null }>() : null;
+  return cached?.versions?.includes(canonical) ? true : null;
 }

@@ -4,10 +4,12 @@ import worker from "../src/index";
 import local from "../crash-bindings.local.json";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyD1Migrations } from "cloudflare:test";
-import { receive, expire, listing, report } from "../src/crash-reports";
+import { expire, listing, report } from "../src/crash-reports";
 import { DAY_MS, dimensions } from "../src/crash-reports/admission";
 import { RELEASE_CACHE_KEY, RELEASE_CACHE_NAME } from "../src/crash-reports/releases";
 import { validPayload, MAX_COMPRESSED_BYTES, MAX_JSON_BYTES, RETENTION_MS } from "../src/crash-reports/schema";
+
+let receive: typeof import("../src/crash-reports").receive;
 
 // The fixture configuration supplies every optional crash binding.
 const crashEnv = env as Env & CrashBindings;
@@ -17,6 +19,8 @@ beforeAll(async () => {
   await applyD1Migrations(crashEnv.CRASH_INDEX, fixture.TEST_CRASH_MIGRATIONS);
 });
 beforeEach(async () => {
+  vi.resetModules();
+  ({ receive } = await import("../src/crash-reports"));
   await crashEnv.CRASH_INDEX.batch(["crash_reports", "crash_groups", "crash_ips", "crash_days"].map((table) =>
     crashEnv.CRASH_INDEX.prepare(`DELETE FROM ${table}`)));
   await (await caches.open(RELEASE_CACHE_NAME)).put(RELEASE_CACHE_KEY, Response.json({ versions: ["1.2.3", "1.2.3-beta", "1.2.3-nightly"] },
@@ -713,8 +717,7 @@ describe("crash reports", { timeout: 30000 }, () => {
       expect(response.headers.get("Retry-After")).toBe("60");
     }
     expect(fetcher).toHaveBeenCalledTimes(1);
-    expect((await (await caches.open(RELEASE_CACHE_NAME)).match(`${RELEASE_CACHE_KEY}/refresh`))
-      ?.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(await (await caches.open(RELEASE_CACHE_NAME)).match(`${RELEASE_CACHE_KEY}/refresh`)).toBeUndefined();
     expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) FROM crash_groups").first("COUNT(*)")).toBe(0);
     expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(0);
     expect((await receive(await request(payload()), bindings())).status).toBe(201);
