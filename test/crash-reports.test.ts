@@ -5,7 +5,7 @@ import local from "../crash-bindings.local.json";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyD1Migrations } from "cloudflare:test";
 import { receive, expire, listing, report } from "../src/crash-reports";
-import { DAY_MS } from "../src/crash-reports/admission";
+import { DAY_MS, dimensions } from "../src/crash-reports/admission";
 import { RELEASE_CACHE_KEY, RELEASE_CACHE_NAME } from "../src/crash-reports/releases";
 import { validPayload, MAX_COMPRESSED_BYTES, MAX_JSON_BYTES, RETENTION_MS } from "../src/crash-reports/schema";
 
@@ -89,6 +89,39 @@ async function listingPlan(search: string): Promise<string[]> {
 }
 
 describe("crash reports", { timeout: 30000 }, () => {
+  it.each([
+    ["Intel(R) UHD Graphics 630", "intel"],
+    ["Adreno (TM) 619", "qualcomm"],
+    ["Mali-G78", "arm"],
+    ["Apple M2", "apple"],
+    ["NVIDIA GeForce MX570", "nvidia"],
+    ["AMD Radeon RX 6600", "amd"],
+    ["  iNtEl(r)-UHD Graphics 630  ", "intel"],
+    ["aDrEnO(TM)-619", "qualcomm"],
+    ["mALI-g78", "arm"],
+    ["aPpLe-M2", "apple"],
+    ["nViDiA-GeForce MX570", "nvidia"],
+    ["aMd-Radeon RX 6600", "amd"],
+    ["GeForce GTX 1080", "nvidia"],
+    ["Radeon RX 6600", "amd"],
+    ["PowerVR Rogue GE8320", "imagination"],
+    ["nvidia", "nvidia"],
+    ["amd", "amd"],
+    ["intel", "intel"],
+    ["apple", "apple"],
+    ["qualcomm", "qualcomm"],
+    ["arm", "arm"],
+    ["imagination", "imagination"],
+    ["Unknown adapter", "other"],
+    ["Not Intel UHD Graphics", "other"],
+    ["armature GPU", "other"],
+    ["", "other"],
+    [null, "other"],
+    [undefined, "other"],
+  ])("buckets GPU adapter %s as %s", (gpu, vendor) => {
+    expect(dimensions({ ...payload(), gpu }).gpu).toBe(vendor);
+  });
+
   it("keeps crash routes unavailable until storage is provisioned", async () => {
     const unconfigured = { ...env, CRASH_REPORTS: undefined, CRASH_INDEX: undefined,
       CRASH_GLOBAL_LIMIT: undefined, CRASH_IP_LIMIT: undefined, CRASH_INSTALL_LIMIT: undefined } as unknown as Env;

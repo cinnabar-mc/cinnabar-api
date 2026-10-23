@@ -2,6 +2,15 @@ import type { Payload } from "./schema";
 
 export const DAY_MS = 86_400_000;
 const MAX_DAILY_IPS = 65_536;
+const GPU_VENDORS = [
+  ["nvidia", /^(nvidia|geforce)\b/],
+  ["amd", /^(amd|radeon)\b/],
+  ["intel", /^intel\b/],
+  ["apple", /^apple\b/],
+  ["qualcomm", /^(qualcomm|adreno)\b/],
+  ["arm", /^(arm|mali)\b/],
+  ["imagination", /^(imagination|powervr)\b/],
+] as const;
 
 export interface Budget {
   samples: number;
@@ -27,12 +36,11 @@ export function signature(value: string): string {
 /** Maps index dimensions to fixed sets so random device strings cannot multiply groups. */
 export function dimensions(payload: Payload): { os: string; gpu: string; backend: string } {
   const os = payload.os.trim().toLowerCase();
-  const gpu = payload.gpu?.trim().toLowerCase() ?? "";
+  const gpu = (payload.gpu ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
   const backend = payload.backend?.trim().toLowerCase() ?? "";
   return {
     os: ["linux", "windows", "macos", "android", "ios"].includes(os) ? os : "other",
-    gpu: ["nvidia", "amd", "intel", "apple", "qualcomm", "arm", "imagination"].find((name) =>
-      gpu === name || gpu.startsWith(`${name} `)) ?? "other",
+    gpu: GPU_VENDORS.find(([, prefix]) => prefix.test(gpu))?.[0] ?? "other",
     backend: ["vulkan", "metal", "dx12", "dx11", "gl", "gles", "software"].includes(backend) ? backend : "other",
   };
 }
