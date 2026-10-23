@@ -5,9 +5,8 @@ import { count } from "./metrics";
 export function publicCache(cacheControl: string, query: Readonly<Record<string, string>> = {}): MiddlewareHandler<{ Bindings: Env }> {
   return async (c, next) => {
     const key = new URL(c.req.url);
-    const parameters = new URLSearchParams(key.search);
     key.search = "";
-    for (const [name, fallback] of Object.entries(query)) key.searchParams.set(name, parameters.get(name) ?? fallback);
+    for (const [name, fallback] of Object.entries(query)) key.searchParams.set(name, c.req.query(name) ?? fallback);
     let edge: Cache | undefined;
     try {
       edge = await caches.open("cinnabar-api-v1");

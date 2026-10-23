@@ -92,6 +92,18 @@ it("keeps history ranges in distinct cache entries", async () => {
   expect(r2).toHaveBeenCalledTimes(3);
 });
 
+it.each([["24h", "30d"], ["30d", "24h"]])("keeps encoded duplicate range %s separate from literal range %s", async (encoded, literal) => {
+  const r2 = vi.spyOn(env.API_CACHE, "get");
+  expect(await (await request(`/v1/presence/history?%72ange=${encoded}&range=${literal}`)).json())
+    .toMatchObject({ range: literal });
+  for (let repeat = 0; repeat < 2; repeat++) {
+    for (const range of [encoded, literal]) {
+      expect(await (await request(`/v1/presence/history?range=${range}`)).json()).toMatchObject({ range });
+    }
+  }
+  expect(r2).toHaveBeenCalledTimes(2);
+});
+
 it("revalidates cached catalogs without reading R2 or replacing the full cached response", async () => {
   const r2 = vi.spyOn(env.COSMETIC_ASSETS, "get");
   const put = vi.spyOn(edge, "put");
