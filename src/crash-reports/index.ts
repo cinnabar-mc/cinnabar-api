@@ -89,10 +89,11 @@ export async function listing(url: URL, env: Env): Promise<Response> {
   const beforeId = match?.[2] ?? "z";
   if (!Number.isSafeInteger(before)) return new Response(null, { status: 400 });
   if (url.searchParams.get("groups") === "1") {
-    const rows = await env.CRASH_INDEX.prepare(`SELECT signature, version,
-      SUM(count) AS count, SUM(samples) AS samples, MAX(latest_at) AS latest_at, MIN(cursor_id) AS cursor_id FROM crash_groups
+    const rows = await env.CRASH_INDEX.prepare(`SELECT * FROM (
+      SELECT signature, version, SUM(count) AS count, SUM(samples) AS samples,
+        MAX(latest_at) AS latest_at, MIN(cursor_id) AS cursor_id FROM crash_groups
       WHERE latest_at > ? GROUP BY signature, version
-      HAVING latest_at < ? OR (latest_at = ? AND cursor_id < ?)
+      ) WHERE latest_at < ? OR (latest_at = ? AND cursor_id < ?)
       ORDER BY latest_at DESC, cursor_id DESC LIMIT ?`).bind(cutoff, before, before, beforeId, PAGE_SIZE)
       .all<{ latest_at: number; cursor_id: string }>();
     const last = rows.results.at(-1);

@@ -306,6 +306,44 @@ describe("crash reports", { timeout: 30000 }, () => {
     expect((await owner("?groups=1&cursor=invalid")).status).toBe(400);
   });
 
+  it("paginates recurring crash groups across days without repeats or stalled cursors", async () => {
+    const latest = Math.floor(Date.now() / DAY_MS) * DAY_MS - DAY_MS;
+    const groups = Array.from({ length: 205 }, (_, index) => ({
+      signature: `recurring-${index}`, version: "release", count: 3, samples: 3,
+      latest_at: latest - Math.floor(index / 110),
+      cursor_id: (index * 3).toString(16).padStart(32, "0"),
+    })).sort((a, b) => b.latest_at - a.latest_at || b.cursor_id.localeCompare(a.cursor_id));
+    await crashEnv.CRASH_INDEX.batch(groups.flatMap((group) => [2, 1, 0].map((daysAgo) => {
+      const received = group.latest_at - daysAgo * DAY_MS;
+      const id = (parseInt(group.cursor_id, 16) + 2 - daysAgo).toString(16).padStart(32, "0");
+      return crashEnv.CRASH_INDEX.prepare(`INSERT INTO crash_groups
+        (day, signature, version, cursor_id, count, latest_at, samples) VALUES (?, ?, ?, ?, 1, ?, 1)`)
+        .bind(Math.floor(received / DAY_MS), group.signature, group.version, id, received);
+    })));
+    let cursor: string | null = null;
+    const seen: string[] = [];
+    for (let page = 0; page < 3; page++) {
+      const response = await owner(`?groups=1${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+      expect(response.status).toBe(200);
+      const body = await response.json() as { groups: {
+        signature: string; version: string; count: number; samples: number; latest_at: number;
+      }[]; next_cursor: string | null };
+      const expected = groups.slice(page * 100, (page + 1) * 100);
+      expect(body.groups).toEqual(expected.map(({ cursor_id, ...group }) => group));
+      seen.push(...body.groups.map((group) => group.signature));
+      const last = expected.at(-1)!;
+      expect(body.next_cursor).toBe(page < 2 ? `${last.latest_at}:${last.cursor_id}` : null);
+      if (cursor && body.next_cursor) {
+        const before = Number(cursor.split(":")[0]);
+        const after = Number(body.next_cursor.split(":")[0]);
+        expect(after < before || (after === before && body.next_cursor < cursor)).toBe(true);
+      }
+      cursor = body.next_cursor;
+    }
+    expect(seen).toHaveLength(groups.length);
+    expect(new Set(seen).size).toBe(groups.length);
+  });
+
   it("runs retention through the configured hourly schedule", async () => {
     const value = payload();
     await receive(await request(value), bindings(), Date.now() - RETENTION_MS - 1);
