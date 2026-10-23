@@ -2,7 +2,7 @@
 import { env, exports } from "cloudflare:workers";
 import worker from "../src/index";
 import local from "../crash-bindings.local.json";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyD1Migrations } from "cloudflare:test";
 import { receive, expire, listing, report } from "../src/crash-reports";
 import { DAY_MS } from "../src/crash-reports/admission";
@@ -21,9 +21,26 @@ beforeEach(async () => {
     crashEnv.CRASH_INDEX.prepare(`DELETE FROM ${table}`)));
   await (await caches.open(RELEASE_CACHE_NAME)).put(RELEASE_CACHE_KEY, Response.json({ versions: ["1.2.3", "1.2.3-beta", "1.2.3-nightly"] },
     { headers: { "Cache-Control": "public, max-age=300" } }));
+  await (await caches.open(RELEASE_CACHE_NAME)).delete(`${RELEASE_CACHE_KEY}/refresh`);
   const objects = await crashEnv.CRASH_REPORTS.list();
   if (objects.objects.length) await crashEnv.CRASH_REPORTS.delete(objects.objects.map((object) => object.key));
 });
+
+afterEach(() => vi.restoreAllMocks());
+
+/** Supplies a mutable synthetic publication list and its current stable manifest. */
+function publication(versions = ["1.2.3", "1.2.3-beta", "1.2.3-nightly"]) {
+  const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com/")) {
+      return Response.json(versions.map((tag_name) => ({ tag_name, published_at: "2026-10-01" })));
+    }
+    if (url.endsWith("release-assets.json")) return Response.json({ repository: "cinnabar-mc/cinnabar",
+      update_channels: { stable: { track: "tagged", manifest: "update-stable.json" } } });
+    return Response.json({ manifest: btoa(JSON.stringify({ version: versions[0], channel: "stable" })) });
+  });
+  return { versions, fetcher };
+}
 
 /** A synthetic payload with no account or server identity. */
 function payload() {
@@ -628,6 +645,7 @@ describe("crash reports", { timeout: 30000 }, () => {
   });
 
   it("rejects unshipped versions, implausible commits and empty or oversized signatures", async () => {
+    publication();
     for (const change of [{ release: "9.9.9" }, { release: "custom-build" }, { commit: "local-debug" },
       { signature: " \u200b " }, { signature: "x".repeat(241) }]) {
       expect((await receive(await request({ ...payload(), ...change }), bindings())).status).toBe(422);
@@ -636,6 +654,64 @@ describe("crash reports", { timeout: 30000 }, () => {
     for (const release of ["1.2.3", "1.2.3-beta", "1.2.3-nightly", "v1.2.3"]) {
       expect((await receive(await request({ ...payload(), release }), bindings())).status).toBe(201);
     }
+  });
+
+  it("admits the next upload when a release is published during the cache window", async () => {
+    await (await caches.open(RELEASE_CACHE_NAME)).delete(RELEASE_CACHE_KEY);
+    const { versions, fetcher } = publication();
+    expect((await receive(await request(payload()), bindings())).status).toBe(201);
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    versions.push("1.2.4");
+    const value = { ...payload(), release: "1.2.4" };
+    expect((await receive(await request(value), bindings())).status).toBe(201);
+    expect(fetcher).toHaveBeenCalledTimes(6);
+    expect((await receive(await request(value), bindings())).status).toBe(200);
+    expect(fetcher).toHaveBeenCalledTimes(6);
+  });
+
+  it.each(["http", "network"])("keeps a %s refresh failure retryable and preserves cached admissions", async (failure) => {
+    const fetcher = vi.spyOn(globalThis, "fetch");
+    if (failure === "http") fetcher.mockResolvedValue(new Response(null, { status: 503 }));
+    else fetcher.mockRejectedValue(new Error("publication unavailable"));
+    const value = { ...payload(), release: "1.2.4" };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await receive(await request(value), bindings());
+      expect(response.status).toBe(503);
+      expect(response.headers.get("Retry-After")).toBe("60");
+    }
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect((await (await caches.open(RELEASE_CACHE_NAME)).match(`${RELEASE_CACHE_KEY}/refresh`))
+      ?.headers.get("Cache-Control")).toBe("public, max-age=60");
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) FROM crash_groups").first("COUNT(*)")).toBe(0);
+    expect((await crashEnv.CRASH_REPORTS.list()).objects).toHaveLength(0);
+    expect((await receive(await request(payload()), bindings())).status).toBe(201);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a truly unknown version on a cold publication lookup", async () => {
+    await (await caches.open(RELEASE_CACHE_NAME)).delete(RELEASE_CACHE_KEY);
+    const { fetcher } = publication();
+    const response = await receive(await request({ ...payload(), release: "9.9.9" }), bindings());
+    expect(response.status).toBe(422);
+    expect(response.headers.has("Retry-After")).toBe(false);
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+
+  it("rejects an unknown version only after fetching fresh publication data", async () => {
+    const { versions, fetcher } = publication();
+    const value = { ...payload(), release: "1.2.4" };
+    expect((await receive(await request(value), bindings())).status).toBe(422);
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    versions.push(value.release);
+    const response = await receive(await request(value), bindings());
+    expect(response.status).toBe(503);
+    expect(response.headers.get("Retry-After")).toBe("60");
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(await crashEnv.CRASH_INDEX.prepare("SELECT COUNT(*) FROM crash_groups").first("COUNT(*)")).toBe(0);
+    // Removing the cooldown simulates its expiry without waiting for wall-clock time.
+    await (await caches.open(RELEASE_CACHE_NAME)).delete(`${RELEASE_CACHE_KEY}/refresh`);
+    expect((await receive(await request(value), bindings())).status).toBe(201);
+    expect(fetcher).toHaveBeenCalledTimes(6);
   });
 
   it("disables ingestion before limiter, decoding, release lookup or storage", async () => {

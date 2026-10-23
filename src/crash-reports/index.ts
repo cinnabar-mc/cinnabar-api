@@ -37,7 +37,7 @@ export async function receive(request: Request, env: Env, now = Date.now()): Pro
   if (!(await env.CRASH_INSTALL_LIMIT.limit({ key: payload.install_id })).success) return limited();
   if (!/^[0-9a-f]{6,40}$/i.test(payload.commit) || !signature(payload.signature)) return new Response(null, { status: 422 });
   const published = await publishedRelease(payload.release);
-  if (published === null) return new Response(null, { status: 503 });
+  if (published === null) return new Response(null, { status: 503, headers: { "Retry-After": "60" } });
   if (!published) return new Response(null, { status: 422 });
   const digest = await crypto.subtle.digest("SHA-256", decoded.json);
   const hash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");

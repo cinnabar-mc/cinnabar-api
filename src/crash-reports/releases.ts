@@ -72,18 +72,27 @@ async function publishedVersions(): Promise<string[]> {
   return [...versions];
 }
 
-/** Checks only admission, never authenticity; outages fail closed and are cached briefly. */
+/** Checks admission, refreshing cached misses; null means publication must be retried later. */
 export async function publishedRelease(release: string): Promise<boolean | null> {
   const canonical = version(release);
   if (!canonical) return false;
   const cache = await caches.open(RELEASE_CACHE_NAME);
-  let entry = await cache.match(RELEASE_CACHE_KEY);
-  if (!entry) {
-    let versions: string[] | null = null;
-    try { versions = await publishedVersions(); } catch { /* Refuse ingestion while publication cannot be checked. */ }
-    entry = Response.json({ versions }, { headers: { "Cache-Control": `public, max-age=${versions ? 300 : 30}` } });
-    await cache.put(RELEASE_CACHE_KEY, entry.clone());
+  const entry = await cache.match(RELEASE_CACHE_KEY);
+  if (entry) {
+    const { versions } = await entry.json<{ versions: string[] | null }>();
+    if (!versions) return null;
+    if (versions.includes(canonical)) return true;
+    // A cached absence cannot permanently reject a release published since the lookup.
+    const refreshKey = `${RELEASE_CACHE_KEY}/refresh`;
+    if (await cache.match(refreshKey)) return null;
+    await cache.put(refreshKey, new Response(null, { headers: { "Cache-Control": "public, max-age=60" } }));
   }
-  const { versions } = await entry.json<{ versions: string[] | null }>();
+  let versions: string[] | null = null;
+  try { versions = await publishedVersions(); } catch { /* Refuse ingestion while publication cannot be checked. */ }
+  // A failed refresh must not remove admission for versions already in the cache.
+  if (versions || !entry) {
+    await cache.put(RELEASE_CACHE_KEY, Response.json({ versions },
+      { headers: { "Cache-Control": `public, max-age=${versions ? 300 : 30}` } }));
+  }
   return versions ? versions.includes(canonical) : null;
 }

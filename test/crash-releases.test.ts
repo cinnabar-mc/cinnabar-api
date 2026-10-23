@@ -5,7 +5,11 @@ const LIST = "https://api.github.com/repos/cinnabar-mc/cinnabar/releases?per_pag
 const RELEASES = "https://github.com/cinnabar-mc/cinnabar/releases/";
 const CHANNELS = "https://raw.githubusercontent.com/cinnabar-mc/cinnabar/dev/packaging/release-assets.json";
 
-beforeEach(async () => { await (await caches.open(RELEASE_CACHE_NAME)).delete(RELEASE_CACHE_KEY); });
+beforeEach(async () => {
+  const cache = await caches.open(RELEASE_CACHE_NAME);
+  await cache.delete(RELEASE_CACHE_KEY);
+  await cache.delete(`${RELEASE_CACHE_KEY}/refresh`);
+});
 afterEach(() => vi.restoreAllMocks());
 
 /** Supplies synthetic public release metadata and manifests in their published envelope format. */
@@ -46,9 +50,9 @@ describe("crash release admission", () => {
       expect(await publishedRelease(release)).toBe(true);
     }
     expect(await publishedRelease("9.9.9")).toBe(false);
-    expect(await publishedRelease("8.8.8")).toBe(false);
-    expect(await publishedRelease("7.7.7")).toBe(false);
-    expect(fetcher).toHaveBeenCalledTimes(4);
+    expect(await publishedRelease("8.8.8")).toBeNull();
+    expect(await publishedRelease("7.7.7")).toBeNull();
+    expect(fetcher).toHaveBeenCalledTimes(8);
     expect((await (await caches.open(RELEASE_CACHE_NAME)).match(RELEASE_CACHE_KEY))?.headers.get("Cache-Control"))
       .toBe("public, max-age=300");
   });
@@ -72,7 +76,7 @@ describe("crash release admission", () => {
     expect(await publishedRelease("2.0.99")).toBe(true);
     expect(await publishedRelease("1.2.3")).toBe(false);
     expect(fetcher).toHaveBeenCalledWith(`${RELEASES}download/nightly/update-nightly.json`, expect.anything());
-    expect(fetcher).toHaveBeenCalledTimes(4);
+    expect(fetcher).toHaveBeenCalledTimes(8);
   });
 
   it("derives rolling tags and manifest asset names from the channel metadata", async () => {
