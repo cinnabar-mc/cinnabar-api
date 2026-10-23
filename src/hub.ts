@@ -1,6 +1,8 @@
 import { catalog, admitLoadout } from "./cosmetics";
 import { loadCatalog, type Catalog } from "./catalog-store";
 import { DurableObject } from "cloudflare:workers";
+import { MarketplaceStore, handle, type MarketCall, type MarketResult } from "./marketplace/store";
+import { signText } from "./marketplace/signing";
 import { PresenceHistory, type HistoryRange, type OnlineHistory } from "./presence-history";
 import { IssuerUnavailable, encodeBase64Url, identityUuid, issuerKeys, verifyProof } from "./identity";
 import {
@@ -96,10 +98,13 @@ export class Hub extends DurableObject<Env> {
    */
   private readonly lookupBudgets = new Map<string, LookupBudget>();
   private cosmeticCatalog: Catalog = catalog;
+  private readonly market: MarketplaceStore;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.history = new PresenceHistory(ctx.storage.sql);
+    this.market = new MarketplaceStore(ctx.storage.sql,
+      new Set((env.OWNER_XUIDS ?? "").split(",").map((xuid) => xuid.trim()).filter((xuid) => /^[0-9]{1,20}$/.test(xuid))));
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS lookup_budgets (
       xuid TEXT PRIMARY KEY, tokens REAL NOT NULL, updated_at INTEGER NOT NULL
     )`);
@@ -419,7 +424,9 @@ export class Hub extends DurableObject<Env> {
       .map((session) => session.loadout).filter((value): value is LoadoutState => value !== undefined)
       .sort((a, b) => b.revision - a.revision)[0];
     this.save(ws, { stage: "ready", xuid, displayName, uuid, channel, visible, loadout, lastSeen: now });
-    send(ws, { type: "welcome", xuid, loadout_revision: loadout?.revision ?? 0, owned_cosmetics: this.ownedCosmetics(xuid), ...SERVER_PARAMETERS });
+    const modLibrary = this.market.library(xuid);
+    send(ws, { type: "welcome", xuid, loadout_revision: loadout?.revision ?? 0, owned_cosmetics: this.ownedCosmetics(xuid),
+      ...(modLibrary.length ? { mod_library: modLibrary } : {}), ...SERVER_PARAMETERS });
 
     if (latest && compareReleases(latest.version, latest.build, pending.clientVersion, pending.clientBuild) > 0) {
       send(ws, { type: "release", ...latest });
@@ -520,6 +527,41 @@ export class Hub extends DurableObject<Env> {
     return { type: "emote", xuid: state.xuid, uuid: state.uuid, emote_id: active?.id ?? null,
       elapsed_ms: active ? Math.min(0xffffffff, active.elapsed + age) : 0,
       valid_for_ms: active ? EMOTE_TTL_MS - age : 0 };
+  }
+
+  /**
+   * Answers one marketplace request. Completed approvals are signed when a signing key is configured, and players
+   * whose library changed get it pushed to every live client.
+   */
+  async marketplace(call: MarketCall): Promise<MarketResult> {
+    const result = handle(this.market, call, Date.now());
+    if (call.op === "me" && result.status === 200) {
+      const account = (result.body as { account: { xuid: string } | null }).account;
+      (result.body as { game_online: boolean }).game_online = !!account && [...(this.byXuid.get(account.xuid) ?? [])]
+        .some((ws) => this.sessions.get(ws)?.stage === "ready");
+    }
+    if (result.approved !== undefined && this.env.MARKETPLACE_SIGNING_KEY) {
+      try {
+        const signature = await signText(this.env.MARKETPLACE_SIGNING_KEY, this.market.statement(result.approved));
+        this.market.setSignature(result.approved, signature);
+      } catch {
+        // A malformed key leaves the release unsigned; clients refuse unsigned releases, so nothing unverified ships.
+      }
+    }
+    for (const xuid of new Set(result.notify ?? [])) {
+      const mods = this.market.library(xuid);
+      for (const ws of this.byXuid.get(xuid) ?? []) {
+        if (this.sessions.get(ws)?.stage === "ready") send(ws, { type: "mod_library", mods });
+      }
+    }
+    return { status: result.status, body: result.body };
+  }
+
+  /** The signed list of pulled versions; the signature is null until a signing key is configured. */
+  async modRevocations(): Promise<{ body: string; signature: string | null }> {
+    const body = this.market.revocations();
+    const key = this.env.MARKETPLACE_SIGNING_KEY;
+    return { body, signature: key ? await signText(key, body) : null };
   }
 
   /** Reads paid ownership from the durable database, including after hibernation. */
