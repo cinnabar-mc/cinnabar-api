@@ -16,18 +16,20 @@ messages against it.
 | `POST /v1/releases` | Release hook. `Authorization: Bearer <RELEASE_HOOK_SECRET>`, body `{"channel","version","build"}`; records and broadcasts only a newer (version, build) pair. Repeats and older records are no-ops. Omitted v1 builds mean zero. |
 | `GET /v1/connect` | WebSocket. The client authenticates with a Minecraft multiplayer token plus an ES384 proof of its key, then can toggle visibility, look up which XUIDs or UUIDs recently used Cinnabar, and receives release pushes. |
 
-Public GET responses use Hono's Cache API middleware with lifetimes declared beside each route:
+Public GET responses use the Cloudflare Cache API with lifetimes declared beside each route:
 
 | Route | Cache lifetime |
 | --- | --- |
 | `/v1/health` | 60 seconds |
 | `/v1/presence/count` | 30 seconds |
-| `/v1/presence/history` | 60 seconds, separately for each query string |
+| `/v1/presence/history` | 60 seconds per supported range |
 | `/v1/cosmetics/catalog` | 300 seconds, with `If-None-Match` revalidation on cache hits and misses |
 | `/v1/cosmetics/assets/:hash` | One year, immutable |
 
-The cache is local to each Cloudflare location. Only successful public GET responses are stored;
-requests with `Authorization`, private routes, writes and WebSocket connections bypass it.
+The cache is local to each Cloudflare location. Public routes ignore unrelated query parameters and
+reuse the same anonymous response when an Authorization header is present. Private routes, writes
+and WebSocket connections never use this cache. Unknown asset digests have a ten-second negative
+cache; missing files for known assets and other errors are not cached.
 
 Close codes: `4401` failed or timed-out authentication, `1009` frame over 16 KiB, `1007` frame
 that isn't a JSON object with a `type`, `1008` invalid messages, binary frames, flood control or
@@ -87,7 +89,8 @@ so reconnecting clients supply their signed identity again.
   on wake. Raw IP addresses are used only to compute the hash during admission.
 - Server addresses are not sent, but submitted roster XUIDs can reveal who shares a server.
   Player data is not logged. Analytics Engine receives only fixed event labels and counts for
-  admission refusals, authentication failures, overload closes and lookups, with no identifiers
+  admission refusals, authentication failures, overload closes, lookups, history storage work,
+  publication failures and cache failures, with no identifiers
   or payloads. Counts are aggregated per invocation; failed metric writes are dropped without
   affecting admission or cleanup. Workers observability remains off so invocation logs do not
   record request metadata.
@@ -125,16 +128,21 @@ The Worker is configured for the `api.cinnabar.gg` custom domain and keeps
 a Cloudflare token that can manage the zone. After the domain is live, update the Cinnabar client's
 `CINNABAR_API_BASE_URL` and the website's API origin in their own repositories.
 
-CI deploys every push to `main` after the tests pass: it uploads cosmetic assets missing from R2, then runs
-`wrangler deploy`. The job runs in the `production` environment, whose `CLOUDFLARE_API_TOKEN` secret only
+Create the private `cinnabar-api-cache` R2 bucket before the first deployment that binds `API_CACHE`:
+
+```sh
+pnpm exec wrangler r2 bucket create cinnabar-api-cache
+```
+
+CI deploys every push to `main` after the tests pass. The private cosmetics repository publishes its
+own assets and catalog. The job runs in the `production` environment, whose `CLOUDFLARE_API_TOKEN` secret only
 `main` can read. CI also copies the repository's `PRESENCE_READ_SECRET` Actions secret
 into the Worker before deployment; configure the same value in the administrative consumer.
-A manual deploy runs the asset upload and Worker deployment after configuring secrets:
+A manual deploy runs the Worker deployment after configuring secrets:
 
 ```sh
 pnpm exec wrangler secret put RELEASE_HOOK_SECRET   # once
 pnpm exec wrangler secret put PRESENCE_READ_SECRET  # same value as the consumer
-node scripts/sync-cosmetic-assets.mjs
 pnpm exec wrangler deploy
 ```
 
@@ -244,8 +252,17 @@ website. Each minute keeps its first observation; delayed runs use their actual 
 Samples survive hub hibernation and are retained for 90 days. No account identifiers are stored.
 History begins when collection is deployed; it cannot reconstruct earlier counts.
 
+The cron publisher reads only new SQL samples after a checkpoint and updates chart buckets with
+exact sums and observed peaks. The checkpoint and all chart ranges live in `API_CACHE` R2 storage.
+Public history requests never call the Hub or read SQL. The first publication rebuilds the supported
+windows from retained samples once; later publications and hibernation recovery read only new minutes.
+An upload failure retains the previous snapshot and backs off across hibernation, then catches up
+from SQL without inventing or duplicating observations. An empty history before the first publication
+contains no points; a temporary R2 read failure returns 503 with a retry delay.
+
 The history response includes `from`, `to`, and `interval_ms` in milliseconds. Each point contains
 its bucket start (`at`), the average observed count (`online`), the highest observation (`peak`),
-and the number of observations (`samples`). The current bucket can be incomplete. Missing buckets
+and the number of observations (`samples`). `to` identifies the published observation window, so it
+can lag while publication is unavailable. The current bucket can be incomplete. Missing buckets
 are omitted and must be shown as gaps, not zero. Averages and peaks cover observed minutes only;
 a minute sample is not a record of every join and departure.

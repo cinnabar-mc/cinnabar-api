@@ -95,8 +95,8 @@ it("refreshes the public count without retaining an expired account", async () =
   expect(await response.json()).toEqual({ online: 1 });
   const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + SESSION_IDLE_TIMEOUT_MS);
   try {
-    // A new cache key observes Hub freshness; mocking Date.now does not advance the edge cache's clock.
-    const expired = await exports.default.fetch("https://api.test/v1/presence/count?observation=expired");
+    // A cold origin observes Hub freshness; mocking Date.now does not advance the edge cache's clock.
+    const expired = await exports.default.fetch("https://cold.api.test/v1/presence/count");
     expect(await expired.json()).toEqual({ online: 0 });
   } finally {
     clock.mockRestore();

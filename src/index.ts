@@ -1,10 +1,11 @@
 import { catalogResponse, assetResponse, revalidateCatalog } from "./cosmetics";
 import { authorizePublisher, entitlementCommand } from "./cosmetics-admin";
 import { Hono } from "hono";
-import { cache } from "hono/cache";
+import { publicCache } from "./public-cache";
+import { count } from "./metrics";
 import { isReleaseHookRequest } from "./protocol";
 import { hubFor } from "./routing";
-import { HISTORY_RANGES, type HistoryRange } from "./presence-history";
+import { DEFAULT_HISTORY_RANGE, HISTORY_RANGES, loadHistory, snapshotHistory, type HistoryRange } from "./history-snapshot";
 
 export { Hub } from "./hub";
 
@@ -12,10 +13,10 @@ const MAX_HOOK_BODY_BYTES = 1024;
 
 const app = new Hono<{ Bindings: Env }>();
 
-app.get("/v1/health", cache({ cacheName: "cinnabar-api-v1", cacheControl: "public, max-age=60" }),
+app.get("/v1/health", publicCache("public, max-age=60"),
   (c) => c.json({ ok: true, api: "v1" }));
 
-app.get("/v1/presence/count", cache({ cacheName: "cinnabar-api-v1", cacheControl: "public, max-age=30" }), async (c) => {
+app.get("/v1/presence/count", publicCache("public, max-age=30"), async (c) => {
   const online = await hubFor(c.env).onlineCount();
   return c.json({ online }, 200, {
     "Access-Control-Allow-Origin": "*",
@@ -29,17 +30,21 @@ app.get("/v1/presence/players", async (c) => {
 });
 
 app.get("/v1/cosmetics/catalog", revalidateCatalog,
-  cache({ cacheName: "cinnabar-api-v1", cacheControl: "public, max-age=300" }),
+  publicCache("public, max-age=300"),
   (c) => catalogResponse(c.env.COSMETIC_ASSETS));
 
-app.get("/v1/presence/history", cache({ cacheName: "cinnabar-api-v1", cacheControl: "public, max-age=60" }), async (c) => {
+app.get("/v1/presence/history", publicCache("public, max-age=60", { range: DEFAULT_HISTORY_RANGE }), async (c) => {
   c.header("Access-Control-Allow-Origin", "*");
-  const range = c.req.query("range") ?? "24h";
+  const range = c.req.query("range") ?? DEFAULT_HISTORY_RANGE;
   if (!Object.hasOwn(HISTORY_RANGES, range)) return c.json({ error: "unsupported range" }, 400);
-  return c.json(await hubFor(c.env).onlineHistory(range as HistoryRange));
+  try {
+    return c.json(snapshotHistory(await loadHistory(c.env.API_CACHE), range as HistoryRange, Date.now()));
+  } catch {
+    return c.json({ error: "history unavailable" }, 503, { "Retry-After": "60" });
+  }
 });
 app.get("/v1/cosmetics/assets/:hash",
-  cache({ cacheName: "cinnabar-api-v1", cacheControl: "public, max-age=31536000, immutable" }),
+  publicCache("public, max-age=31536000, immutable"),
   (c) => assetResponse(c.req.param("hash"), c.env.COSMETIC_ASSETS));
 
 app.post("/v1/cosmetics/entitlements", async (c) => {
@@ -121,6 +126,7 @@ export default {
   fetch: app.fetch,
   /** Samples at execution time, so delayed cron delivery cannot fabricate past counts. */
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
-    await hubFor(env).recordOnlineCount();
+    try { await hubFor(env).recordOnlineCount(); }
+    catch (error) { count(env.METRICS, "history_publish_failed"); throw error; }
   },
 } satisfies ExportedHandler<Env>;

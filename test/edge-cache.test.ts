@@ -31,9 +31,9 @@ async function request(path: string, init?: RequestInit) {
 it.each([
   ["/v1/health", "public, max-age=60", false, false],
   ["/v1/presence/count", "public, max-age=30", true, false],
-  ["/v1/presence/history?range=24h", "public, max-age=60", true, false],
-  ["/v1/presence/history?range=7d", "public, max-age=60", true, false],
-  ["/v1/presence/history?range=30d", "public, max-age=60", true, false],
+  ["/v1/presence/history?range=24h", "public, max-age=60", false, false],
+  ["/v1/presence/history?range=7d", "public, max-age=60", false, false],
+  ["/v1/presence/history?range=30d", "public, max-age=60", false, false],
   ["/v1/cosmetics/catalog", "public, max-age=300", false, true],
   [asset.url, "public, max-age=31536000, immutable", false, true],
 ])("caches %s at the edge without another Hub or R2 call", async (path, policy, usesHub, usesR2) => {
@@ -68,7 +68,7 @@ it.each(["/v1/presence/count", "/v1/presence/history?range=24h"])("reads fresh H
   await (await request(path)).text();
   await edge.delete(put.mock.calls[0]![0]);
   await (await request(path)).text();
-  expect(hub).toHaveBeenCalledTimes(2);
+  expect(hub).toHaveBeenCalledTimes(path.includes("history") ? 0 : 2);
 });
 
 it("streams assets from R2 again after edge eviction", async () => {
@@ -83,13 +83,13 @@ it("streams assets from R2 again after edge eviction", async () => {
 });
 
 it("keeps history ranges in distinct cache entries", async () => {
-  const hub = vi.spyOn(env.HUB, "get");
+  const r2 = vi.spyOn(env.API_CACHE, "get");
   for (let repeat = 0; repeat < 2; repeat++) {
     for (const range of ["24h", "7d", "30d"]) {
       expect(await (await request(`/v1/presence/history?range=${range}`)).json()).toMatchObject({ range });
     }
   }
-  expect(hub).toHaveBeenCalledTimes(3);
+  expect(r2).toHaveBeenCalledTimes(3);
 });
 
 it("revalidates cached catalogs without reading R2 or replacing the full cached response", async () => {
@@ -136,14 +136,14 @@ it("does not cache errors or retain an asset miss after it is published", async 
   expect((await request(asset.url)).status).toBe(200);
 });
 
-it("bypasses a warm public cache for requests with Authorization", async () => {
+it("reuses anonymous responses when Authorization is present", async () => {
   const hub = vi.spyOn(env.HUB, "get");
   const put = vi.spyOn(edge, "put");
   await (await request("/v1/presence/count")).text();
   for (let repeat = 0; repeat < 2; repeat++) {
     await (await request("/v1/presence/count", { headers: { Authorization: "Bearer fixture" } })).text();
   }
-  expect(hub).toHaveBeenCalledTimes(3);
+  expect(hub).toHaveBeenCalledTimes(1);
   expect(put).toHaveBeenCalledTimes(1);
 });
 
@@ -165,4 +165,24 @@ it("never reads or writes the edge cache for the private directory, hooks or con
   expect((await request("/v1/connect")).status).toBe(426);
   expect(match).not.toHaveBeenCalled();
   expect(put).not.toHaveBeenCalled();
+});
+
+it("briefly caches unknown digests without retaining misses for known unpublished assets", async () => {
+  const hash = "f".repeat(64);
+  const get = vi.spyOn(env.COSMETIC_ASSETS, "get");
+  for (const suffix of ["", "?unused=one"]) {
+    const response = await request(`/v1/cosmetics/assets/${hash}${suffix}`);
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=10");
+  }
+  expect(get.mock.calls.filter(([key]) => key === CATALOG_KEY)).toHaveLength(1);
+});
+
+it.each(["read", "write"])("keeps public responses available during cache %s failures", async (failure) => {
+  if (failure === "read") vi.spyOn(caches, "open").mockRejectedValueOnce(new Error("cache unavailable"));
+  else vi.spyOn(edge, "put").mockRejectedValueOnce(new Error("cache unavailable"));
+  const response = await request("/v1/health");
+  expect(response.status).toBe(200);
+  expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
+  expect(await response.json()).toEqual({ ok: true, api: "v1" });
 });

@@ -17,11 +17,9 @@ async function player(options: Parameters<typeof login>[0] = {}) {
   return client;
 }
 
-let observation = 0;
-
-/** Reads a fresh aggregate with a distinct edge cache key for each observation. */
+/** Reads each observation through a cold cache origin so this test measures current Hub state. */
 async function count() {
-  const response = await exports.default.fetch(`https://api.test/v1/presence/count?observation=${++observation}`);
+  const response = await exports.default.fetch(`https://${crypto.randomUUID()}.api.test/v1/presence/count`);
   expect(response.status).toBe(200);
   expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
   expect(response.headers.get("Cache-Control")).toBe("public, max-age=30");
