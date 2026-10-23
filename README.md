@@ -267,7 +267,9 @@ most 65,536 distinct IP counters can be created per day; further new IPs receive
 addresses are never stored. Invocation logging stays disabled.
 
 Admission requires a version found in the 100 most recent published GitHub releases or the newest
-available nightly, beta or stable update manifest, and a 6–40 character hexadecimal commit id.
+manifest for each channel published in the client's release metadata, and a 6–40 character hexadecimal
+commit id. Current manifests are fetched directly from their configured release tracks, independently
+of the historical release list.
 Publication lookups have bounded response sizes and deadlines, with a five-minute location cache.
 Publication failures return 503 and are cached for 30 seconds. This checks admission only: callers
 can copy a published build identity, so it provides no authentication.

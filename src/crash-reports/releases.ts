@@ -2,7 +2,8 @@ import { bounded } from "./body";
 
 export const RELEASE_CACHE_KEY = "https://api.cinnabar.gg/v1/crash-release-admission-cache";
 export const RELEASE_CACHE_NAME = "cinnabar-crash-releases-v1";
-const REPOSITORY = "https://github.com/cinnabar-mc/cinnabar/releases/download/";
+const REPOSITORY = "cinnabar-mc/cinnabar";
+const CHANNELS = `https://raw.githubusercontent.com/${REPOSITORY}/dev/packaging/release-assets.json`;
 const RELEASES = "https://api.github.com/repos/cinnabar-mc/cinnabar/releases?per_page=100";
 const VERSION = /^v?(\d{1,5}\.\d{1,5}\.\d{1,5}(?:-(?:nightly|beta|alpha|rc)(?:[.-]\d{1,10})?)?)$/;
 
@@ -21,26 +22,41 @@ async function metadata(url: string, limit = 256 * 1024): Promise<unknown> {
   return JSON.parse(new TextDecoder().decode(bytes));
 }
 
-/** Reads recent published tags and the newest available manifest for each release channel. */
+/** Resolves current manifest URLs from the release pipeline's published channel metadata. */
+async function currentManifests(): Promise<Map<string, string>> {
+  const assets = await metadata(CHANNELS);
+  if (!assets || typeof assets !== "object" || !("repository" in assets) || assets.repository !== REPOSITORY
+    || !("update_channels" in assets) || !assets.update_channels || typeof assets.update_channels !== "object"
+    || Array.isArray(assets.update_channels)) throw new Error("invalid release channels");
+  const manifests = new Map<string, string>();
+  for (const [channel, release] of Object.entries(assets.update_channels)) {
+    if (!release || typeof release !== "object" || !/^[a-z]{1,32}$/.test(channel)
+      || typeof release.manifest !== "string" || !/^[a-zA-Z0-9._-]{1,100}\.json$/.test(release.manifest)) {
+      throw new Error("invalid release channel");
+    }
+    let path: string;
+    if (release.track === "tagged") path = "latest/download";
+    else if (release.track === "rolling" && typeof release.tag === "string"
+      && /^[a-zA-Z0-9._-]{1,100}$/.test(release.tag)) path = `download/${encodeURIComponent(release.tag)}`;
+    else throw new Error("invalid release track");
+    manifests.set(channel, `https://github.com/${REPOSITORY}/releases/${path}/${release.manifest}`);
+  }
+  if (!manifests.size) throw new Error("no release channels");
+  return manifests;
+}
+
+/** Reads bounded historical tags and current channel manifests independently of release ordering. */
 async function publishedVersions(): Promise<string[]> {
   const releases = await metadata(RELEASES, 8 * 1024 * 1024);
   if (!Array.isArray(releases) || releases.length > 100) throw new Error("invalid release list");
   const versions = new Set<string>();
-  const manifests = new Map<string, string>();
   for (const release of releases) {
     if (!release || typeof release !== "object" || release.draft || !release.published_at) continue;
     const tag = release.tag_name;
     const canonical = version(tag);
     if (canonical) versions.add(canonical);
-    if (typeof tag !== "string" || !/^[a-zA-Z0-9._-]{1,100}$/.test(tag) || !Array.isArray(release.assets)) continue;
-    for (const channel of ["nightly", "beta", "stable"]) {
-      const name = `update-${channel}.json`;
-      if (!manifests.has(channel) && release.assets.some((asset: { name?: unknown }) => asset?.name === name)) {
-        manifests.set(channel, `${REPOSITORY}${encodeURIComponent(tag)}/${name}`);
-      }
-    }
   }
-  for (const [channel, url] of manifests) {
+  for (const [channel, url] of await currentManifests()) {
     const envelope = await metadata(url);
     if (!envelope || typeof envelope !== "object" || !("manifest" in envelope)
       || typeof envelope.manifest !== "string") throw new Error("invalid release envelope");

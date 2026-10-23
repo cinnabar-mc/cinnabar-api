@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { publishedRelease, RELEASE_CACHE_KEY, RELEASE_CACHE_NAME } from "../src/crash-reports/releases";
 
 const LIST = "https://api.github.com/repos/cinnabar-mc/cinnabar/releases?per_page=100";
-const DOWNLOAD = "https://github.com/cinnabar-mc/cinnabar/releases/download/";
+const RELEASES = "https://github.com/cinnabar-mc/cinnabar/releases/";
+const CHANNELS = "https://raw.githubusercontent.com/cinnabar-mc/cinnabar/dev/packaging/release-assets.json";
 
 beforeEach(async () => { await (await caches.open(RELEASE_CACHE_NAME)).delete(RELEASE_CACHE_KEY); });
 afterEach(() => vi.restoreAllMocks());
@@ -16,19 +17,26 @@ function publisher() {
     { tag_name: "v9.9.9", published_at: "2026-10-04", draft: true, assets: [] },
     { tag_name: "v8.8.8", published_at: null, assets: [] },
   ];
+  const assets = {
+    repository: "cinnabar-mc/cinnabar",
+    update_channels: {
+      beta: { track: "tagged", manifest: "update-beta.json" },
+      nightly: { track: "rolling", tag: "nightly", manifest: "update-nightly.json" },
+    },
+  };
   const manifests = new Map([
-    ["v1.2.3/update-stable.json", { version: "1.2.3", channel: "stable" }],
-    ["v1.2.4-beta.1/update-beta.json", { version: "1.2.4-beta.1", channel: "beta" }],
-    ["nightly/update-nightly.json", { version: "1.2.5-nightly", channel: "nightly" }],
+    ["latest/download/update-beta.json", { version: "1.2.4-beta.1", channel: "beta" }],
+    ["download/nightly/update-nightly.json", { version: "1.2.5-nightly", channel: "nightly" }],
   ]);
   const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
     const url = String(input);
-    if (url === LIST) return Response.json(releases);
-    const manifest = manifests.get(url.replace(DOWNLOAD, ""));
+    if (url === LIST) return Response.json(releases.slice(0, 100));
+    if (url === CHANNELS) return Response.json(assets);
+    const manifest = manifests.get(url.replace(RELEASES, ""));
     if (!manifest) return new Response(null, { status: 404 });
     return Response.json({ key_id: "fixture", signature: "synthetic", manifest: btoa(JSON.stringify(manifest)) });
   });
-  return { releases, manifests, fetcher };
+  return { releases, assets, manifests, fetcher };
 }
 
 describe("crash release admission", () => {
@@ -53,6 +61,29 @@ describe("crash release admission", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("admits the current nightly when its rolling release is beyond the first 100 releases", async () => {
+    const { releases, fetcher } = publisher();
+    releases.unshift(...Array.from({ length: 100 }, (_, index) => ({
+      tag_name: `v2.0.${index}`, published_at: "2026-10-05", assets: [],
+    })));
+    expect(releases.findIndex((release) => release.tag_name === "nightly")).toBeGreaterThanOrEqual(100);
+    expect(await publishedRelease("1.2.5-nightly")).toBe(true);
+    expect(await publishedRelease("1.2.4-beta.1")).toBe(true);
+    expect(await publishedRelease("2.0.99")).toBe(true);
+    expect(await publishedRelease("1.2.3")).toBe(false);
+    expect(fetcher).toHaveBeenCalledWith(`${RELEASES}download/nightly/update-nightly.json`, expect.anything());
+    expect(fetcher).toHaveBeenCalledTimes(4);
+  });
+
+  it("derives rolling tags and manifest asset names from the channel metadata", async () => {
+    const { assets, manifests } = publisher();
+    assets.update_channels.nightly = { track: "rolling", tag: "nightly-current", manifest: "current.json" };
+    manifests.delete("download/nightly/update-nightly.json");
+    manifests.set("download/nightly-current/current.json", { version: "1.2.6-nightly", channel: "nightly" });
+    expect(await publishedRelease("1.2.6-nightly")).toBe(true);
+    expect(await publishedRelease("1.2.5-nightly")).toBe(false);
+  });
+
   it("fails closed during publication outages and caches failures briefly", async () => {
     const { fetcher } = publisher();
     fetcher.mockResolvedValue(new Response(null, { status: 503 }));
@@ -67,6 +98,21 @@ describe("crash release admission", () => {
     expect(await publishedRelease("1.2.3")).toBe(true);
   });
 
+  it.each([CHANNELS, `${RELEASES}download/nightly/update-nightly.json`])(
+    "fails closed and caches an outage fetching %s", async (url) => {
+      const { fetcher } = publisher();
+      const fetchPublication = fetcher.getMockImplementation()!;
+      fetcher.mockImplementation(async (input, init) => String(input) === url
+        ? new Response(null, { status: 503 }) : fetchPublication(input, init));
+      expect(await publishedRelease("1.2.5-nightly")).toBeNull();
+      const calls = fetcher.mock.calls.length;
+      expect(await publishedRelease("1.2.3")).toBeNull();
+      expect(fetcher).toHaveBeenCalledTimes(calls);
+      expect((await (await caches.open(RELEASE_CACHE_NAME)).match(RELEASE_CACHE_KEY))?.headers.get("Cache-Control"))
+        .toBe("public, max-age=30");
+    },
+  );
+
   it("rejects malformed or oversized publication responses without trusting a claimed length", async () => {
     const { fetcher } = publisher();
     let cancelled = false;
@@ -79,11 +125,12 @@ describe("crash release admission", () => {
   });
 
   it("requires the expected manifest channel and refuses malformed envelopes", async () => {
-    const { manifests } = publisher();
-    manifests.set("nightly/update-nightly.json", { version: "1.2.5-nightly", channel: "stable" });
+    const { releases, assets, manifests, fetcher } = publisher();
+    manifests.set("download/nightly/update-nightly.json", { version: "1.2.5-nightly", channel: "stable" });
     expect(await publishedRelease("1.2.3")).toBeNull();
     await (await caches.open(RELEASE_CACHE_NAME)).delete(RELEASE_CACHE_KEY);
-    vi.mocked(fetch).mockResolvedValue(Response.json({ manifest: "not base64" }));
+    fetcher.mockResolvedValueOnce(Response.json(releases)).mockResolvedValueOnce(Response.json(assets))
+      .mockResolvedValueOnce(Response.json({ manifest: "not base64" }));
     expect(await publishedRelease("1.2.3")).toBeNull();
   });
 });
