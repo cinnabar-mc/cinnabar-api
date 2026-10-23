@@ -231,6 +231,19 @@ marketplaceRoutes.post("/submissions", async (c) => {
   const media: MediaFile[] = [];
   const images = form.getAll("images");
   if (images.length > MAX_IMAGES) return c.json({ error: "Upload at most four images." }, 422);
+  let imageMetadata: { caption: string; alt: string }[] = [];
+  if (form.has("image_metadata")) {
+    try {
+      if (form.getAll("image_metadata").length !== 1 || typeof form.get("image_metadata") !== "string"
+        || String(form.get("image_metadata")).length > 8192) throw new Error();
+      const raw: unknown = JSON.parse(String(form.get("image_metadata")));
+      if (!Array.isArray(raw) || raw.length !== images.length) throw new Error();
+      imageMetadata = raw.map(item => {
+        if (!item || typeof item.caption !== "string" || item.caption.length > 160 || typeof item.alt !== "string" || item.alt.length > 300) throw new Error();
+        return { caption: item.caption, alt: item.alt };
+      });
+    } catch { return c.json({ error: "Supply one caption and alt text per image, within their limits.", fields: { images: "Invalid image metadata." } }, 422); }
+  }
   const imageBytes: Uint8Array[] = [];
   try {
     for (const image of images) {
@@ -238,7 +251,8 @@ marketplaceRoutes.post("/submissions", async (c) => {
       if (image.size > MAX_IMAGE_BYTES) throw new Error("Each image must be at most 1 MiB.");
       const data = new Uint8Array(await image.arrayBuffer());
       const type = imageType(data);
-      media.push({ sha256: await sha256(data), bytes: data.length, type, caption: image.name.slice(0, 160) });
+      const details = imageMetadata[media.length];
+      media.push({ sha256: await sha256(data), bytes: data.length, type, caption: details?.caption ?? image.name.slice(0, 160), alt: details?.alt ?? "" });
       imageBytes.push(data);
     }
   } catch (error) { return c.json({ error: error instanceof Error ? error.message : "Invalid image." }, 422); }
@@ -270,6 +284,19 @@ marketplaceRoutes.get("/staff/versions/:id/file", async (c) => {
   if (!object) return c.notFound();
   return c.body(object.body, 200, { "Content-Type": "application/wasm", "Cache-Control": "private, no-store",
     "Content-Disposition": "attachment", "X-Content-Type-Options": "nosniff" });
+});
+
+marketplaceRoutes.get("/me/mods/:id/media/:sha256", async c => {
+  c.header("Cache-Control", "private, no-store");
+  const target = id(c.req.param("id"));
+  const hash = c.req.param("sha256");
+  if (target === null || !/^[0-9a-f]{64}$/.test(hash)) return c.notFound();
+  const result = await call(c, { op: "private-media", id: target, sha256: hash, ...(await caller(c)) });
+  if (result.status !== 200) return reply(c, result);
+  const { key, type } = result.body as { key: string; type: string };
+  const object = await c.env.MOD_QUARANTINE.get(key);
+  return object ? c.body(object.body, 200, { "Content-Type": type, "Cache-Control": "private, no-store",
+    "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; sandbox" }) : c.notFound();
 });
 
 marketplaceRoutes.post("/staff/versions/:id/rescan", async c => {

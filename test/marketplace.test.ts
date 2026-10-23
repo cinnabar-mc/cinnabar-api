@@ -542,21 +542,37 @@ describe("quarantine and publication pipeline", () => {
     const owner = await signIn(OWNER, "OreKeeper");
     const creator = await signIn("2535400000006106", "ImageCreator");
     const form = new FormData();
-    form.set("listing", JSON.stringify({ slug: "image-mod", name: "Image mod", summary: "A mod with a screenshot.", version: "1.0.0" }));
+    form.set("listing", JSON.stringify({ slug: "image-mod", name: "Image mod", summary: "A mod with a screenshot.", version: "1.0.0",
+      category: "Interface", license: "MIT", notes: "Initial screenshot release" }));
     form.set("file", new File([component([["cinnabar:grants", "{}"]])], "image-mod.wasm"));
     // Public synthetic 1x1 raster; actual full image decoding is tested by the scanner suite.
     const png = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aOioAAAAASUVORK5CYII="), c => c.charCodeAt(0));
     form.append("images", new File([png], "Screenshot.png", { type: "image/png" }));
+    form.set("image_metadata", JSON.stringify([{ caption: "HUD screenshot", alt: "Coordinates above the hotbar" }]));
     const result = await api("/submissions", { method: "POST", body: form,
       headers: { Cookie: creator.cookie, Origin: SITE, "X-Cinnabar-CSRF": creator.csrf } });
     expect(result.status).toBe(200);
     const v = await result.json() as any;
+    expect(v).toMatchObject({ category: "Interface", license: "MIT", notes: "Initial screenshot release", scan: { review_ready: false } });
+    expect(v.gallery[0]).toMatchObject({ caption: "HUD screenshot", alt: "Coordinates above the hotbar" });
     const mediaHash = v.gallery[0].sha256;
     expect((await api(`/mods/media/${mediaHash}`)).status).toBe(404);
+    const privatePath = `/me/mods/${v.id}/media/${mediaHash}`;
+    expect((await creator.get(privatePath)).status).toBe(200);
+    expect((await owner.get(privatePath)).status).toBe(200);
+    expect((await api(privatePath)).status).toBe(404);
+    const stranger = await signIn("2535400000006108", "ImageStranger");
+    expect((await stranger.get(privatePath)).status).toBe(404);
     const job = await claim();
     expect((await scanner(`jobs/${job.id}/complete`, report(job, { media: [] }), job.lease)).status).toBe(422);
     expect((await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).status).toBe(200);
+    expect(await (await owner.get(`/staff/versions/${v.id}`)).json()).toMatchObject({ scan: { review_ready: true } });
     await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" });
+    const publicView = await (await api("/mods/image-mod")).json() as any;
+    expect(publicView).toMatchObject({ license: "MIT", category: "Interface", status: "approved", grants: {},
+      history: [{ notes: "Initial screenshot release", publication: "manual" }], scan: { report: { deterministic: "pass" } } });
+    expect(publicView.scan.report.findings).toBeUndefined();
+    expect(publicView.scan.job).toBeUndefined();
     const image = await api(`/mods/media/${mediaHash}`);
     expect(image.status).toBe(200); expect(image.headers.get("Content-Type")).toBe("image/png");
     expect(image.headers.get("X-Content-Type-Options")).toBe("nosniff");
@@ -599,5 +615,20 @@ describe("quarantine and publication pipeline", () => {
     expect((await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).status).toBe(200);
     expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(200);
     expect((await api("/mods/legacy-mod")).status).toBe(200);
+  });
+
+  it("rejects unmatched or oversized image captions before storing a release", async () => {
+    const creator = await signIn("2535400000006109", "MetadataCreator");
+    for (const metadata of [[], [{ caption: "x".repeat(161), alt: "" }], [{ caption: "Caption", alt: null }]]) {
+      const form = new FormData();
+      form.set("listing", JSON.stringify({ slug: "bad-image-meta", name: "Bad metadata", summary: "A metadata validation fixture.", version: "1.0.0" }));
+      form.set("file", new File([component([])], "fixture.wasm"));
+      form.append("images", new File([new Uint8Array([137,80,78,71,13,10,26,10,0,0,0,0])], "fixture.png"));
+      form.set("image_metadata", JSON.stringify(metadata));
+      const result = await api("/submissions", { method: "POST", body: form,
+        headers: { Cookie: creator.cookie, Origin: SITE, "X-Cinnabar-CSRF": creator.csrf } });
+      expect(result.status).toBe(422);
+    }
+    expect(await (await creator.get("/me/mods")).json()).toEqual([]);
   });
 });

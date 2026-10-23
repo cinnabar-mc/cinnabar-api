@@ -8,12 +8,15 @@ AI findings assist moderation; they are not a safety certification.
 ## Upload and release contract
 
 `POST /v1/submissions` takes multipart `listing` JSON, one `file` component, and
-optional repeated `images` files. Identity comes from the host session cookie and
+optional repeated `images` files and `image_metadata` JSON. Image metadata is an
+ordered array of `{caption, alt}`, with one entry per image (160 and 300 characters
+respectively). Omitting it uses the filename as the caption. Identity comes from the host session cookie and
 `X-Cinnabar-CSRF`. Authentication and the twenty-upload/hour account budget run
 before reading the body. Five pending releases per creator are allowed.
 
 Listing fields are `slug`, `name`, `summary`, `description` (40,000 characters),
-`version` and optional GitHub `source`. Acts/Network releases require source.
+`version`, optional GitHub `source`, category, license (128 characters) and release
+notes (4,000 characters). Acts/Network releases require source.
 If the component declares a version it must match the listing version. The API
 reads grants itself, rejects ambiguous/duplicate declarations, and hashes actual
 bytes. Maximums are 16 MiB per component, four 1 MiB images, and 20 MiB + 256 KiB
@@ -31,15 +34,21 @@ expire referenced quarantine objects automatically: interrupted promotions need 
 
 - `status`: `submitted`, `approved`, `changes` or `rejected`;
 - `scan`: `state` (`queued`, `running`, `complete`, `failed`), attempts, job ID,
-  completion time, deterministic findings and structured AI evidence;
+  completion/expiry time, authoritative `review_ready`, deterministic findings and structured AI evidence;
 - `publication`: `manual`, `automatic` or null;
-- immutable description and `gallery` descriptors `{sha256, bytes, type, caption}`.
+- immutable description and `gallery` descriptors `{sha256, bytes, type, caption, alt}`.
 
 Public component/media URLs are `/v1/mods/assets/<sha256>` and
 `/v1/mods/media/<sha256>`. Authorization is checked on each request. Only signed,
 approved, unpulled releases with an active creator and visible listing qualify.
 Responses use `no-store` and `nosniff`; private files never use a public cache path.
 Staff fetch quarantined components through `/v1/staff/versions/<id>/file`.
+Creators and active staff fetch pending screenshots through authenticated
+`GET /v1/me/mods/<id>/media/<sha256>`; other accounts receive 404. Public listing
+responses include grants, category/license, release notes/history, publication mode
+and a scan summary without private findings. Previous-version review data includes
+the exact prior hash and grants. Clients derive media URLs from these digests;
+creator-provided URLs never select storage objects.
 
 ## Durable scan protocol
 

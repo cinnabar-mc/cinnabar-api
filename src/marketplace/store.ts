@@ -2,7 +2,7 @@ import {
   ROLES, approvalRule, approvalsComplete, atLeast, canApprove, canReview, canSetRole, grantDiff, reachOf,
   requestedCapabilities, validateListing, type Actor, type Grants, type Reach, type ReviewState, type Role,
 } from "./policy";
-import { CLIENT_REVISION, MAX_SCAN_ATTEMPTS, SCAN_LEASE_MS, SCAN_POLICY, parseScanReport, scanReady, type ScanReport } from "./scanning";
+import { CLIENT_REVISION, MAX_SCAN_ATTEMPTS, SCAN_LEASE_MS, SCAN_MAX_AGE_MS, SCAN_POLICY, parseScanReport, scanReady, type ScanReport } from "./scanning";
 
 export const PLAYER_SESSION_MS = 30 * 24 * 3_600_000;
 export const STAFF_SESSION_MS = 12 * 3_600_000;
@@ -64,7 +64,7 @@ type ListingRow = {
   hidden: number;
 };
 
-export interface MediaFile { sha256: string; bytes: number; type: "image/png" | "image/jpeg" | "image/webp"; caption: string }
+export interface MediaFile { sha256: string; bytes: number; type: "image/png" | "image/jpeg" | "image/webp"; caption: string; alt?: string }
 type PipelineRow = {
   version_id: number; metadata: string; media: string; baseline: number | null;
   job_id: string; state: "queued" | "running" | "complete" | "failed";
@@ -257,14 +257,23 @@ export class MarketplaceStore {
   private publicListing(listing: ListingRow) {
     const live = this.liveVersion(listing.slug);
     if (!live || listing.hidden || this.account(listing.creator)?.suspended) return null;
-    const metadata = JSON.parse(this.pipeline(live.id)!.metadata) as ListingRow;
+    const metadata = JSON.parse(this.pipeline(live.id)!.metadata) as ListingRow & { category?: string; license?: string };
+    const p = this.pipeline(live.id)!;
+    const report = p.report ? JSON.parse(p.report) as ScanReport : null;
     return {
       slug: listing.slug, name: metadata.name, summary: metadata.summary, description: metadata.description,
       source: metadata.source, gallery: this.media(live.id), creator: listing.creator, creator_name: this.name(listing.creator),
+      category: metadata.category ?? "", license: metadata.license ?? "", grants: JSON.parse(live.grants) as Grants,
       version: live.version, version_id: String(live.id), reach: live.reach,
+      status: "approved",
       capabilities: requestedCapabilities(JSON.parse(live.grants)), sha256: live.sha256, bytes: live.bytes,
       updated_at: live.decided_at, reviewed_by: this.approvals(live.id).map((a) => a.gamertag).join(", "),
       publication: this.pipeline(live.id)?.publish_mode,
+      // Public summaries omit private scanner findings and source evidence.
+      scan: { state: p.state, completed_at: p.completed_at, report: report ? {
+        deterministic: report.deterministic, policy: report.policy, validator: report.validator,
+        ai: { verdict: report.ai.verdict, model: report.ai.model, prompt: report.ai.prompt },
+      } : null },
       update_pending: this.sql.exec("SELECT 1 FROM mod_versions WHERE slug = ? AND status = 'submitted'", listing.slug)
         .toArray().length > 0,
     };
@@ -284,6 +293,8 @@ export class MarketplaceStore {
     const history = this.versions("v.slug = ? AND v.status = 'approved' ORDER BY v.decided_at DESC", slug).map((v) => ({
       version: v.version, at: v.decided_at, pulled: !!v.pulled, reach: v.reach,
       reviewers: this.approvals(v.id).map((a) => a.gamertag),
+      publication: this.pipeline(v.id)?.publish_mode,
+      notes: (JSON.parse(this.pipeline(v.id)!.metadata) as { notes?: string }).notes ?? "",
     }));
     const live = this.liveVersion(slug)!;
     return ok({ ...view, history, release: live.signature ? { statement: this.statement(live.id), signature: live.signature } : null });
@@ -429,6 +440,16 @@ export class MarketplaceStore {
   /** Media descriptors belong to the immutable version, not mutable listing metadata. */
   media(id: number): MediaFile[] { return JSON.parse(this.pipeline(id)?.media ?? "[]") as MediaFile[]; }
 
+  /** Pending screenshots are visible only to their creator or active staff, under an authenticated no-store route. */
+  privateMedia(caller: Caller, id: number, sha256: string, now: number): MarketResult {
+    const session = this.session(caller, now);
+    if (!session || session.account.suspended) return fail(404, "No such image.");
+    const v = this.versions("v.id = ?", id)[0];
+    const media = this.media(id).find(item => item.sha256 === sha256);
+    if (!v || !media || (v.creator !== session.account.xuid && !atLeast(session.account, "moderator"))) return fail(404, "No such image.");
+    return ok({ key: `media/${media.sha256}`, type: media.type });
+  }
+
   /** Check public media authorization without revealing another version's private files. */
   mediaAllowed(sha256: string): boolean {
     return this.versions("v.status = 'approved' AND v.signature IS NOT NULL AND v.pulled = 0 AND l.hidden = 0")
@@ -509,7 +530,7 @@ export class MarketplaceStore {
     // Listing/source/media edits get a human content review at launch.
     const before = JSON.parse(prior!.metadata) as Record<string, unknown>;
     const after = JSON.parse(p.metadata) as Record<string, unknown>;
-    if (["name", "summary", "description", "source"].some(key => before[key] !== after[key]) || prior!.media !== p.media) return false;
+    if (["name", "summary", "description", "source", "category", "license"].some(key => before[key] !== after[key]) || prior!.media !== p.media) return false;
     return true;
   }
 
@@ -576,7 +597,9 @@ export class MarketplaceStore {
   private versionView(v: VersionRow) {
     const listing = this.listing(v.slug)!;
     const p = this.pipeline(v.id)!;
-    const metadata = JSON.parse(p.metadata) as ListingRow;
+    const metadata = JSON.parse(p.metadata) as ListingRow & { category?: string; license?: string; notes?: string };
+    const report = p.report ? JSON.parse(p.report) as ScanReport : null;
+    const trust = this.sql.exec<{ expires_at: number }>("SELECT expires_at FROM mod_trust WHERE slug = ? AND creator = ?", v.slug, v.creator).toArray()[0];
     const previous = p.baseline === null ? undefined : this.versions("v.id = ?", p.baseline)[0];
     const grants = JSON.parse(v.grants) as Grants;
     return {
@@ -584,10 +607,14 @@ export class MarketplaceStore {
       creator: v.creator, creator_name: this.name(v.creator), sha256: v.sha256, bytes: v.bytes,
       submitted_at: v.submitted_at, decided_at: v.decided_at, pulled: !!v.pulled, pull_reason: v.pull_reason,
       name: metadata.name, summary: metadata.summary, description: metadata.description, source: metadata.source, hidden: !!listing.hidden,
+      category: metadata.category ?? "", license: metadata.license ?? "", notes: metadata.notes ?? "",
+      trust: { trusted: !!trust && trust.expires_at > Date.now(), expires_at: trust?.expires_at ?? null },
       gallery: this.media(v.id), scan: { state: p.state, attempts: p.attempts, job: p.job_id,
-        completed_at: p.completed_at, report: p.report ? JSON.parse(p.report) : null }, publication: p.publish_mode,
+        completed_at: p.completed_at, expires_at: p.completed_at === null ? null : p.completed_at + SCAN_MAX_AGE_MS,
+        review_ready: p.state === "complete" && scanReady(report, p.completed_at, Date.now()), report }, publication: p.publish_mode,
       capabilities: requestedCapabilities(grants), rule: approvalRule(v.reach as Reach), approvals: this.approvals(v.id),
-      previous: previous ? { version: previous.version, diff: grantDiff(JSON.parse(previous.grants), grants) } : null,
+      previous: previous ? { version: previous.version, sha256: previous.sha256, grants: JSON.parse(previous.grants) as Grants,
+        diff: grantDiff(JSON.parse(previous.grants), grants) } : null,
     };
   }
 
@@ -781,6 +808,7 @@ export type MarketCall = Caller & (
   | { op: "hide"; slug: string; body: unknown } | { op: "resolve"; id: number; body: unknown }
   | { op: "role"; body: unknown } | { op: "suspend"; body: unknown } | { op: "asset"; sha256: string }
   | { op: "media"; sha256: string } | { op: "trust"; slug: string; body: unknown } | { op: "rescan"; id: number }
+  | { op: "private-media"; id: number; sha256: string }
   | { op: "scan-claim" } | { op: "scan-file"; job: string; lease: string; sha256: string }
   | { op: "scan-complete"; job: string; lease: string; body: unknown }
   | { op: "begin"; state: string; verifier: string; returnTo: string } | { op: "consume"; state: string }
@@ -812,6 +840,7 @@ export function handle(store: MarketplaceStore, call: MarketCall, now: number): 
     case "suspend": return store.suspend(call, call.body, now);
     case "asset": return ok({ allowed: store.assetAllowed(call.sha256, call, now) });
     case "media": return ok({ allowed: store.mediaAllowed(call.sha256) });
+    case "private-media": return store.privateMedia(call, call.id, call.sha256, now);
     case "trust": return store.setTrust(call, call.slug, call.body, now);
     case "rescan": return store.rescan(call, call.id, now);
     case "scan-claim": return store.claimScan(now);

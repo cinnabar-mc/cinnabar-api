@@ -129,6 +129,9 @@ export interface ListingFields {
   description: string;
   version: string;
   source: string;
+  category: string;
+  license: string;
+  notes: string;
 }
 
 /** Normalises and validates listing fields, returning per-field messages for anything wrong. */
@@ -138,12 +141,16 @@ export function validateListing(input: unknown, reach: Reach): { fields: Listing
   const fields: ListingFields = {
     slug: text("slug"), name: text("name"), summary: text("summary"), description: text("description"),
     version: text("version"), source: text("source").replace(/\/$/, ""),
+    category: text("category"), license: text("license"), notes: text("notes"),
   };
   const errors: Record<string, string> = {};
   if (!/^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])$/.test(fields.slug)) errors.slug = "Use 3–40 lowercase letters, numbers and dashes.";
   if (!fields.name || fields.name.length > 64) errors.name = "Name it in 64 characters or fewer.";
   if (fields.summary.length < 10 || fields.summary.length > 140) errors.summary = "Summarise it in 10–140 characters.";
   if (fields.description.length > 40000) errors.description = "Keep the description under 40,000 characters.";
+  if (fields.category && !["Interface", "Visuals", "Camera", "Utilities", "Gameplay", "Network"].includes(fields.category)) errors.category = "Choose a category.";
+  if (fields.license.length > 128) errors.license = "Keep the license under 128 characters.";
+  if (fields.notes.length > 4000) errors.notes = "Keep release notes under 4,000 characters.";
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(fields.version) || fields.version.length > 32) {
     errors.version = "Use a SemVer version such as 1.0.0.";
   }
