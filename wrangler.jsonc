@@ -16,7 +16,11 @@
     "ISSUER": "https://authorization.franchise.minecraft-services.net/"
   },
   "analytics_engine_datasets": [{ "binding": "METRICS", "dataset": "cinnabar_api_events" }],
-  "r2_buckets": [{ "binding": "COSMETIC_ASSETS", "bucket_name": "cinnabar-cosmetics" }],
+  "r2_buckets": [
+    { "binding": "COSMETIC_ASSETS", "bucket_name": "cinnabar-cosmetics" },
+    // Submitted mod components, keyed by SHA-256. Create it before deploying: `wrangler r2 bucket create cinnabar-mods`.
+    { "binding": "MOD_FILES", "bucket_name": "cinnabar-mods" }
+  ],
   "durable_objects": {
     "bindings": [{ "name": "HUB", "class_name": "Hub" }]
   },

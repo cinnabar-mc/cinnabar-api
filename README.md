@@ -64,6 +64,79 @@ so reconnecting clients supply their signed identity again.
 - Issuer keys: cached for an hour, with at most one refresh attempt per 60 s, including unknown `kid`s
   and failures. Sessions remain authenticated after the original token expires.
 
+## Mod marketplace
+
+Players browse, send and report Cinnabar mods; creators submit them; staff review them. The website at
+`MARKETPLACE_ORIGIN` is the only browser origin allowed to call these routes with credentials. The catalogue,
+mod pages, files and revocations are public.
+
+**Accounts are Xbox identities.**
+- `GET /v1/auth/microsoft/start?return_to=` runs Microsoft OAuth with PKCE (`XboxLive.signin`, personal accounts).
+- `GET /v1/auth/microsoft/callback` exchanges the code for an Xbox user token and then an XSTS token, keeps
+  only the XUID and gamertag, and discards every token.
+- It sets a `__Host-cinnabar_session` cookie (HttpOnly, Secure, SameSite=Lax). Only its SHA-256 is stored.
+- The game's `/v1/connect` login proves the same XUID, so web and game accounts need no linking.
+- Writes need the website `Origin` and the `X-Cinnabar-CSRF` token from `GET /v1/me`.
+- Sessions last 30 days, or 12 hours for staff. A role change needs a sign-in from the last 10 minutes.
+- XSTS refusals return to the site with `signin_error=no_xbox_profile|child_account|xbox_unavailable|cancelled`.
+
+**Roles.**
+- Players can submit, send and report.
+- Moderators review and resolve reports.
+- Admins also approve Acts and Network mods, pull versions, suspend accounts and manage moderators.
+- Owners come only from `OWNER_XUIDS` and manage admins.
+- Nobody reviews their own mod or changes their own role.
+- Every staff action is written to `staff_audit`.
+
+**Reach.** Each upload's `cinnabar:grants` section is read without compiling the component and filed on the
+highest reach it touches. Reach sets the review rule:
+
+| Reach | Capabilities | Approval |
+| --- | --- | --- |
+| Looks, Reads, Watches | drawing, reading the session, other players | one staff member |
+| Acts | camera, controls, keys, item use, movement, attack reach, inventory, commands | an admin |
+| Network | packet delay, session packets, WASI | two staff, one an admin |
+
+Acts and Network listings must link their GitHub source.
+
+**Files and trust.**
+- Uploads (at most 16 MiB) are stored in R2 `MOD_FILES` under their SHA-256.
+- An approved version is signed with the Ed25519 `MARKETPLACE_SIGNING_KEY` over a canonical statement
+  `{approved_at, approvers, bytes, grants, sha256, slug, version}`, returned as `release` on `GET /v1/mods/:slug`.
+- Pulled versions appear in `GET /v1/mods/revocations`, signed in `X-Cinnabar-Signature`.
+
+**Send to game.**
+- `POST /v1/mods/:slug/send` adds the current version to the player's library.
+- It pushes `mod_library` to the player's live sockets, and `welcome` carries the library on every login.
+- Pulling a version pushes it again with `pulled: true` and staff's `pull_reason`.
+
+| Route | Who |
+| --- | --- |
+| `GET /v1/me`, `POST /v1/auth/signout` | anyone; returns `{account, library, csrf, game_online}` |
+| `GET /v1/mods`, `GET /v1/mods/:slug`, `GET /v1/mods/assets/:sha256`, `GET /v1/mods/revocations` | public |
+| `POST /v1/mods/:slug/send`, `POST /v1/mods/:slug/reports`, `GET /v1/me/mods` | signed in |
+| `POST /v1/submissions` (multipart `listing` JSON and `file`) | signed in; five pending versions at most |
+| `GET /v1/staff/queue`, `/reports`, `/people`, `/audit`, `/versions/:id`, `/versions/:id/file` | staff |
+| `POST /v1/staff/versions/:id/decision` `{decision: approve, changes or reject, note}` | staff |
+| `POST /v1/staff/reports/:id/resolve`, `POST /v1/staff/mods/:slug/hide` | staff |
+| `POST /v1/staff/versions/:id/pull`, `POST /v1/staff/people/suspend` | admin |
+| `POST /v1/staff/people/role` `{gamertag, role, reason}` | admin (moderators) or owner (admins) |
+
+Before enabling it in production:
+
+```sh
+pnpm exec wrangler r2 bucket create cinnabar-mods
+pnpm exec wrangler secret put MARKETPLACE_SIGNING_KEY   # base64 PKCS#8 Ed25519 private key
+pnpm exec wrangler secret put MICROSOFT_CLIENT_SECRET   # only for a confidential Entra app
+```
+
+Then set the `MARKETPLACE_ORIGIN`, `MICROSOFT_CLIENT_ID` and `OWNER_XUIDS` variables.
+- Register the Entra app for personal Microsoft accounts with the redirect URI
+  `https://api.cinnabar.gg/v1/auth/microsoft/callback`.
+- Sign-in answers 503 until the origin and client ID are set.
+- The session cookie only reaches the API when the website shares its registrable domain (for example
+  `cinnabar.gg`), so the site must leave `*.workers.dev` before sign-in works there.
+
 ## Privacy
 
 - The public online count includes each visible connected account once, even with several sockets.
@@ -91,6 +164,15 @@ so reconnecting clients supply their signed identity again.
   or payloads. Counts are aggregated per invocation; failed metric writes are dropped without
   affecting admission or cleanup. Workers observability remains off so invocation logs do not
   record request metadata.
+- Signing in to the marketplace stores the account's XUID, gamertag, role and last sign-in time.
+  Sessions are stored as the SHA-256 of their cookie, with a CSRF token and creation time. Microsoft
+  and Xbox tokens are never stored. Pending sign-ins keep a random state and PKCE verifier for at most
+  ten minutes.
+- The marketplace also keeps:
+  - each player's sent mods
+  - the reports they file, with their XUID and text
+  - creators' listings and uploaded components
+  - the staff audit log, which names the acting XUID
 
 ## Shared emotes
 

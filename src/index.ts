@@ -4,6 +4,7 @@ import { Hono } from "hono";
 import { cache } from "hono/cache";
 import { isReleaseHookRequest } from "./protocol";
 import { hubFor } from "./routing";
+import { marketplaceRoutes } from "./marketplace/routes";
 import { HISTORY_RANGES, type HistoryRange } from "./presence-history";
 
 export { Hub } from "./hub";
@@ -70,6 +71,8 @@ app.post("/v1/releases", async (c) => {
   await hubFor(c.env).recordRelease(body.channel, body.version, body.build);
   return c.body(null, 204);
 });
+
+app.route("/v1", marketplaceRoutes);
 
 app.get("/v1/connect", (c) => {
   if (c.req.header("Upgrade")?.toLowerCase() !== "websocket") return c.body(null, 426, { Upgrade: "websocket" });

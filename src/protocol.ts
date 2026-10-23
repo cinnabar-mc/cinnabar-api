@@ -92,6 +92,17 @@ export interface ReleaseRecord {
   build?: number;
   published_at: string;
 }
+/** A mod the player sent to their game from the website; `pulled` versions must be turned off with staff's reason. */
+export interface ModLibraryEntry {
+  slug: string;
+  version: string;
+  sha256: string;
+  bytes: number;
+  grants: Record<string, boolean | string[]>;
+  sent_at: string;
+  pulled: boolean;
+  pull_reason?: string;
+}
 export interface ReleaseHookRequest {
   channel: Channel;
   version: string;
@@ -102,7 +113,9 @@ export type ServerMessage =
   | ({ xuid: string; uuid: string } & LoadoutState)
   | { type: "challenge"; nonce: string }
   | { type: "cosmetic_ownership"; owned_cosmetics: string[] }
-  | ({ type: "welcome"; xuid: string; loadout_revision?: number; owned_cosmetics?: string[] } & WelcomeParameters)
+  | ({ type: "welcome"; xuid: string; loadout_revision?: number; owned_cosmetics?: string[]; mod_library?: ModLibraryEntry[] }
+    & WelcomeParameters)
+  | { type: "mod_library"; mods: ModLibraryEntry[] }
   | { type: "error"; code: "unauthorized" | "invalid_loadout" }
   | { type: "error"; code: "rate_limited"; id: number }
   | { type: "lookup_result"; id: number; cinnabar: string[]; cinnabar_uuids?: string[] }
