@@ -9,6 +9,22 @@ beforeAll(installFakeIssuer);
 afterEach(() => Promise.all(open.splice(0).map((client) => (client.close(), client.closed))));
 
 describe("session failures", () => {
+  it("closes and removes a session even when persisting its departure budget fails", async () => {
+    const { client } = await login();
+    open.push(client);
+    await client.lookup(["999900001"]);
+    await runInDurableObject(hub(), async (instance, state) => {
+      const ws = state.getWebSockets()[0]!;
+      const exec = vi.spyOn(state.storage.sql, "exec").mockImplementation(() => { throw new Error("SQL quota exhausted"); });
+      try {
+        await expect(instance.webSocketClose(ws, 1000, "")).rejects.toThrow("SQL quota exhausted");
+        expect(ws.readyState).not.toBe(WebSocket.OPEN);
+        expect(instance.onlineCount()).toBe(0);
+      } finally { exec.mockRestore(); }
+    });
+    expect((await client.closed).code).toBe(1000);
+  });
+
   it("forgets and closes a session when its attachment update fails", async () => {
     const { client } = await login();
     open.push(client);

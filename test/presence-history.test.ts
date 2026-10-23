@@ -3,7 +3,8 @@ import { env, exports } from "cloudflare:workers";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import worker from "../src/index";
 import { Hub } from "../src/hub";
-import { PresenceHistory, type OnlineHistory } from "../src/presence-history";
+import { PresenceHistory } from "../src/presence-history";
+import { HISTORY_KEY, loadHistory, snapshotHistory, type OnlineHistory } from "../src/history-snapshot";
 import { hub, installFakeIssuer, login, type Client } from "./helpers";
 
 const MINUTE = 60_000;
@@ -11,7 +12,11 @@ const DAY = 24 * 60 * MINUTE;
 const open: Client[] = [];
 beforeEach(async () => {
   installFakeIssuer();
-  await runInDurableObject(hub(), (_, state) => state.storage.sql.exec("DELETE FROM presence_samples").toArray());
+  await runInDurableObject(hub(), (_, state) => {
+    state.storage.sql.exec("DELETE FROM presence_samples");
+    state.storage.sql.exec("DELETE FROM presence_publication");
+  });
+  await env.API_CACHE.delete(HISTORY_KEY);
 });
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -19,13 +24,14 @@ afterEach(async () => {
 });
 
 it("persists the first minute observation across hibernation, including zero and gaps", async () => {
-  await runInDurableObject(hub(), (_, state) => {
-    const history = new PresenceHistory(state.storage.sql);
+  await runInDurableObject(hub(), async (_, state) => {
+    const history = new PresenceHistory(state.storage.sql, env.API_CACHE);
     const now = 200 * DAY;
     history.record(now, 0);
     history.record(now + 1, 999);
     history.record(now + 2 * MINUTE, 7);
-    expect(new PresenceHistory(state.storage.sql).read(now + 2 * MINUTE, "24h").points).toEqual([
+    await history.publish(now + 2 * MINUTE);
+    expect(snapshotHistory(await loadHistory(env.API_CACHE), "24h", now + 2 * MINUTE).points).toEqual([
       { at: now, online: 0, peak: 0, samples: 1 },
       { at: now + 2 * MINUTE, online: 7, peak: 7, samples: 1 },
     ]);
@@ -37,20 +43,22 @@ it("persists the first minute observation across hibernation, including zero and
 });
 
 it("averages observed minutes and retains peaks without filling missing buckets", async () => {
-  await runInDurableObject(hub(), (_, state) => {
-    const history = new PresenceHistory(state.storage.sql);
+  await runInDurableObject(hub(), async (_, state) => {
+    const history = new PresenceHistory(state.storage.sql, env.API_CACHE);
     const now = 200 * DAY;
     history.record(now - 8 * DAY, 999);
     history.record(now, 0);
     history.record(now + MINUTE, 10);
     history.record(now + 20 * MINUTE, 3);
-    const result = history.read(now + 20 * MINUTE, "7d");
+    await history.publish(now + 20 * MINUTE);
+    const snapshot = await loadHistory(env.API_CACHE);
+    const result = snapshotHistory(snapshot, "7d", now + 20 * MINUTE);
     expect(result.interval_ms).toBe(10 * MINUTE);
     expect(result.points).toEqual([
       { at: now, online: 5, peak: 10, samples: 2 },
       { at: now + 20 * MINUTE, online: 3, peak: 3, samples: 1 },
     ]);
-    expect(history.read(now + 20 * MINUTE, "30d").points.at(-1)).toEqual({
+    expect(snapshotHistory(snapshot, "30d", now + 20 * MINUTE).points.at(-1)).toEqual({
       at: now, online: 13 / 3, peak: 10, samples: 3,
     });
   });
@@ -63,14 +71,14 @@ it("cron collects unique, visible, fresh accounts without a website request", as
   const now = Math.ceil(Date.now() / MINUTE) * MINUTE;
   vi.spyOn(Date, "now").mockReturnValue(now);
   await worker.scheduled(createScheduledController({ scheduledTime: now - DAY }), env);
-  await runInDurableObject(hub(), (instance: Hub, state) => {
-    expect(new Hub(state, env).onlineHistory("24h").points).toEqual([
+  await runInDurableObject(hub(), async (instance: Hub, state) => {
+    expect(snapshotHistory(await loadHistory(env.API_CACHE), "24h", now).points).toEqual([
       { at: now, online: 1, peak: 1, samples: 1 },
     ]);
     // The same clock drives freshness and the recorded timestamp.
     vi.spyOn(Date, "now").mockReturnValue(now + 2 * MINUTE);
-    instance.recordOnlineCount();
-    expect(instance.onlineHistory("24h").points.at(-1)?.online).toBe(0);
+    await instance.recordOnlineCount();
+    expect(snapshotHistory(await loadHistory(env.API_CACHE), "24h", now + 2 * MINUTE).points.at(-1)?.online).toBe(0);
   });
 });
 
