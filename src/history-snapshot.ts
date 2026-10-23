@@ -75,7 +75,9 @@ export async function loadHistory(bucket: R2Bucket): Promise<HistorySnapshot | n
   const object = await bucket.get(HISTORY_KEY);
   if (!object) return null;
   if (object.size > MAX_SNAPSHOT_BYTES) { await object.body.cancel(); return null; }
-  const value: unknown = await object.json().catch(() => null);
+  const text = await object.text();
+  let value: unknown;
+  try { value = JSON.parse(text); } catch { return null; }
   if (!value || typeof value !== "object") return null;
   const snapshot = value as Partial<HistorySnapshot>;
   if (snapshot.version !== 1 || !Number.isSafeInteger(snapshot.through) || snapshot.through! % MINUTE_MS !== 0 || !snapshot.buckets) return null;

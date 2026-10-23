@@ -118,8 +118,8 @@ it("serializes overlapping publications and keeps the newest checkpoint", async 
   });
 });
 
-it("rebuilds malformed snapshots from retained observations", async () => {
-  await env.API_CACHE.put(HISTORY_KEY, '{"version":1,"through":0,"buckets":{}}');
+it.each(['{', '{"version":1,"through":0,"buckets":{}}'])("rebuilds malformed snapshots from retained observations (%#)", async (text) => {
+  await env.API_CACHE.put(HISTORY_KEY, text);
   expect(await loadHistory(env.API_CACHE)).toBeNull();
   await runInDurableObject(hub(), async (_, state) => {
     const history = new PresenceHistory(state.storage.sql, env.API_CACHE);
@@ -127,4 +127,36 @@ it("rebuilds malformed snapshots from retained observations", async () => {
     await history.publish(now);
   });
   expect(snapshotHistory(await loadHistory(env.API_CACHE), "24h", now).points.at(-1)?.online).toBe(4);
+});
+
+it("propagates failed snapshot body reads to public responses and publication backoff", async () => {
+  await runInDurableObject(hub(), async (_, state) => {
+    const history = new PresenceHistory(state.storage.sql, env.API_CACHE);
+    history.record(now, 3);
+    await history.publish(now);
+  });
+  const object = (await env.API_CACHE.get(HISTORY_KEY))!;
+  const failure = new Error("R2 body unavailable");
+  vi.spyOn(object, "json").mockRejectedValue(failure);
+  vi.spyOn(object, "text").mockRejectedValue(failure);
+  const get = vi.spyOn(env.API_CACHE, "get").mockResolvedValue(object);
+  const url = `https://${crypto.randomUUID()}.api.test/v1/presence/history`;
+  const response = await exports.default.fetch(url);
+  expect(response.status).toBe(503);
+  expect(response.headers.get("Retry-After")).toBe("60");
+  expect(response.headers.get("Cache-Control")).toBeNull();
+  await runInDurableObject(hub(), async (_, state) => {
+    const history = new PresenceHistory(state.storage.sql, env.API_CACHE);
+    history.record(now + MINUTE_MS, 5);
+    await expect(history.publish(now + MINUTE_MS)).rejects.toThrow("R2 body unavailable");
+    expect(state.storage.sql.exec("SELECT failures, retry_at FROM presence_publication").toArray())
+      .toEqual([{ failures: 1, retry_at: now + 2 * MINUTE_MS }]);
+    get.mockClear();
+    await new PresenceHistory(state.storage.sql, env.API_CACHE).publish(now + MINUTE_MS);
+    expect(get).not.toHaveBeenCalled();
+  });
+  get.mockRestore();
+  const recovered = await exports.default.fetch(url);
+  expect(recovered.status).toBe(200);
+  expect(await recovered.json()).toMatchObject({ points: [{ online: 3 }] });
 });
