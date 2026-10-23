@@ -65,6 +65,45 @@ describe("crash release admission", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it.each(["empty", "warm"])("shares concurrent %s cache refreshes so a later failure cannot replace successful admission", async (state) => {
+    const { fetcher } = publisher();
+    const fetchPublication = fetcher.getMockImplementation()!;
+    const cache = await caches.open(RELEASE_CACHE_NAME);
+    if (state === "warm") await cache.put(RELEASE_CACHE_KEY, Response.json({ versions: ["1.0.0"] }));
+    vi.spyOn(caches, "open").mockResolvedValue(cache);
+    const match = cache.match.bind(cache);
+    const bothMissed = Promise.withResolvers<void>();
+    const succeed = Promise.withResolvers<void>();
+    const fail = Promise.withResolvers<void>();
+    let reads = 0;
+    let lookups = 0;
+    vi.spyOn(cache, "match").mockImplementation(async (...args) => {
+      const entry = await match(...args);
+      if (String(args[0]) === RELEASE_CACHE_KEY && ++reads === 2) bothMissed.resolve();
+      return entry;
+    });
+    fetcher.mockImplementation(async (input, init) => {
+      if (String(input) === LIST) {
+        if (++lookups === 1) await succeed.promise;
+        else {
+          await fail.promise;
+          return new Response(null, { status: 503 });
+        }
+      }
+      return fetchPublication(input, init);
+    });
+
+    const first = publishedRelease("1.2.3");
+    const second = publishedRelease("1.2.5-nightly");
+    await bothMissed.promise;
+    succeed.resolve();
+    const firstResult = await first;
+    fail.resolve();
+    const secondResult = await second;
+    expect([firstResult, secondResult, await publishedRelease("1.2.3")]).toEqual([true, true, true]);
+    expect(lookups).toBe(1);
+  });
+
   it("admits the current nightly when its rolling release is beyond the first 100 releases", async () => {
     const { releases, fetcher } = publisher();
     releases.unshift(...Array.from({ length: 100 }, (_, index) => ({
