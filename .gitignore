@@ -6,3 +6,6 @@ worker-configuration.d.ts
 
 # Python cosmetic authoring tools.
 __pycache__/
+
+# Generated local crash bindings keep development secrets relative to the repository root.
+.wrangler.crash-local.json

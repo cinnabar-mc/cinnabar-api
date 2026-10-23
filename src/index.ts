@@ -1,3 +1,4 @@
+import * as crashes from "./crash-reports";
 import { catalogResponse, assetResponse, revalidateCatalog } from "./cosmetics";
 import { authorizePublisher, entitlementCommand } from "./cosmetics-admin";
 import { Hono } from "hono";
@@ -11,6 +12,16 @@ export { Hub } from "./hub";
 const MAX_HOOK_BODY_BYTES = 1024;
 
 const app = new Hono<{ Bindings: Env }>();
+
+app.post("/v1/crash-reports", (c) => crashes.receive(c.req.raw, c.env));
+app.get("/v1/crash-reports", async (c) => {
+  if (!(await bearerMatches(c.req.header("Authorization"), c.env.CRASH_OWNER_SECRET))) return c.body(null, 401);
+  return crashes.listing(new URL(c.req.url), c.env);
+});
+app.get("/v1/crash-reports/:id", async (c) => {
+  if (!(await bearerMatches(c.req.header("Authorization"), c.env.CRASH_OWNER_SECRET))) return c.body(null, 401);
+  return crashes.report(c.req.param("id"), c.env);
+});
 
 app.get("/v1/health", cache({ cacheName: "cinnabar-api-v1", cacheControl: "public, max-age=60" }),
   (c) => c.json({ ok: true, api: "v1" }));
@@ -120,7 +131,13 @@ async function bearerMatches(header: string | undefined, secret: string | undefi
 export default {
   fetch: app.fetch,
   /** Samples at execution time, so delayed cron delivery cannot fabricate past counts. */
-  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
-    await hubFor(env).recordOnlineCount();
+  async scheduled(controller: ScheduledController, env: Env): Promise<void> {
+    if (controller.cron === "17 * * * *") {
+      // Leave room for D1 calls alongside at most 900 R2 marker writes per invocation.
+      for (let batch = 0; batch < 9; batch++) {
+        if (!(await crashes.expire(env))) break;
+      }
+    }
+    else await hubFor(env).recordOnlineCount();
   },
 } satisfies ExportedHandler<Env>;
