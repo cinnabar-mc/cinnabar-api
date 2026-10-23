@@ -322,7 +322,8 @@ as an additional storage safeguard. No report ingestion or retention call uses a
 
 Before deployment, explicitly provision the private report R2 bucket and D1 database, replace the
 local example D1 id, add the crash storage/rate-limit bindings and hourly cron to the default
-production configuration, apply all three files in `migrations/` (including `0003_crash_report_cap.sql`),
+production configuration, apply all four files in `migrations/` (including `0003_crash_report_cap.sql`
+and `0004_crash_listing_indexes.sql`),
 configure unused rate-limit namespaces and the owner secret, and set the R2 retention rule.
 Provision a separate private symbols bucket for the client's release
 workflow, with bucket-scoped CI upload credentials and account/bucket variables. This source change

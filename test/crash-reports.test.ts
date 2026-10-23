@@ -50,6 +50,27 @@ function owner(path = "", token = "test-crash-owner") {
     { headers: { Authorization: `Bearer ${token}` } });
 }
 
+/** Explains the SQL and bound values executed by the listing handler in the test database. */
+async function listingPlan(search: string): Promise<string[]> {
+  const db = crashEnv.CRASH_INDEX;
+  const original = db.prepare.bind(db);
+  let query = "";
+  let values: unknown[] = [];
+  const prepare = vi.spyOn(db, "prepare").mockImplementation((sql) => {
+    query = sql;
+    const statement = original(sql);
+    const bind = statement.bind.bind(statement);
+    statement.bind = (...args) => { values = args; return bind(...args); };
+    return statement;
+  });
+  try {
+    expect((await listing(new URL(`https://api.test/v1/crash-reports${search}`), crashEnv)).status).toBe(200);
+    expect(prepare).toHaveBeenCalledTimes(1);
+  } finally { prepare.mockRestore(); }
+  const plan = await db.prepare(`EXPLAIN QUERY PLAN ${query}`).bind(...values).all<{ detail: string }>();
+  return plan.results.map((row) => row.detail);
+}
+
 describe("crash reports", { timeout: 30000 }, () => {
   it("keeps crash routes unavailable until storage is provisioned", async () => {
     const unconfigured = { ...env, CRASH_REPORTS: undefined, CRASH_INDEX: undefined,
@@ -287,6 +308,52 @@ describe("crash reports", { timeout: 30000 }, () => {
     });
     try { expect((await report(value.report_id, crashEnv)).status).toBe(404); }
     finally { get.mockRestore(); }
+  });
+
+  it("seeks report pages through the listing index without a temporary sort", async () => {
+    for (const search of ["", `?cursor=${Date.now()}:${"8".repeat(32)}`]) {
+      const plan = await listingPlan(search);
+      expect(plan.some((detail) => detail.includes("SEARCH crash_reports USING INDEX crash_reports_listing"))).toBe(true);
+      expect(plan.join("\n")).toContain("(received_at,id)<(?,?)");
+      expect(plan.some((detail) => detail.includes("TEMP B-TREE"))).toBe(false);
+    }
+  });
+
+  it("uses an indexed retention range for group aggregation on both pages", async () => {
+    for (const search of ["?groups=1", `?groups=1&cursor=${Date.now()}:${"8".repeat(32)}`]) {
+      const plan = await listingPlan(search);
+      expect(plan.some((detail) => detail.includes("SEARCH crash_groups USING INDEX crash_groups_latest (latest_at>?)"))).toBe(true);
+      expect(plan.some((detail) => detail.includes("SCAN crash_groups"))).toBe(false);
+    }
+  });
+
+  it("paginates stored reports across timestamp ties and excludes expired and pending rows", async () => {
+    const latest = Date.now() - 1000;
+    const rows = Array.from({ length: 207 }, (_, index) => ({
+      id: index.toString(16).padStart(32, "0"),
+      received_at: index === 0 ? latest - RETENTION_MS : latest - Math.floor(index / 110),
+      stored: index === 1 ? 0 : 1,
+    }));
+    await crashEnv.CRASH_INDEX.batch(rows.map((row) => crashEnv.CRASH_INDEX.prepare(`INSERT INTO crash_reports
+      (id, install_id, payload_hash, received_at, signature, version, os, gpu, backend, stored)
+      VALUES (?, 'install', 'hash', ?, 'panic: boom', '1.2.3', 'linux', 'gpu', 'vulkan', ?)`)
+      .bind(row.id, row.received_at, row.stored)));
+    const expected = rows.slice(2).sort((a, b) => b.received_at - a.received_at || b.id.localeCompare(a.id));
+    let cursor: string | null = null;
+    const seen: string[] = [];
+    for (let page = 0; page < 3; page++) {
+      const body = await (await owner(cursor ? `?cursor=${encodeURIComponent(cursor)}` : "")).json() as {
+        reports: { id: string; received_at: number }[]; next_cursor: string | null;
+      };
+      const wanted = expected.slice(page * 100, (page + 1) * 100);
+      expect(body.reports.map(({ id, received_at }) => ({ id, received_at })))
+        .toEqual(wanted.map(({ id, received_at }) => ({ id, received_at })));
+      seen.push(...body.reports.map((row) => row.id));
+      const last = wanted.at(-1)!;
+      expect(body.next_cursor).toBe(page < 2 ? `${last.received_at}:${last.id}` : null);
+      cursor = body.next_cursor;
+    }
+    expect(new Set(seen).size).toBe(expected.length);
   });
 
   it("paginates every crash group with tied timestamps", async () => {

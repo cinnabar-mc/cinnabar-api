@@ -93,8 +93,8 @@ export async function listing(url: URL, env: Env): Promise<Response> {
       SELECT signature, version, SUM(count) AS count, SUM(samples) AS samples,
         MAX(latest_at) AS latest_at, MIN(cursor_id) AS cursor_id FROM crash_groups
       WHERE latest_at > ? GROUP BY signature, version
-      ) WHERE latest_at < ? OR (latest_at = ? AND cursor_id < ?)
-      ORDER BY latest_at DESC, cursor_id DESC LIMIT ?`).bind(cutoff, before, before, beforeId, PAGE_SIZE)
+      ) WHERE (latest_at, cursor_id) < (?, ?)
+      ORDER BY latest_at DESC, cursor_id DESC LIMIT ?`).bind(cutoff, before, beforeId, PAGE_SIZE)
       .all<{ latest_at: number; cursor_id: string }>();
     const last = rows.results.at(-1);
     const next = rows.results.length === PAGE_SIZE && last ? `${last.latest_at}:${last.cursor_id}` : null;
@@ -103,8 +103,8 @@ export async function listing(url: URL, env: Env): Promise<Response> {
   }
   const rows = await env.CRASH_INDEX.prepare(`SELECT id, received_at, signature, version, os, gpu, backend
     FROM crash_reports WHERE stored = 1 AND received_at > ?
-    AND (received_at < ? OR (received_at = ? AND id < ?))
-    ORDER BY received_at DESC, id DESC LIMIT ?`).bind(cutoff, before, before, beforeId, PAGE_SIZE)
+    AND (received_at, id) < (?, ?)
+    ORDER BY received_at DESC, id DESC LIMIT ?`).bind(cutoff, before, beforeId, PAGE_SIZE)
     .all<{ id: string; received_at: number }>();
   const last = rows.results.at(-1);
   const next = rows.results.length === PAGE_SIZE && last ? `${last.received_at}:${last.id}` : null;
