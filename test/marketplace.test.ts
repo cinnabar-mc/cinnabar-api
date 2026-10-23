@@ -1,10 +1,13 @@
 import { runInDurableObject } from "cloudflare:test";
-import { exports } from "cloudflare:workers";
+import { env, exports } from "cloudflare:workers";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Hub } from "../src/hub";
 import { readComponent } from "../src/marketplace/component";
 import { TOKEN_URL, XBOX_USER_URL, XSTS_URL } from "../src/marketplace/microsoft";
-import { approvalRule, canApprove, canSetRole, reachOf, type Actor } from "../src/marketplace/policy";
+import { approvalRule, canApprove, canSetRole, grantDiff, reachOf, type Actor } from "../src/marketplace/policy";
+import { CLIENT_REVISION, SCAN_POLICY, VALIDATOR, PROMPT_VERSION, SCAN_LEASE_MS } from "../src/marketplace/scanning";
+import { BodyLimitError, readLimited } from "../src/marketplace/uploads";
+import { MarketplaceStore } from "../src/marketplace/store";
 import { hub, installFakeIssuer, login, type Client } from "./helpers";
 
 const SITE = "https://site.test";
@@ -105,11 +108,32 @@ function component(sections: [string, string][], layer = [0x0d, 0, 1, 0]): Uint8
 }
 
 /** Submits a component built from `grants` through the multipart upload route. */
-async function submit(browser: Browser, slug: string, version: string, grants: object, extra: object = {}): Promise<Response> {
+async function submit(browser: Browser, slug: string, version: string, grants: object, extra: object = {}, scan = true): Promise<Response> {
   const form = new FormData();
   form.set("listing", JSON.stringify({ slug, name: slug, summary: `A test mod called ${slug}.`, version, ...extra }));
   form.set("file", new File([component([["version", version], ["cinnabar:grants", JSON.stringify(grants)]])], `${slug}.wasm`));
-  return api("/submissions", { method: "POST", body: form, headers: { Cookie: browser.cookie, Origin: SITE, "X-Cinnabar-CSRF": browser.csrf } });
+  const result = await api("/submissions", { method: "POST", body: form, headers: { Cookie: browser.cookie, Origin: SITE, "X-Cinnabar-CSRF": browser.csrf } });
+  if (result.status === 200 && scan) await scanOne();
+  return result;
+}
+
+/** Scanner protocol helper. The full trusted validator is exercised separately by the Node scanner tests. */
+const scanner = (path: string, body?: unknown, lease?: string) => api(`/internal/marketplace/${path}`, {
+  method: "POST", headers: { Authorization: "Bearer test-scanner-token", "Content-Type": "application/json", ...(lease ? { "X-Scan-Lease": lease } : {}) },
+  body: body === undefined ? undefined : JSON.stringify(body),
+});
+async function claim(): Promise<any> { return ((await (await scanner("claim")).json()) as any).job; }
+function report(job: any, extra: object = {}) {
+  return { sha256: job.sha256, policy: SCAN_POLICY, validator: VALIDATOR, client_revision: CLIENT_REVISION, deterministic: "pass", imports: [], exports: [],
+    media: job.media.map((m: { sha256: string }) => m.sha256), findings: [],
+    ai: { verdict: "clear", model: "test-model", prompt: PROMPT_VERSION, findings: [] }, ...extra };
+}
+async function scanOne(extra: object = {}): Promise<Response> {
+  const job = await claim();
+  expect(job).toBeTruthy();
+  const response = await scanner(`jobs/${job.id}/complete`, report(job, extra), job.lease);
+  expect(response.status, await response.clone().text()).toBe(200);
+  return response;
 }
 
 /** The owner promotes `gamertag` to `role` (owners manage admins; admins manage moderators). */
@@ -142,6 +166,24 @@ describe("marketplace policy", () => {
     expect(parsed.grants).toEqual({ camera: true });
     expect(() => readComponent(component([], [1, 0, 0, 0]))).toThrow(/core module/);
     expect(() => readComponent(component([["cinnabar:grants", '{"fly":true}']]))).toThrow(/Unknown capability/);
+  });
+
+  it("detects value-level authority changes and refuses ambiguous declarations", () => {
+    expect(grantDiff({ commands: ["help"] }, { commands: ["help", "tp"] })).toMatchObject({
+      added: [], changed: ["commands"], commands: { added: ["tp"], removed: [] }, expanded: true,
+    });
+    expect(grantDiff({ commands: ["help", "tp"] }, { commands: ["tp", "help", "help"] }).expanded).toBe(false);
+    expect(() => readComponent(component([["cinnabar:grants", '{"hud":true,"h\\u0075d":false}']]))).toThrow(/Duplicate capability/);
+    expect(() => readComponent(component([["cinnabar:grants", '{}'], ["cinnabar:grants", '{}']]))).toThrow(/Duplicate metadata/);
+    expect(() => readComponent(component([], [13, 1, 1, 0]))).toThrow(/header/);
+    expect(() => readComponent(new Uint8Array([0,97,115,109,13,0,1,0,0,255,255,255,255,16]))).toThrow(/Malformed length/);
+  });
+
+  it("bounds actual chunked bytes even when Content-Length lies", async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({ pull(controller) { controller.enqueue(new Uint8Array(8)); }, cancel() { cancelled = true; } });
+    await expect(readLimited(new Request("https://api.test", { method: "POST", body, headers: { "Content-Length": "1" } }), 10)).rejects.toBeInstanceOf(BodyLimitError);
+    expect(cancelled).toBe(true);
   });
 });
 
@@ -323,5 +365,239 @@ describe("submission, review and delivery", () => {
     expect(stale.status).toBe(401);
     await promote(await signIn("2535400000005001", "AdminTwo"), "Helper", "player");
     expect((await target.get("/staff/queue")).status).toBe(401);
+  });
+});
+
+describe("quarantine and publication pipeline", () => {
+  let creatorId = 2535400000006200n;
+  /** Create an explicitly established project with one human-approved baseline. */
+  async function established(slug: string) {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const gamertag = `Creator${String(++creatorId).slice(-4)}`;
+    const creator = await signIn(String(creatorId), gamertag);
+    const initial = await (await submit(creator, slug, "1.0.0", { hud: true })).json() as { id: string };
+    expect((await owner.post(`/staff/versions/${initial.id}/decision`, { decision: "approve" })).status).toBe(200);
+    expect((await owner.post(`/staff/mods/${slug}/trust`, { trusted: true, reason: "Established project reviewed by staff" })).status).toBe(200);
+    return { owner, creator, initial, gamertag };
+  }
+
+  it("authenticates uploads before reading bodies and gives scanner tokens no staff privileges", async () => {
+    expect((await api("/submissions", { method: "POST", body: "invalid body" })).status).toBe(401);
+    expect((await api("/internal/marketplace/claim", { method: "POST" })).status).toBe(401);
+    expect((await api("/staff/queue", { headers: { Authorization: "Bearer test-scanner-token" } })).status).toBe(401);
+    const creator = await signIn("2535400000006101", "Uploader");
+    expect((await api("/submissions", { method: "POST", body: "invalid body", headers: { Cookie: creator.cookie } })).status).toBe(403);
+  });
+
+  it("keeps bytes quarantined and refuses approval until a current scan completes", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const creator = await signIn("2535400000006102", "PendingUploader");
+    const v = await (await submit(creator, "pending-mod", "1.0.0", { hud: true }, {}, false)).json() as any;
+    expect(v.scan.state).toBe("queued");
+    expect(await env.MOD_QUARANTINE.head(`mods/${v.sha256}`)).not.toBeNull();
+    expect(await env.MOD_FILES.head(`mods/${v.sha256}`)).toBeNull();
+    expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(409);
+    const job = await claim();
+    expect((await api(`/internal/marketplace/jobs/${job.id}/files/${v.sha256}`, {
+      headers: { Authorization: "Bearer test-scanner-token", "X-Scan-Lease": "wrong" },
+    })).status).toBe(404);
+    const bad = report(job, { sha256: "0".repeat(64) });
+    expect((await scanner(`jobs/${job.id}/complete`, bad, job.lease)).status).toBe(422);
+    expect((await scanner(`jobs/${job.id}/complete`, report(job, { policy: "old-policy" }), job.lease)).status).toBe(422);
+    expect((await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).status).toBe(200);
+    const duplicate = await scanner(`jobs/${job.id}/complete`, report(job), job.lease);
+    expect(await duplicate.json()).toMatchObject({ duplicate: true });
+    expect((await api(`/mods/assets/${v.sha256}`)).status).toBe(404);
+    expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(200);
+    expect((await api(`/mods/assets/${v.sha256}`)).status).toBe(200);
+  });
+
+  it("automatically publishes a checked established update once and preserves its signed evidence", async () => {
+    const { creator } = await established("trusted-mod");
+    const v = await (await submit(creator, "trusted-mod", "1.0.1", { hud: true }, {}, false)).json() as any;
+    const job = await claim();
+    const result = await scanner(`jobs/${job.id}/complete`, report(job), job.lease);
+    expect(await result.json()).toMatchObject({ automatic: true });
+    const listing = await (await api("/mods/trusted-mod")).json() as any;
+    expect(listing).toMatchObject({ version: "1.0.1", publication: "automatic" });
+    expect(JSON.parse(listing.release.statement)).toMatchObject({ sha256: v.sha256, policy: SCAN_POLICY, scan_job: job.id, publication: "automatic" });
+    expect((await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).status).toBe(200);
+    const mine = await (await creator.get("/me/mods")).json() as any[];
+    expect(mine.filter(x => x.version === "1.0.1")).toHaveLength(1);
+  });
+
+  it("holds permission expansion, metadata changes, and new imports for a human", async () => {
+    const { creator } = await established("changed-mod");
+    for (const [version, grants, extra, scan] of [
+      ["1.1.0", { hud: true, players: true }, {}, {}],
+      ["1.2.0", { hud: true }, { summary: "A description staff have not seen yet." }, {}],
+      ["1.3.0", { hud: true }, {}, { imports: ["cinnabar:extension/hud@0.1.0"] }],
+    ] as const) {
+      await submit(creator, "changed-mod", version, grants, extra, false);
+      expect(await (await scanOne(scan)).json()).toMatchObject({ automatic: false });
+    }
+    expect(await (await api("/mods/changed-mod")).json()).toMatchObject({ version: "1.0.0" });
+  });
+
+  it("holds AI flags for explained human review and blocks errors or deterministic failures", async () => {
+    const { owner, creator } = await established("flagged-mod");
+    const v = await (await submit(creator, "flagged-mod", "1.1.0", { hud: true }, {}, false)).json() as any;
+    await scanOne({ ai: { verdict: "flag", model: "test-model", prompt: PROMPT_VERSION, findings: ["Suspicious string"] } });
+    expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(422);
+    expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve", note: "Reviewed the finding against the submitted artifact" })).status).toBe(200);
+    for (const [version, failure] of [
+      ["1.2.0", { deterministic: "block", findings: ["Unsupported host import"] }],
+      ["1.3.0", { ai: { verdict: "error", model: "test-model", prompt: PROMPT_VERSION, findings: ["Timed out"] } }],
+    ] as const) {
+      const failed = await (await submit(creator, "flagged-mod", version, { hud: true }, {}, false)).json() as any;
+      await scanOne(failure);
+      expect((await owner.post(`/staff/versions/${failed.id}/decision`, { decision: "approve", note: "Cannot bypass checks" })).status).toBe(409);
+    }
+  });
+
+  it("rechecks revoked trust, open reports, suspension and the exact baseline at completion", async () => {
+    const { owner, creator, initial, gamertag } = await established("revoked-mod");
+    await submit(creator, "revoked-mod", "1.1.0", { hud: true }, {}, false);
+    const job = await claim();
+    await owner.post("/staff/mods/revoked-mod/trust", { trusted: false, reason: "Incident under review" });
+    expect(await (await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).json()).toMatchObject({ automatic: false });
+    await owner.post("/staff/mods/revoked-mod/trust", { trusted: true, reason: "New review completed" });
+    await submit(creator, "revoked-mod", "1.2.0", { hud: true }, {}, false);
+    const nextJob = await claim();
+    const reporter = await signIn("2535400000006103", "IncidentReporter");
+    await reporter.post("/mods/revoked-mod/reports", { reason: "malicious", details: "Please check this suspicious behavior." });
+    expect(await (await scanner(`jobs/${nextJob.id}/complete`, report(nextJob), nextJob.lease)).json()).toMatchObject({ automatic: false });
+    await owner.post(`/staff/versions/${initial.id}/pull`, { reason: "Withdrawn during investigation" });
+    expect((await api("/mods/revoked-mod")).status).toBe(404);
+    await owner.post("/staff/people/suspend", { gamertag, suspended: true, reason: "Incident under review" });
+    expect((await submit(creator, "revoked-mod", "1.3.0", { hud: true })).status).toBe(403);
+  });
+
+  it("does not replace approved listing text with an unreviewed edit", async () => {
+    const { creator, owner } = await established("snapshot-mod");
+    const edit = await (await submit(creator, "snapshot-mod", "2.0.0", { hud: true }, { description: "Unreviewed text", name: "Changed name" })).json() as any;
+    expect(await (await api("/mods/snapshot-mod")).json()).toMatchObject({ name: "snapshot-mod", description: "", version: "1.0.0" });
+    await owner.post(`/staff/versions/${edit.id}/decision`, { decision: "approve" });
+    expect(await (await api("/mods/snapshot-mod")).json()).toMatchObject({ name: "Changed name", description: "Unreviewed text", version: "2.0.0" });
+  });
+
+  it("reclaims expired leases, rejects stale completion and exhausts retries into a hold", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const creator = await signIn("2535400000006104", "RetryCreator");
+    const v = await (await submit(creator, "retry-mod", "1.0.0", { hud: true }, {}, false)).json() as any;
+    const first = await claim();
+    const expire = () => runInDurableObject(hub(), (_: Hub, state) => { state.storage.sql.exec("UPDATE mod_pipeline SET lease_until = ? WHERE version_id = ?", Date.now() - SCAN_LEASE_MS, Number(v.id)); });
+    await expire();
+    const second = await claim();
+    expect(second.lease).not.toBe(first.lease);
+    expect((await scanner(`jobs/${first.id}/complete`, report(first), first.lease)).status).toBe(409);
+    await expire(); await claim(); await expire();
+    expect(await claim()).toBeNull();
+    expect(await (await owner.get(`/staff/versions/${v.id}`)).json()).toMatchObject({ scan: { state: "failed", attempts: 3 } });
+    expect((await owner.post(`/staff/versions/${v.id}/rescan`)).status).toBe(200);
+    expect((await claim()).id).not.toBe(first.id);
+  });
+
+  it("recovers an interrupted promotion without exposing an unsigned release", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const creator = await signIn("2535400000006105", "RecoveryCreator");
+    const v = await (await submit(creator, "recovery-mod", "1.0.0", { hud: true })).json() as any;
+    const key = `mods/${v.sha256}`;
+    const bytes = await (await env.MOD_QUARANTINE.get(key))!.arrayBuffer();
+    await env.MOD_QUARANTINE.delete(key);
+    expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(503);
+    expect((await api("/mods/recovery-mod")).status).toBe(404);
+    expect((await creator.post("/mods/recovery-mod/send")).status).toBe(404);
+    await env.MOD_QUARANTINE.put(key, bytes);
+    await hub().recoverModPublications();
+    expect((await api("/mods/recovery-mod")).status).toBe(200);
+  });
+
+  it("holds a concurrently scanned update whose approved baseline changed", async () => {
+    const { creator } = await established("parallel-mod");
+    await submit(creator, "parallel-mod", "1.0.1", { hud: true }, {}, false);
+    await submit(creator, "parallel-mod", "1.0.2", { hud: true }, {}, false);
+    const first = await claim(); const second = await claim();
+    expect(await (await scanner(`jobs/${first.id}/complete`, report(first), first.lease)).json()).toMatchObject({ automatic: true });
+    expect(await (await scanner(`jobs/${second.id}/complete`, report(second), second.lease)).json()).toMatchObject({ automatic: false });
+    expect(await (await api("/mods/parallel-mod")).json()).toMatchObject({ version: "1.0.1" });
+  });
+
+  it("rechecks trust after signing work and cannot commit an old publication ticket", async () => {
+    const { creator } = await established("race-mod");
+    const v = await (await submit(creator, "race-mod", "1.0.1", { hud: true }, {}, false)).json() as any;
+    await runInDurableObject(hub(), (_: Hub, state) => {
+      const store = new MarketplaceStore(state.storage.sql, new Set([OWNER]));
+      const job = (store.claimScan(Date.now()).body as any).job;
+      expect(store.completeScan(job.id, job.lease, report(job), Date.now()).approved).toBe(Number(v.id));
+      const candidate = store.publicationReady(Number(v.id), Date.now())!;
+      expect(candidate).not.toBeNull();
+      state.storage.sql.exec("DELETE FROM mod_trust WHERE slug = ?", "race-mod");
+      expect(store.publish(Number(v.id), candidate.statement, "signature-from-outdated-ticket", Date.now())).toBe(false);
+    });
+    expect(await (await api("/mods/race-mod")).json()).toMatchObject({ version: "1.0.0" });
+  });
+
+  it("quarantines image bytes, binds their hashes to the scan and publishes only after approval", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const creator = await signIn("2535400000006106", "ImageCreator");
+    const form = new FormData();
+    form.set("listing", JSON.stringify({ slug: "image-mod", name: "Image mod", summary: "A mod with a screenshot.", version: "1.0.0" }));
+    form.set("file", new File([component([["cinnabar:grants", "{}"]])], "image-mod.wasm"));
+    // Public synthetic 1x1 raster; actual full image decoding is tested by the scanner suite.
+    const png = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aOioAAAAASUVORK5CYII="), c => c.charCodeAt(0));
+    form.append("images", new File([png], "Screenshot.png", { type: "image/png" }));
+    const result = await api("/submissions", { method: "POST", body: form,
+      headers: { Cookie: creator.cookie, Origin: SITE, "X-Cinnabar-CSRF": creator.csrf } });
+    expect(result.status).toBe(200);
+    const v = await result.json() as any;
+    const mediaHash = v.gallery[0].sha256;
+    expect((await api(`/mods/media/${mediaHash}`)).status).toBe(404);
+    const job = await claim();
+    expect((await scanner(`jobs/${job.id}/complete`, report(job, { media: [] }), job.lease)).status).toBe(422);
+    expect((await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).status).toBe(200);
+    await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" });
+    const image = await api(`/mods/media/${mediaHash}`);
+    expect(image.status).toBe(200); expect(image.headers.get("Content-Type")).toBe("image/png");
+    expect(image.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(new Uint8Array(await image.arrayBuffer())).toEqual(png);
+    await owner.post(`/staff/versions/${v.id}/pull`, { reason: "Withdraw screenshot" });
+    expect((await api(`/mods/media/${mediaHash}`)).status).toBe(404);
+  });
+
+  it("holds expired trust and refuses manual approval of an expired scan", async () => {
+    const { creator, owner } = await established("expiry-mod");
+    const v = await (await submit(creator, "expiry-mod", "1.0.1", { hud: true }, {}, false)).json() as any;
+    await runInDurableObject(hub(), (_: Hub, state) => { state.storage.sql.exec("UPDATE mod_trust SET expires_at = 0 WHERE slug = ?", "expiry-mod"); });
+    expect(await (await scanOne()).json()).toMatchObject({ automatic: false });
+    await runInDurableObject(hub(), (_: Hub, state) => { state.storage.sql.exec("UPDATE mod_pipeline SET completed_at = 0 WHERE version_id = ?", Number(v.id)); });
+    expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(409);
+    expect(await (await api("/mods/expiry-mod")).json()).toMatchObject({ version: "1.0.0" });
+  });
+
+  it("upgrades pre-pipeline releases into quarantine and retains access across rescans", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const creator = await signIn("2535400000006107", "LegacyCreator");
+    const v = await (await submit(creator, "legacy-mod", "0.9.7", { hud: true }, {}, false)).json() as any;
+    const key = `mods/${v.sha256}`;
+    const bytes = await (await env.MOD_QUARANTINE.get(key))!.arrayBuffer();
+    await env.MOD_FILES.put(key, bytes); await env.MOD_QUARANTINE.delete(key);
+    await runInDurableObject(hub(), (_: Hub, state) => {
+      state.storage.sql.exec("DELETE FROM mod_pipeline WHERE version_id = ?", Number(v.id));
+      state.storage.sql.exec("UPDATE mod_versions SET status = 'approved', signature = 'old-signature' WHERE id = ?", Number(v.id));
+      state.storage.sql.exec("DELETE FROM market_schema WHERE version = 1");
+      new MarketplaceStore(state.storage.sql, new Set([OWNER]));
+    });
+    expect((await api(`/mods/assets/${v.sha256}`)).status).toBe(404);
+    const rescan = await owner.post(`/staff/versions/${v.id}/rescan`);
+    expect(rescan.status).toBe(200);
+    const job = await claim();
+    const file = await api(`/internal/marketplace/jobs/${job.id}/files/${v.sha256}`, {
+      headers: { Authorization: "Bearer test-scanner-token", "X-Scan-Lease": job.lease },
+    });
+    expect(file.status).toBe(200); expect(await file.arrayBuffer()).toEqual(bytes);
+    expect((await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).status).toBe(200);
+    expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(200);
+    expect((await api("/mods/legacy-mod")).status).toBe(200);
   });
 });

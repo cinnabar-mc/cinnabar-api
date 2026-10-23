@@ -6,3 +6,5 @@ worker-configuration.d.ts
 
 # Python cosmetic authoring tools.
 __pycache__/
+.generated/
+.build/

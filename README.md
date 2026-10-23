@@ -100,7 +100,16 @@ highest reach it touches. Reach sets the review rule:
 Acts and Network listings must link their GitHub source.
 
 **Files and trust.**
-- Uploads (at most 16 MiB) are stored in R2 `MOD_FILES` under their SHA-256.
+- Components (at most 16 MiB) and up to four raster images (1 MiB each) enter private
+  `MOD_QUARANTINE` storage under server-computed SHA-256 keys. An authenticated,
+  byte-bounded multipart request creates an immutable metadata snapshot and durable scan job.
+- A separate scanner validates full component structure/types/core bytecode, host imports
+  and image decoding without executing uploaded code. Workers AI assists staff with bounded,
+  schema-validated findings. Missing, failed or expired checks prevent publication.
+- Admins can establish a creator for a particular project after human review. Eligible updates
+  publish automatically only with current trust and completed checks, unchanged content/imports,
+  no added permissions or commands, and no suspension, withdrawal or open-report hold.
+  Acts and Network releases always need human approval. See [the pipeline contract](docs/marketplace.md).
 - An approved version is signed with the Ed25519 `MARKETPLACE_SIGNING_KEY` over a canonical statement
   `{approved_at, approvers, bytes, grants, sha256, slug, version}`, returned as `release` on `GET /v1/mods/:slug`.
 - Pulled versions appear in `GET /v1/mods/revocations`, signed in `X-Cinnabar-Signature`.
@@ -126,7 +135,9 @@ Before enabling it in production:
 
 ```sh
 pnpm exec wrangler r2 bucket create cinnabar-mods
+pnpm exec wrangler r2 bucket create cinnabar-mods-quarantine
 pnpm exec wrangler secret put MARKETPLACE_SIGNING_KEY   # base64 PKCS#8 Ed25519 private key
+pnpm exec wrangler secret put MARKETPLACE_SCANNER_TOKEN # separate random scanner credential
 pnpm exec wrangler secret put MICROSOFT_CLIENT_SECRET   # only for a confidential Entra app
 ```
 
@@ -136,6 +147,10 @@ Then set the `MARKETPLACE_ORIGIN`, `MICROSOFT_CLIENT_ID` and `OWNER_XUIDS` varia
 - Sign-in answers 503 until the origin and client ID are set.
 - The session cookie only reaches the API when the website shares its registrable domain (for example
   `cinnabar.gg`), so the site must leave `*.workers.dev` before sign-in works there.
+- Keep both R2 buckets private with no public domains. Run the separate scanner with its
+  limited credential and a Workers AI token; it never receives the signing key. Provisioning,
+  scanner deployment and website HTTP enablement are separate from merging the API code.
+  See [deployment and recovery](docs/marketplace.md#deployment-and-recovery).
 
 ## Privacy
 
@@ -192,7 +207,9 @@ no emote history is written to durable storage or logs. No server addresses are 
 
 ```sh
 pnpm install
+pnpm source:fetch # derive capabilities/imports from the immutable client revision in source.json
 pnpm test          # vitest in the Workers runtime
+pnpm test:scanner  # real component validation, image decoding and scanner protocol
 pnpm typecheck
 cp .dev.vars.example .dev.vars && pnpm dev
 ```

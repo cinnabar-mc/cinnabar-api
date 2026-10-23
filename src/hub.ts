@@ -540,13 +540,11 @@ export class Hub extends DurableObject<Env> {
       (result.body as { game_online: boolean }).game_online = !!account && [...(this.byXuid.get(account.xuid) ?? [])]
         .some((ws) => this.sessions.get(ws)?.stage === "ready");
     }
-    if (result.approved !== undefined && this.env.MARKETPLACE_SIGNING_KEY) {
-      try {
-        const signature = await signText(this.env.MARKETPLACE_SIGNING_KEY, this.market.statement(result.approved));
-        this.market.setSignature(result.approved, signature);
-      } catch {
-        // A malformed key leaves the release unsigned; clients refuse unsigned releases, so nothing unverified ships.
-      }
+    if (result.approved !== undefined) {
+      const published = await this.publishMod(result.approved);
+      if (!published) return { status: 503, body: { error: "Publication is pending. The release remains private; retry after configuration or storage recovers." } };
+      // Return the committed view, including status and signature, rather than the pre-signing candidate.
+      if (call.op === "decide") result.body = this.market.version(call, result.approved, Date.now()).body;
     }
     for (const xuid of new Set(result.notify ?? [])) {
       const mods = this.market.library(xuid);
@@ -555,6 +553,32 @@ export class Hub extends DurableObject<Env> {
       }
     }
     return { status: result.status, body: result.body };
+  }
+
+  /** Copy verified artifacts to distribution, sign, then recheck live database gates before exposing anything. */
+  private async publishMod(id: number): Promise<boolean> {
+    this.market.promotionAttempt(id, Date.now());
+    const key = this.env.MARKETPLACE_SIGNING_KEY;
+    const candidate = key && this.market.publicationReady(id, Date.now());
+    if (!candidate || !key) return false;
+    try {
+      for (const objectKey of [`mods/${candidate.sha256}`, ...candidate.media.map(m => `media/${m.sha256}`)]) {
+        const object = await this.env.MOD_QUARANTINE.get(objectKey)
+          ?? (candidate.legacy ? await this.env.MOD_FILES.get(objectKey) : null);
+        if (!object) return false;
+        await this.env.MOD_FILES.put(objectKey, object.body, { httpMetadata: object.httpMetadata });
+      }
+      const signature = await signText(key, candidate.statement);
+      return this.market.publish(id, candidate.statement, signature, Date.now());
+    } catch {
+      // Pending promotions survive in SQLite. Cron retries; unsigned bytes never become public.
+      return false;
+    }
+  }
+
+  /** Cron recovery for committed decisions interrupted during R2 promotion or signing. */
+  async recoverModPublications(): Promise<void> {
+    for (const id of this.market.pendingPublications()) await this.publishMod(id);
   }
 
   /** The signed list of pulled versions; the signature is null until a signing key is configured. */

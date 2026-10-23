@@ -1,3 +1,5 @@
+import contract from "../../.generated/contract.json";
+
 /** Reach levels, from least to most of a player's game a mod can touch. */
 export const RUNGS = ["looks", "reads", "watches", "acts", "network"] as const;
 export type Reach = 0 | 1 | 2 | 3 | 4;
@@ -10,14 +12,17 @@ export const ROLES = Object.keys(ROLE_RANK) as Role[];
  * The client's `ModGrants` capabilities (crates/mod-host/src/grants.rs) and the rung each is filed under.
  * Every capability the client marks sensitive sits on Acts or Network.
  */
-export const CAPABILITY_RUNG: Readonly<Record<string, Reach>> = {
-  environment: 0, hud: 0, settings: 0, render: 0, world_draw: 0, render_material: 0, render_post: 0,
-  render_depth: 0, fullbright: 0,
-  terrain: 1, player_state: 1, entities: 1, items: 1, recipes: 1, screen: 1,
-  players: 2, entity_observe: 2, entity_highlight: 2, block_highlights: 2, render_through_walls: 2,
-  camera: 3, controls: 3, keys: 3, item_use: 3, movement: 3, interaction: 3, inventory: 3, commands: 3,
-  packet_delay: 4, packets: 4, wasi: 4,
-};
+const groups = [
+  ["environment", "hud", "settings", "render", "world_draw", "render_material", "render_post", "render_depth", "fullbright"],
+  ["terrain", "player_state", "entities", "items", "recipes", "screen"],
+  ["players", "entity_observe", "entity_highlight", "block_highlights", "render_through_walls"],
+  ["camera", "controls", "keys", "item_use", "movement", "interaction", "inventory", "commands"],
+];
+// Presentation groups only; unknown/new client permissions default to the highest review gate.
+export const CAPABILITY_RUNG: Readonly<Record<string, Reach>> = Object.fromEntries(contract.capabilities.map(cap => {
+  const group = groups.findIndex(names => names.includes(cap.name));
+  return [cap.name, (group < 0 || (cap.sensitive && group < 3) ? 4 : group) as Reach];
+}));
 
 export type Grants = Record<string, boolean | string[]>;
 
@@ -138,7 +143,7 @@ export function validateListing(input: unknown, reach: Reach): { fields: Listing
   if (!/^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])$/.test(fields.slug)) errors.slug = "Use 3–40 lowercase letters, numbers and dashes.";
   if (!fields.name || fields.name.length > 64) errors.name = "Name it in 64 characters or fewer.";
   if (fields.summary.length < 10 || fields.summary.length > 140) errors.summary = "Summarise it in 10–140 characters.";
-  if (fields.description.length > 2000) errors.description = "Keep the description under 2,000 characters.";
+  if (fields.description.length > 40000) errors.description = "Keep the description under 40,000 characters.";
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(fields.version) || fields.version.length > 32) {
     errors.version = "Use a SemVer version such as 1.0.0.";
   }
@@ -150,12 +155,21 @@ export function validateListing(input: unknown, reach: Reach): { fields: Listing
 }
 
 /** Compares two grant requests and names what a new version adds and drops. */
-export function grantDiff(previous: unknown, next: unknown): { added: string[]; removed: string[]; kept: string[] } {
+export function grantDiff(previous: unknown, next: unknown) {
   const before = new Set(requestedCapabilities(previous));
   const after = requestedCapabilities(next);
+  const oldCommands = new Set((previous as Grants | null)?.commands as string[] ?? []);
+  const newCommands = new Set((next as Grants | null)?.commands as string[] ?? []);
+  const commands = {
+    added: [...newCommands].filter(name => !oldCommands.has(name)).sort(),
+    removed: [...oldCommands].filter(name => !newCommands.has(name)).sort(),
+  };
+  const added = after.filter(name => !before.has(name));
   return {
-    added: after.filter((name) => !before.has(name)),
+    added,
     removed: [...before].filter((name) => !after.includes(name)),
     kept: after.filter((name) => before.has(name)),
+    changed: before.has("commands") && after.includes("commands") && (commands.added.length || commands.removed.length) ? ["commands"] : [],
+    commands, expanded: !!(added.length || commands.added.length),
   };
 }

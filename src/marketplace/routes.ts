@@ -4,13 +4,13 @@ import { encodeBase64Url } from "../identity";
 import { hubFor } from "../routing";
 import { MAX_COMPONENT_BYTES, readComponent } from "./component";
 import { SignInFailure, authorizeUrl, pkceChallenge, randomToken, xboxIdentity } from "./microsoft";
-import { PLAYER_SESSION_MS, type Caller, type MarketCall, type MarketResult } from "./store";
+import { PLAYER_SESSION_MS, type Caller, type MarketCall, type MarketResult, type MediaFile } from "./store";
+import { BodyLimitError, MAX_IMAGES, MAX_IMAGE_BYTES, MAX_UPLOAD_BYTES, imageType, readLimited, sha256 } from "./uploads";
 
 const SESSION_COOKIE = "cinnabar_session";
 const OAUTH_COOKIE = "cinnabar_oauth";
 const CSRF_HEADER = "X-Cinnabar-CSRF";
-const MAX_JSON_BYTES = 16 * 1024;
-const MAX_UPLOAD_BYTES = MAX_COMPONENT_BYTES + 64 * 1024;
+const MAX_JSON_BYTES = 64 * 1024;
 
 type Ctx = Context<{ Bindings: Env }>;
 
@@ -44,11 +44,9 @@ function reply(c: Ctx, result: MarketResult, cache = "no-store"): Response {
 
 /** Parses a small JSON body, or returns null when it's oversized or not JSON. */
 async function readJson(c: Ctx): Promise<unknown | null> {
-  if (Number(c.req.header("Content-Length") ?? 0) > MAX_JSON_BYTES) return null;
-  const text = await c.req.text();
-  if (text.length > MAX_JSON_BYTES) return null;
-  if (!text) return {};
   try {
+    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(await readLimited(c.req.raw, MAX_JSON_BYTES));
+    if (!text) return {};
     return JSON.parse(text);
   } catch {
     return null;
@@ -167,10 +165,21 @@ async function asset(c: Ctx, sha256: string, cache: string): Promise<Response> {
   if (!(allowed.body as { allowed: boolean }).allowed) return c.json({ error: "Not found." }, 404);
   const object = await c.env.MOD_FILES.get(`mods/${sha256}`);
   if (!object) return c.json({ error: "Not found." }, 404);
-  return c.body(object.body, 200, { "Content-Type": "application/wasm", "Cache-Control": cache, ETag: `"${sha256}"` });
+  return c.body(object.body, 200, { "Content-Type": "application/wasm", "Cache-Control": cache, ETag: `"${sha256}"`,
+    "X-Content-Type-Options": "nosniff", "Content-Disposition": "attachment" });
 }
 
-marketplaceRoutes.get("/mods/assets/:sha256", (c) => asset(c, c.req.param("sha256"), "public, max-age=300"));
+marketplaceRoutes.get("/mods/assets/:sha256", (c) => asset(c, c.req.param("sha256"), "no-store"));
+marketplaceRoutes.get("/mods/media/:sha256", async c => {
+  const hash = c.req.param("sha256");
+  if (!/^[0-9a-f]{64}$/.test(hash)) return c.notFound();
+  const allowed = await call(c, { op: "media", sha256: hash });
+  if (!(allowed.body as { allowed: boolean }).allowed) return c.notFound();
+  const object = await c.env.MOD_FILES.get(`media/${hash}`);
+  if (!object) return c.notFound();
+  return c.body(object.body, 200, { "Content-Type": object.httpMetadata?.contentType ?? "application/octet-stream",
+    "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; sandbox" });
+});
 marketplaceRoutes.get("/mods/:slug", async (c) => reply(c, await call(c, { op: "mod", slug: c.req.param("slug") }), "public, max-age=30"));
 
 marketplaceRoutes.post("/mods/:slug/send", async (c) =>
@@ -185,15 +194,17 @@ marketplaceRoutes.post("/mods/:slug/reports", async (c) => {
 /** A multipart upload: `listing` (JSON listing fields) and `file` (the `.wasm` component). */
 marketplaceRoutes.post("/submissions", async (c) => {
   const who = await caller(c);
-  if (Number(c.req.header("Content-Length") ?? Infinity) > MAX_UPLOAD_BYTES) {
-    return c.json({ error: "The file is over 16 MiB.", fields: { file: "The file is over 16 MiB." } }, 413);
-  }
+  const authenticated = await call(c, { op: "upload-auth", ...who });
+  if (authenticated.status !== 200) return reply(c, authenticated);
   let form: FormData;
   try {
-    form = await c.req.formData();
-  } catch {
+    const bytes = await readLimited(c.req.raw, MAX_UPLOAD_BYTES);
+    form = await new Response(bytes, { headers: { "Content-Type": c.req.header("Content-Type") ?? "" } }).formData();
+  } catch (error) {
+    if (error instanceof BodyLimitError) return c.json({ error: error.message }, 413);
     return c.json({ error: "Send the listing and file as a form." }, 400);
   }
+  if (form.getAll("listing").length !== 1 || form.getAll("file").length !== 1) return c.json({ error: "Supply one listing and one component." }, 422);
   let listing: unknown;
   try {
     listing = JSON.parse(String(form.get("listing") ?? ""));
@@ -204,20 +215,39 @@ marketplaceRoutes.post("/submissions", async (c) => {
   if (checked.status !== 200) return reply(c, checked);
   const file = form.get("file");
   if (!(file instanceof File)) return c.json({ error: "Choose your mod's .wasm file.", fields: { file: "Choose a file." } }, 422);
+  if (file.size > MAX_COMPONENT_BYTES) return c.json({ error: "The file is over 16 MiB." }, 413);
   const bytes = new Uint8Array(await file.arrayBuffer());
   let grants;
   try {
-    grants = readComponent(bytes).grants;
+    const declarations = readComponent(bytes);
+    grants = declarations.grants;
+    if (declarations.version && declarations.version !== (listing as { version?: string }).version) {
+      throw new Error("The component version must match the release version.");
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : "This file can't be read.";
     return c.json({ error: message, fields: { file: message } }, 422);
   }
-  const sha256 = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((b) => b.toString(16).padStart(2, "0")).join("");
-  const key = `mods/${sha256}`;
-  if (!(await c.env.MOD_FILES.head(key))) {
-    await c.env.MOD_FILES.put(key, bytes, { httpMetadata: { contentType: "application/wasm" } });
+  const media: MediaFile[] = [];
+  const images = form.getAll("images");
+  if (images.length > MAX_IMAGES) return c.json({ error: "Upload at most four images." }, 422);
+  const imageBytes: Uint8Array[] = [];
+  try {
+    for (const image of images) {
+      if (!(image instanceof File)) throw new Error("Choose an image file.");
+      if (image.size > MAX_IMAGE_BYTES) throw new Error("Each image must be at most 1 MiB.");
+      const data = new Uint8Array(await image.arrayBuffer());
+      const type = imageType(data);
+      media.push({ sha256: await sha256(data), bytes: data.length, type, caption: image.name.slice(0, 160) });
+      imageBytes.push(data);
+    }
+  } catch (error) { return c.json({ error: error instanceof Error ? error.message : "Invalid image." }, 422); }
+  const hash = await sha256(bytes);
+  for (let i = 0; i < media.length; i++) {
+    await c.env.MOD_QUARANTINE.put(`media/${media[i]!.sha256}`, imageBytes[i]!, { httpMetadata: { contentType: media[i]!.type } });
   }
-  return reply(c, await call(c, { op: "submit", body: listing, file: { sha256, bytes: bytes.byteLength, grants }, ...who }));
+  await c.env.MOD_QUARANTINE.put(`mods/${hash}`, bytes, { httpMetadata: { contentType: "application/wasm" } });
+  return reply(c, await call(c, { op: "submit", body: listing, file: { sha256: hash, bytes: bytes.byteLength, grants, media }, ...who }));
 });
 
 marketplaceRoutes.get("/staff/queue", async (c) => reply(c, await call(c, { op: "queue", ...(await caller(c)) })));
@@ -235,7 +265,49 @@ marketplaceRoutes.get("/staff/versions/:id/file", async (c) => {
   const versionId = id(c.req.param("id"));
   const version = versionId === null ? null : await call(c, { op: "version", id: versionId, ...(await caller(c)) });
   if (!version || version.status !== 200) return reply(c, version ?? { status: 404, body: { error: "No such version." } });
-  return asset(c, (version.body as { sha256: string }).sha256, "private, no-store");
+  const objectKey = `mods/${(version.body as { sha256: string }).sha256}`;
+  const object = await c.env.MOD_QUARANTINE.get(objectKey) ?? await c.env.MOD_FILES.get(objectKey);
+  if (!object) return c.notFound();
+  return c.body(object.body, 200, { "Content-Type": "application/wasm", "Cache-Control": "private, no-store",
+    "Content-Disposition": "attachment", "X-Content-Type-Options": "nosniff" });
+});
+
+marketplaceRoutes.post("/staff/versions/:id/rescan", async c => {
+  const target = id(c.req.param("id"));
+  return target === null ? c.notFound() : reply(c, await call(c, { op: "rescan", id: target, ...(await caller(c)) }));
+});
+marketplaceRoutes.post("/staff/mods/:slug/trust", async c => {
+  const body = await readJson(c);
+  if (body === null) return c.json({ error: "Send JSON." }, 400);
+  return reply(c, await call(c, { op: "trust", slug: c.req.param("slug"), body, ...(await caller(c)) }));
+});
+
+/** Scanner credentials authorize only this internal job protocol, never marketplace staff operations. */
+marketplaceRoutes.use("/internal/marketplace/*", async (c, next) => {
+  c.header("Cache-Control", "no-store");
+  const secret = c.env.MARKETPLACE_SCANNER_TOKEN;
+  if (!secret) return c.json({ error: "Scanner is not configured." }, 503);
+  const presented = c.req.header("Authorization")?.replace(/^Bearer /, "") ?? "";
+  const a = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret)));
+  const b = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(presented)));
+  let different = 0;
+  for (let i = 0; i < a.length; i++) different |= a[i]! ^ b[i]!;
+  if (different !== 0) return c.json({ error: "Unauthorized." }, 401);
+  return next();
+});
+marketplaceRoutes.post("/internal/marketplace/claim", async c => reply(c, await call(c, { op: "scan-claim" })));
+marketplaceRoutes.get("/internal/marketplace/jobs/:job/files/:sha256", async c => {
+  const result = await call(c, { op: "scan-file", job: c.req.param("job"), lease: c.req.header("X-Scan-Lease") ?? "", sha256: c.req.param("sha256") });
+  if (result.status !== 200) return reply(c, result);
+  const { key, type, legacy } = result.body as { key: string; type: string; legacy: boolean };
+  const object = await c.env.MOD_QUARANTINE.get(key)
+    ?? (legacy ? await c.env.MOD_FILES.get(key) : null);
+  return object ? c.body(object.body, 200, { "Content-Type": type, "Cache-Control": "no-store" }) : c.notFound();
+});
+marketplaceRoutes.post("/internal/marketplace/jobs/:job/complete", async c => {
+  const body = await readJson(c);
+  if (body === null) return c.json({ error: "Send a bounded scan report." }, 400);
+  return reply(c, await call(c, { op: "scan-complete", job: c.req.param("job"), lease: c.req.header("X-Scan-Lease") ?? "", body }));
 });
 
 /** Registers a staff write that takes a numeric id and a JSON body. */

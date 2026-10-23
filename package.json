@@ -18,16 +18,24 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "cf-typegen": "wrangler types --strict-vars false",
-    "typecheck": "wrangler types --strict-vars false && tsc --noEmit",
+    "source:fetch": "node scripts/marketplace-source.mjs",
+    "scanner:build": "node scripts/build-scanner.mjs",
+    "scanner:start": "node scanner/runner.mjs",
+    "test:scanner": "pnpm scanner:build && node --test scanner/*.test.mjs",
+    "typecheck": "wrangler types --strict-vars false && tsc --noEmit && tsc --noEmit -p scanner/tsconfig.json",
     "test": "vitest run"
   },
   "dependencies": {
+    "@bytecodealliance/jco-transpile": "0.20.0",
     "@cfworker/json-schema": "^4.1.1",
     "hono": "^4.13.13",
-    "jose": "^6.2.12"
+    "jose": "^6.2.12",
+    "sharp": "0.35.5"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.4.1",
+    "@types/node": "^24.19.2",
+    "esbuild": "0.28.2",
     "typescript": "^5.9.3",
     "vitest": "^4.1.11",
     "wrangler": "^4.150.0"

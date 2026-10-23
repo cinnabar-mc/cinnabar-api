@@ -125,5 +125,6 @@ export default {
   /** Samples at execution time, so delayed cron delivery cannot fabricate past counts. */
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
     await hubFor(env).recordOnlineCount();
+    await hubFor(env).recoverModPublications();
   },
 } satisfies ExportedHandler<Env>;

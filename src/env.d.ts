@@ -1,6 +1,7 @@
 // Secrets aren't in wrangler.jsonc, so `wrangler types` can't see them.
 declare namespace Cloudflare {
   interface Env {
+    MARKETPLACE_SCANNER_TOKEN?: string; // isolated scanner: claim/read/complete only, never an admin or signing key
     PRESENCE_READ_SECRET?: string;
     RELEASE_HOOK_SECRET?: string; // bearer token for POST /v1/releases; set with `wrangler secret put`
     MICROSOFT_CLIENT_SECRET?: string; // optional; the Entra app may be a public client using PKCE alone
@@ -12,6 +13,7 @@ declare namespace Cloudflare {
   }
 }
 interface Env {
+  MARKETPLACE_SCANNER_TOKEN?: string;
   PRESENCE_READ_SECRET?: string;
   RELEASE_HOOK_SECRET?: string;
   MICROSOFT_CLIENT_SECRET?: string;
