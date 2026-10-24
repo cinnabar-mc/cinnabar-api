@@ -239,6 +239,12 @@ the server for each claim; no scheduled job or deployment is needed to stop gran
 Claims survive hibernation and reconnects, and manual revocations are not undone
 by another sign-in. No window is started by deploying the API alone.
 
+The same administrative identity can DELETE `{ "item_id": "namespace:item" }`
+at `/v1/cosmetics/login-rewards` to stop a reward and revoke every ownership grant
+for that item atomically. Connected clients receive updated ownership. Its claim
+history is cleared, so an explicit later POST starts a fresh seven-day window.
+Other items and their ownership are preserved.
+
 Cinnabar owns downloading, validation, caching, rendering and focused regression
 fixtures. Full catalog compatibility runs against the private checkout with
 `CINNABAR_COSMETICS_CHECKOUT` and the client test

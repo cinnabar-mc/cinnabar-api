@@ -45,7 +45,7 @@ it("starts only for a published restricted item and retains its deadline across 
 
 it("includes the start, excludes the exact end, and preserves grants after expiry", async () => {
   await runInDurableObject(hub(), (_instance, state) => {
-    const rewards = new LoginRewards(state.storage.sql);
+    const rewards = new LoginRewards(state.storage);
     const window = rewards.start(rewardItem.id, 1_000);
     const claim = (xuid: string, now: number) => state.storage.transactionSync(() => rewards.claim(xuid, now));
     expect(claim("1", window.starts_at - 1)).toBe(false);
@@ -53,7 +53,7 @@ it("includes the start, excludes the exact end, and preserves grants after expir
     expect(claim("3", window.ends_at - 1)).toBe(true);
     expect(claim("4", window.ends_at)).toBe(false);
     expect(claim("5", window.ends_at + 1)).toBe(false);
-    expect(new LoginRewards(state.storage.sql).claim("6", window.ends_at + 1)).toBe(false);
+    expect(new LoginRewards(state.storage).claim("6", window.ends_at + 1)).toBe(false);
     expect(state.storage.sql.exec("SELECT xuid FROM cosmetic_entitlements WHERE item_id = ? ORDER BY xuid", rewardItem.id).toArray())
       .toEqual([{ xuid: "2" }, { xuid: "3" }]);
   });
@@ -109,7 +109,7 @@ it("does not let a claim ledger bypass an explicit revocation during the active 
 
 it("retries a claim after transaction rollback without losing the permanent grant", async () => {
   await runInDurableObject(hub(), (_instance, state) => {
-    const rewards = new LoginRewards(state.storage.sql); rewards.start(rewardItem.id, 1_000);
+    const rewards = new LoginRewards(state.storage); rewards.start(rewardItem.id, 1_000);
     expect(() => state.storage.transactionSync(() => {
       expect(rewards.claim("401", 1_000)).toBe(true);
       throw new Error("rollback");
@@ -129,9 +129,11 @@ it("keeps granting an activated reward when a later metadata fallback omits the 
 });
 
 it("requires administrative authentication and accepts no client-selected duration or account", async () => {
-  for (const authorization of [undefined, "Bearer forged"]) {
+  for (const [method, authorization] of [
+    ["POST", undefined], ["POST", "Bearer forged"], ["DELETE", undefined], ["DELETE", "Bearer forged"],
+  ]) {
     const response = await exports.default.fetch("https://api.test/v1/cosmetics/login-rewards", {
-      method: "POST", headers: authorization ? { Authorization: authorization } : undefined,
+      method, headers: authorization ? { Authorization: authorization } : undefined,
       body: JSON.stringify({ item_id: rewardItem.id }),
     });
     expect(response.status).toBe(401);
@@ -142,4 +144,48 @@ it("requires administrative authentication and accepts no client-selected durati
     { item_id: rewardItem.id, xuid: "1" }, { item_id: rewardItem.id, duration_days: 8 }]) {
     expect(loginRewardCommand(value)).toBeNull();
   }
+});
+
+it("stops claims, revokes only the selected item, refreshes live ownership and permits a later fresh window", async () => {
+  const other = { ...rewardItem, id: "fixture:retained-" + crypto.randomUUID() };
+  release.items.push(other);
+  await publish(); await hub().startLoginReward(rewardItem.id);
+  await hub().setCosmeticEntitlements("601", [other.id], true);
+  const first = await login({ xuid: "601", visible: false }); clients.push(first.client);
+  expect(first.welcome.owned_cosmetics).toContain(rewardItem.id);
+  expect(await hub().stopLoginReward(rewardItem.id)).toEqual({ item_id: rewardItem.id, revoked_accounts: 1 });
+  const remaining = (first.welcome.owned_cosmetics as string[]).filter((id) => id !== rewardItem.id);
+  expect(await first.client.next()).toEqual({ type: "cosmetic_ownership", owned_cosmetics: remaining });
+  expect(await hub().stopLoginReward(rewardItem.id)).toEqual({ item_id: rewardItem.id, revoked_accounts: 0 });
+  first.client.close(); await first.client.closed;
+  const second = await login({ xuid: "601" }); clients.push(second.client);
+  expect(second.welcome.owned_cosmetics).toEqual(remaining);
+  const fresh = await login({ xuid: "602" }); clients.push(fresh.client);
+  expect(fresh.welcome.owned_cosmetics).not.toContain(rewardItem.id);
+  await runInDurableObject(hub(), (_instance, state) => {
+    expect(state.storage.sql.exec("SELECT * FROM cosmetic_login_rewards WHERE item_id = ?", rewardItem.id).toArray()).toEqual([]);
+    expect(state.storage.sql.exec("SELECT * FROM cosmetic_login_reward_claims WHERE item_id = ?", rewardItem.id).toArray()).toEqual([]);
+    new LoginRewards(state.storage).claim("603", Date.now());
+    expect(state.storage.sql.exec("SELECT * FROM cosmetic_entitlements WHERE xuid = ? AND item_id = ?", "603", rewardItem.id).toArray()).toEqual([]);
+  });
+  const restarted = await hub().startLoginReward(rewardItem.id);
+  expect(restarted!.ends_at - restarted!.starts_at).toBe(LOGIN_REWARD_DURATION_MS);
+  expect(await second.client.next()).toEqual({ type: "cosmetic_ownership", owned_cosmetics: expect.arrayContaining([other.id, rewardItem.id]) });
+});
+
+it("does not disable the in-memory window when the revocation transaction rolls back", async () => {
+  await runInDurableObject(hub(), (_instance, state) => {
+    const rewards = new LoginRewards(state.storage);
+    rewards.start(rewardItem.id, 1_000);
+    expect(rewards.claim("701", 1_000)).toBe(true);
+    state.storage.sql.exec(`CREATE TRIGGER reject_reward_revoke BEFORE DELETE ON cosmetic_entitlements
+      BEGIN SELECT RAISE(ABORT, 'reject revocation'); END`);
+    try {
+      expect(() => rewards.stop(rewardItem.id)).toThrow();
+      expect(state.storage.sql.exec("SELECT * FROM cosmetic_login_rewards WHERE item_id = ?", rewardItem.id).toArray()).toHaveLength(1);
+      expect(state.storage.sql.exec("SELECT * FROM cosmetic_login_reward_claims WHERE item_id = ?", rewardItem.id).toArray()).toHaveLength(1);
+      expect(state.storage.sql.exec("SELECT * FROM cosmetic_entitlements WHERE item_id = ?", rewardItem.id).toArray()).toHaveLength(1);
+      expect(rewards.claim("702", 1_000)).toBe(true);
+    } finally { state.storage.sql.exec("DROP TRIGGER reject_reward_revoke"); }
+  });
 });

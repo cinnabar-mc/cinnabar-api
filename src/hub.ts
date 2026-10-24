@@ -109,7 +109,7 @@ export class Hub extends DurableObject<Env> {
     )`);
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS lookup_budgets_expiry ON lookup_budgets (updated_at)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS cosmetic_entitlements (xuid TEXT NOT NULL, item_id TEXT NOT NULL, PRIMARY KEY (xuid, item_id))");
-    this.loginRewards = new LoginRewards(ctx.storage.sql);
+    this.loginRewards = new LoginRewards(ctx.storage);
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS hub_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     ctx.storage.sql.exec("INSERT OR IGNORE INTO hub_config (key, value) VALUES ('ip_salt', ?)", crypto.randomUUID());
     this.ipSalt = ctx.storage.sql.exec<{ value: string }>("SELECT value FROM hub_config WHERE key = 'ip_salt'").one().value;
@@ -553,6 +553,23 @@ export class Hub extends DurableObject<Env> {
       })) this.claimLoginRewards(xuid, now);
     }
     return reward;
+  }
+
+  /** Stops a restricted item's reward, revokes all its ownership and refreshes connected clients. */
+  async stopLoginReward(itemId: string): Promise<{ item_id: string; revoked_accounts: number } | null> {
+    this.cosmeticCatalog = await loadCatalog(this.env.COSMETIC_ASSETS, Date.now(), true);
+    if (!this.cosmeticCatalog.items.some((item) => item.id === itemId && !item.free)) return null;
+    const revoked = this.loginRewards.stop(itemId);
+    for (const xuid of revoked) {
+      this.entitlements.delete(xuid);
+      const items = this.ownedCosmetics(xuid);
+      for (const ws of this.byXuid.get(xuid) ?? []) {
+        send(ws, { type: "cosmetic_ownership", owned_cosmetics: items });
+        const state = this.sessions.get(ws);
+        if (state?.stage === "ready") this.broadcastLoadout(state);
+      }
+    }
+    return { item_id: itemId, revoked_accounts: revoked.length };
   }
 
   /** Grants once within the server-time window and informs existing sockets without preceding a new socket's welcome. */
