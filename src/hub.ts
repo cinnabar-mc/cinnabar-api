@@ -4,6 +4,7 @@ import { DurableObject } from "cloudflare:workers";
 import { MarketplaceStore, handle, type MarketCall, type MarketResult } from "./marketplace/store";
 import { signText } from "./marketplace/signing";
 import { PresenceHistory } from "./presence-history";
+import { LoginRewards, type LoginReward } from "./login-rewards";
 import { count } from "./metrics";
 import { IssuerUnavailable, encodeBase64Url, identityUuid, issuerKeys, verifyProof } from "./identity";
 import {
@@ -101,6 +102,7 @@ export class Hub extends DurableObject<Env> {
   private cosmeticCatalog: Catalog = catalog;
   private readonly market: MarketplaceStore;
   private readonly entitlements = new Map<string, Set<string>>();
+  private readonly loginRewards: LoginRewards;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -112,6 +114,7 @@ export class Hub extends DurableObject<Env> {
     )`);
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS lookup_budgets_expiry ON lookup_budgets (updated_at)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS cosmetic_entitlements (xuid TEXT NOT NULL, item_id TEXT NOT NULL, PRIMARY KEY (xuid, item_id))");
+    this.loginRewards = new LoginRewards(ctx.storage);
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS hub_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     ctx.storage.sql.exec("INSERT OR IGNORE INTO hub_config (key, value) VALUES ('ip_salt', ?)", crypto.randomUUID());
     this.ipSalt = ctx.storage.sql.exec<{ value: string }>("SELECT value FROM hub_config WHERE key = 'ip_salt'").one().value;
@@ -428,6 +431,7 @@ export class Hub extends DurableObject<Env> {
       .map((session) => session.loadout).filter((value): value is LoadoutState => value !== undefined)
       .sort((a, b) => b.revision - a.revision)[0];
     this.save(ws, { stage: "ready", xuid, displayName, uuid, channel, visible, loadout, lastSeen: now });
+    this.claimLoginRewards(xuid, now, ws);
     const modLibrary = this.market.library(xuid);
     send(ws, { type: "welcome", xuid, loadout_revision: loadout?.revision ?? 0, owned_cosmetics: this.ownedCosmetics(xuid),
       ...(modLibrary.length ? { mod_library: modLibrary } : {}), ...SERVER_PARAMETERS });
@@ -608,6 +612,49 @@ export class Hub extends DurableObject<Env> {
     ).toArray().map((row) => row.item_id));
     if (this.byXuid.has(xuid)) this.entitlements.set(xuid, items);
     return items;
+  }
+
+  /** Activates a published restricted item once, also including fresh accounts already connected at activation. */
+  async startLoginReward(itemId: string): Promise<LoginReward | null> {
+    this.cosmeticCatalog = await loadCatalog(this.env.COSMETIC_ASSETS, Date.now(), true);
+    if (!this.cosmeticCatalog.items.some((item) => item.id === itemId && !item.free)) return null;
+    const now = Date.now();
+    const reward = this.loginRewards.start(itemId, now);
+    for (const [xuid, sockets] of this.byXuid) {
+      if ([...sockets].some((ws) => {
+        const session = this.sessions.get(ws);
+        return ws.readyState === WebSocket.OPEN && session?.stage === "ready" && this.idleDeadline(ws, session) > now;
+      })) this.claimLoginRewards(xuid, now);
+    }
+    return reward;
+  }
+
+  /** Stops a restricted item's reward, revokes all its ownership and refreshes connected clients. */
+  async stopLoginReward(itemId: string): Promise<{ item_id: string; revoked_accounts: number } | null> {
+    this.cosmeticCatalog = await loadCatalog(this.env.COSMETIC_ASSETS, Date.now(), true);
+    if (!this.cosmeticCatalog.items.some((item) => item.id === itemId && !item.free)) return null;
+    const revoked = this.loginRewards.stop(itemId);
+    for (const xuid of revoked) {
+      this.entitlements.delete(xuid);
+      const items = this.ownedCosmetics(xuid);
+      for (const ws of this.byXuid.get(xuid) ?? []) {
+        send(ws, { type: "cosmetic_ownership", owned_cosmetics: items });
+        const state = this.sessions.get(ws);
+        if (state?.stage === "ready") this.broadcastLoadout(state);
+      }
+    }
+    return { item_id: itemId, revoked_accounts: revoked.length };
+  }
+
+  /** Grants once within the server-time window and informs existing sockets without preceding a new socket's welcome. */
+  private claimLoginRewards(xuid: string, now: number, welcoming?: WebSocket): void {
+    const changed = this.ctx.storage.transactionSync(() => this.loginRewards.claim(xuid, now));
+    if (!changed) return;
+    this.entitlements.delete(xuid);
+    const owned = this.ownedCosmetics(xuid);
+    for (const ws of this.byXuid.get(xuid) ?? []) {
+      if (ws !== welcoming) send(ws, { type: "cosmetic_ownership", owned_cosmetics: owned });
+    }
   }
 
   /** Applies a validated administrative grant or revocation atomically and updates connected accounts. */
