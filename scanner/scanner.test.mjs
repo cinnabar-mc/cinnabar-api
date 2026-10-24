@@ -36,7 +36,13 @@ test('blocks unsupported imports, missing host callbacks and malformed images', 
 });
 
 test('checks canonical WIT interface versions rather than rewritten JavaScript specifiers', async () => {
-  for (const [name, expected] of [['cinnabar:extension/hud@0.1.0', 'pass'], ['cinnabar:extension/hud@9.0.0', 'block'], ['cinnabar:extension/hud', 'block']]) {
+  for (const [name, expected] of [
+    ['cinnabar:extension/hud@0.1.0', 'pass'],
+    ['cinnabar:extension/hud@9.0.0', 'block'],
+    ['cinnabar:extension/hud', 'block'],
+    ['cinnabar:world-draw/assets@0.1.0', 'pass'],
+    ['cinnabar:world-draw/assets@9.0.0', 'block'],
+  ]) {
     const bytes = await parse(GOOD_WAT.replace('(component', `(component (import "${name}" (instance))`));
     const report = await analyze(jobFor(bytes), bytes, []);
     assert.deepEqual(report.imports, [name]);
