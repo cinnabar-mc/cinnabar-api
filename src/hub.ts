@@ -2,6 +2,7 @@ import { catalog, admitLoadout } from "./cosmetics";
 import { loadCatalog, type Catalog } from "./catalog-store";
 import { DurableObject } from "cloudflare:workers";
 import { PresenceHistory } from "./presence-history";
+import { LoginRewards, type LoginReward } from "./login-rewards";
 import { count } from "./metrics";
 import { IssuerUnavailable, encodeBase64Url, identityUuid, issuerKeys, verifyProof } from "./identity";
 import {
@@ -98,6 +99,7 @@ export class Hub extends DurableObject<Env> {
   private readonly lookupBudgets = new Map<string, LookupBudget>();
   private cosmeticCatalog: Catalog = catalog;
   private readonly entitlements = new Map<string, Set<string>>();
+  private readonly loginRewards: LoginRewards;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -107,6 +109,7 @@ export class Hub extends DurableObject<Env> {
     )`);
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS lookup_budgets_expiry ON lookup_budgets (updated_at)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS cosmetic_entitlements (xuid TEXT NOT NULL, item_id TEXT NOT NULL, PRIMARY KEY (xuid, item_id))");
+    this.loginRewards = new LoginRewards(ctx.storage.sql);
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS hub_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     ctx.storage.sql.exec("INSERT OR IGNORE INTO hub_config (key, value) VALUES ('ip_salt', ?)", crypto.randomUUID());
     this.ipSalt = ctx.storage.sql.exec<{ value: string }>("SELECT value FROM hub_config WHERE key = 'ip_salt'").one().value;
@@ -418,6 +421,7 @@ export class Hub extends DurableObject<Env> {
       .map((session) => session.loadout).filter((value): value is LoadoutState => value !== undefined)
       .sort((a, b) => b.revision - a.revision)[0];
     this.save(ws, { stage: "ready", xuid, displayName, uuid, channel, visible, loadout, lastSeen: now });
+    this.claimLoginRewards(xuid, now, ws);
     send(ws, { type: "welcome", xuid, loadout_revision: loadout?.revision ?? 0, owned_cosmetics: this.ownedCosmetics(xuid), ...SERVER_PARAMETERS });
 
     if (latest && compareReleases(latest.version, latest.build, pending.clientVersion, pending.clientBuild) > 0) {
@@ -534,6 +538,32 @@ export class Hub extends DurableObject<Env> {
     ).toArray().map((row) => row.item_id));
     if (this.byXuid.has(xuid)) this.entitlements.set(xuid, items);
     return items;
+  }
+
+  /** Activates a published restricted item once, also including fresh accounts already connected at activation. */
+  async startLoginReward(itemId: string): Promise<LoginReward | null> {
+    this.cosmeticCatalog = await loadCatalog(this.env.COSMETIC_ASSETS, Date.now(), true);
+    if (!this.cosmeticCatalog.items.some((item) => item.id === itemId && !item.free)) return null;
+    const now = Date.now();
+    const reward = this.loginRewards.start(itemId, now);
+    for (const [xuid, sockets] of this.byXuid) {
+      if ([...sockets].some((ws) => {
+        const session = this.sessions.get(ws);
+        return ws.readyState === WebSocket.OPEN && session?.stage === "ready" && this.idleDeadline(ws, session) > now;
+      })) this.claimLoginRewards(xuid, now);
+    }
+    return reward;
+  }
+
+  /** Grants once within the server-time window and informs existing sockets without preceding a new socket's welcome. */
+  private claimLoginRewards(xuid: string, now: number, welcoming?: WebSocket): void {
+    const changed = this.ctx.storage.transactionSync(() => this.loginRewards.claim(xuid, now));
+    if (!changed) return;
+    this.entitlements.delete(xuid);
+    const owned = this.ownedCosmetics(xuid);
+    for (const ws of this.byXuid.get(xuid) ?? []) {
+      if (ws !== welcoming) send(ws, { type: "cosmetic_ownership", owned_cosmetics: owned });
+    }
   }
 
   /** Applies a validated administrative grant or revocation atomically and updates connected accounts. */

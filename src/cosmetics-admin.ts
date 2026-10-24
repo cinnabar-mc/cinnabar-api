@@ -39,3 +39,12 @@ export function entitlementCommand(value: unknown): { xuid: string; item_ids: st
     || command.item_ids.some((id) => typeof id !== "string" || id.length > schema.$defs.CosmeticItemId.maxLength || !itemIdPattern.test(id))) return null;
   return { xuid: command.xuid, item_ids: [...new Set(command.item_ids as string[])], owned: command.owned };
 }
+
+/** Accepts exactly one item to start its fixed, non-renewable login reward window. */
+export function loginRewardCommand(value: unknown): { item_id: string } | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const command = value as Record<string, unknown>;
+  if (Object.keys(command).length !== 1 || typeof command.item_id !== "string"
+    || command.item_id.length > schema.$defs.CosmeticItemId.maxLength || !itemIdPattern.test(command.item_id)) return null;
+  return { item_id: command.item_id };
+}

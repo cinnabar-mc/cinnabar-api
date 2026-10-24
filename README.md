@@ -225,6 +225,20 @@ exports, production catalog metadata and publication checks. Preserve artwork
 license notices. This public Worker owns delivery and durable SQL entitlements;
 its tests use shared synthetic fixtures and need no private repository access.
 
+The private main-branch administration workflow can POST `{ "item_id": "namespace:item" }`
+to `/v1/cosmetics/login-rewards` using the same GitHub OIDC identity as entitlement
+updates. The item must already be published and restricted. First activation stores
+a server-time start and a deadline exactly seven days later, returned as UTC ISO
+timestamps. Retrying the request, including after expiry, returns the original dates.
+
+Accounts that complete authenticated sign-in during `[starts_at, ends_at)` receive
+permanent database ownership in their welcome message. Fresh accounts already
+connected at activation also receive the item, including those hiding their presence.
+Anonymous, unverified and stale connections do not qualify. Expiry is checked on
+the server for each claim; no scheduled job or deployment is needed to stop grants.
+Claims survive hibernation and reconnects, and manual revocations are not undone
+by another sign-in. No window is started by deploying the API alone.
+
 Cinnabar owns downloading, validation, caching, rendering and focused regression
 fixtures. Full catalog compatibility runs against the private checkout with
 `CINNABAR_COSMETICS_CHECKOUT` and the client test
