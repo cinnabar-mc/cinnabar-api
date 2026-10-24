@@ -23,8 +23,13 @@ const interfaces = Object.values(inputs).flatMap(text => {
   return [...text.matchAll(/^interface\s+([\w-]+)\s*\{/gm)].map(([, name]) => `${base}/${name}${version ? '@' + version : ''}`)
     .concat([...text.matchAll(/\bimport\s+([\w:-]+\/[\w-]+@[\d.]+);/g)].map(([, name]) => name));
 });
+const signingKeys = JSON.parse(inputs.marketplaceKeys).ed25519;
+if (!Array.isArray(signingKeys) || signingKeys.length === 0 || signingKeys.some(key =>
+  typeof key !== 'string' || Buffer.from(key, 'base64').length !== 32 || Buffer.from(key, 'base64').toString('base64') !== key)) {
+  throw new Error('Pin the client Ed25519 public keys before provisioning the marketplace signer.');
+}
 await mkdir(new URL('../.generated/', import.meta.url), { recursive: true });
 await writeFile(new URL('../.generated/contract.json', import.meta.url), JSON.stringify({
-  revision: source.revision, capabilities, interfaces,
+  revision: source.revision, capabilities, interfaces, signingKeys,
 }, null, 2) + '\n');
 console.log(`Derived ${capabilities.length} capabilities and ${interfaces.length} interfaces from pinned client inputs.`);

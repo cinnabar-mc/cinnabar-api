@@ -35,6 +35,17 @@ test('blocks unsupported imports, missing host callbacks and malformed images', 
   await assert.rejects(analyze(job, good, [new Uint8Array([137,80,78,71,13,10,26,10,0,0,0,0])]));
 });
 
+test('checks canonical WIT interface versions rather than rewritten JavaScript specifiers', async () => {
+  for (const [name, expected] of [['cinnabar:extension/hud@0.1.0', 'pass'], ['cinnabar:extension/hud@9.0.0', 'block'], ['cinnabar:extension/hud', 'block']]) {
+    const bytes = await parse(GOOD_WAT.replace('(component', `(component (import "${name}" (instance))`));
+    const report = await analyze(jobFor(bytes), bytes, []);
+    assert.deepEqual(report.imports, [name]);
+    assert.equal(report.deterministic, expected);
+  }
+  const bytes = await parse(GOOD_WAT.replace('(component', '(component (import "untrusted" (func))'));
+  assert.equal((await analyze(jobFor(bytes), bytes, [])).deterministic, 'block');
+});
+
 test('decodes supported images fully and holds oversized or animated media', async () => {
   const good = await parse(GOOD_WAT);
   const png = await sharp({ create: { width: 2, height: 2, channels: 4, background: '#ca6654' } }).png().toBuffer();

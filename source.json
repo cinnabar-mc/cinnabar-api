@@ -1,9 +1,10 @@
 {
   "repository": "cinnabar-mc/cinnabar",
-  "revision": "31ec2294fd662e6d49fc171dfb50bf653aa8ad36",
+  "revision": "a8237b232cb9d3f8703b9c6b6dca880d26ec3b18",
   "inputs": {
     "grants": "crates/mod-host/src/grants.rs",
     "wit": "crates/mod-api/wit/extension.wit",
-    "drawing": "crates/mod-api/wit/deps/world-draw/drawing.wit"
+    "drawing": "crates/mod-api/wit/deps/world-draw/drawing.wit",
+    "marketplaceKeys": "crates/launcher-host/data/marketplace-keys.json"
   }
 }

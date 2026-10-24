@@ -52,6 +52,7 @@ type VersionRow = {
   pulled: number;
   pull_reason: string;
   signature: string | null;
+  statement: string | null;
   creator: string;
 };
 type ListingRow = {
@@ -96,7 +97,7 @@ export class MarketplaceStore {
       `CREATE TABLE IF NOT EXISTS mod_versions (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL,
         version TEXT NOT NULL, sha256 TEXT NOT NULL, bytes INTEGER NOT NULL, grants TEXT NOT NULL, reach INTEGER NOT NULL,
         status TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', submitted_at INTEGER NOT NULL, decided_at INTEGER,
-        pulled INTEGER NOT NULL DEFAULT 0, pull_reason TEXT NOT NULL DEFAULT '', signature TEXT, UNIQUE (slug, version))`,
+        pulled INTEGER NOT NULL DEFAULT 0, pull_reason TEXT NOT NULL DEFAULT '', signature TEXT, statement TEXT, UNIQUE (slug, version))`,
       `CREATE TABLE IF NOT EXISTS mod_approvals (version_id INTEGER NOT NULL, xuid TEXT NOT NULL, admin INTEGER NOT NULL,
         at INTEGER NOT NULL, PRIMARY KEY (version_id, xuid))`,
       `CREATE TABLE IF NOT EXISTS mod_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL,
@@ -128,6 +129,19 @@ export class MarketplaceStore {
       sql.exec(`UPDATE mod_versions SET status = 'submitted', signature = NULL WHERE status = 'approved'
         AND id IN (SELECT version_id FROM mod_pipeline WHERE job_id = 'migration-' || version_id AND state = 'queued')`);
       sql.exec("INSERT INTO market_schema (version) VALUES (1)");
+    }
+    // Old signatures cannot authenticate a newly reconstructed statement after a contract change.
+    if (!sql.exec<{ name: string }>("PRAGMA table_info(mod_versions)").toArray().some(column => column.name === "statement")) {
+      sql.exec("ALTER TABLE mod_versions ADD COLUMN statement TEXT");
+    }
+    if (!sql.exec("SELECT 1 FROM market_schema WHERE version = 2").toArray().length) {
+      sql.exec(`DELETE FROM mod_approvals WHERE version_id IN
+        (SELECT id FROM mod_versions WHERE signature IS NOT NULL AND statement IS NULL)`);
+      sql.exec(`UPDATE mod_pipeline SET state = 'queued', attempts = 0, lease = NULL, lease_until = NULL,
+        report = NULL, completed_at = NULL, publish_mode = NULL WHERE version_id IN
+        (SELECT id FROM mod_versions WHERE signature IS NOT NULL AND statement IS NULL)`);
+      sql.exec("UPDATE mod_versions SET status = 'submitted', signature = NULL WHERE signature IS NOT NULL AND statement IS NULL");
+      sql.exec("INSERT INTO market_schema (version) VALUES (2)");
     }
   }
 
@@ -244,7 +258,7 @@ export class MarketplaceStore {
   }
 
   private liveVersion(slug: string): VersionRow | undefined {
-    return this.versions(`v.slug = ? AND v.status = 'approved' AND v.signature IS NOT NULL AND v.pulled = 0
+    return this.versions(`v.slug = ? AND v.status = 'approved' AND v.signature IS NOT NULL AND v.statement IS NOT NULL AND v.pulled = 0
       AND EXISTS (SELECT 1 FROM mod_pipeline p WHERE p.version_id = v.id AND p.state = 'complete')
       ORDER BY v.decided_at DESC, v.id DESC LIMIT 1`, slug)[0];
   }
@@ -302,7 +316,7 @@ export class MarketplaceStore {
 
   /** Public files require an actually signed, visible release. Quarantine has a separate staff-only route. */
   assetAllowed(sha256: string, caller: Caller, now: number): boolean {
-    return this.versions(`v.sha256 = ? AND v.status = 'approved' AND v.signature IS NOT NULL AND v.pulled = 0
+    return this.versions(`v.sha256 = ? AND v.status = 'approved' AND v.signature IS NOT NULL AND v.statement IS NOT NULL AND v.pulled = 0
       AND l.hidden = 0 AND EXISTS (SELECT 1 FROM mod_pipeline p WHERE p.version_id = v.id AND p.state = 'complete')`, sha256)
       .some(v => !this.account(v.creator)?.suspended);
   }
@@ -310,6 +324,7 @@ export class MarketplaceStore {
   /** The canonical statement signed for an approved version. */
   statement(versionId: number): string {
     const v = this.versions("v.id = ?", versionId)[0]!;
+    if (v.statement !== null) return v.statement;
     const approvers = this.approvals(v.id).map((a) => a.xuid);
     const p = this.pipeline(v.id)!;
     return JSON.stringify({ approved_at: v.decided_at, approvers, bytes: v.bytes, grants: JSON.parse(v.grants), sha256: v.sha256,
@@ -320,7 +335,7 @@ export class MarketplaceStore {
   /** Returns exact signed metadata for a still-public digest, including an older library selection. */
   release(slug: string, version: string, sha256: string): MarketResult {
     const listing = this.listing(slug);
-    const v = this.versions("v.slug = ? AND v.version = ? AND v.sha256 = ? AND v.status = 'approved' AND v.signature IS NOT NULL AND v.pulled = 0", slug, version, sha256)[0];
+    const v = this.versions("v.slug = ? AND v.version = ? AND v.sha256 = ? AND v.status = 'approved' AND v.signature IS NOT NULL AND v.statement IS NOT NULL AND v.pulled = 0", slug, version, sha256)[0];
     if (!listing || listing.hidden || this.account(listing.creator)?.suspended || !v || this.pipeline(v.id)?.state !== "complete") return fail(404, "No such release.");
     return ok({ release: { statement: this.statement(v.id), signature: v.signature } });
   }
@@ -328,7 +343,7 @@ export class MarketplaceStore {
   /** Atomically exposes a signed release after rechecking every gate following external I/O. */
   publish(versionId: number, statement: string, signature: string, now: number): boolean {
     if (!this.publicationReady(versionId, now) || this.statement(versionId) !== statement) return false;
-    this.sql.exec("UPDATE mod_versions SET status = 'approved', signature = ? WHERE id = ?", signature, versionId);
+    this.sql.exec("UPDATE mod_versions SET status = 'approved', statement = ?, signature = ? WHERE id = ?", statement, signature, versionId);
     const v = this.versions("v.id = ?", versionId)[0]!;
     this.log("system", "published", `${v.slug} ${v.version}`, this.pipeline(versionId)!.publish_mode!, now);
     return true;
@@ -468,7 +483,7 @@ export class MarketplaceStore {
 
   /** Check public media authorization without revealing another version's private files. */
   mediaAllowed(sha256: string): boolean {
-    return this.versions("v.status = 'approved' AND v.signature IS NOT NULL AND v.pulled = 0 AND l.hidden = 0")
+    return this.versions("v.status = 'approved' AND v.signature IS NOT NULL AND v.statement IS NOT NULL AND v.pulled = 0 AND l.hidden = 0")
       .some(v => !this.account(v.creator)?.suspended && this.pipeline(v.id)?.state === "complete"
         && this.media(v.id).some(m => m.sha256 === sha256));
   }

@@ -23,6 +23,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm source:fetch
+      - run: node --test scripts/marketplace-signing.test.mjs
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -66,6 +67,13 @@ jobs:
         run: pnpm install --frozen-lockfile
       - if: steps.head.outputs.current == 'true'
         run: pnpm source:fetch
+      - if: steps.head.outputs.current == 'true'
+        name: Configure the client-pinned marketplace signer
+        env:
+          MARKETPLACE_SIGNING_KEY: ${{ secrets.MARKETPLACE_SIGNING_KEY }}
+        run: |
+          node scripts/marketplace-signing.mjs check
+          printf '%s' "$MARKETPLACE_SIGNING_KEY" | pnpm exec wrangler secret put MARKETPLACE_SIGNING_KEY
       - if: steps.head.outputs.current == 'true'
         name: Configure private presence access
         env:

@@ -22,7 +22,13 @@ export async function validateComponent(bytes: Uint8Array) {
   for (const [name, module] of result.files) {
     if (name.endsWith(".wasm") && !WebAssembly.validate(new Uint8Array(module))) throw new Error("Invalid nested core bytecode.");
   }
-  return { imports: result.imports, exports: result.exports.map(([name]) => name), wit: await componentWit(bytes) };
+  const wit = await componentWit(bytes);
+  // Transpiler imports are JS specifiers with versions removed, not canonical capability identities.
+  // The trusted WIT printer emits each world import on its own line. Inline/function imports stay
+  // visibly noncanonical and fail the exact host-interface allowlist below.
+  const imports = [...wit.matchAll(/^\s*import\s+([^\r\n]*)/gm)].map(match => match[1]!.trim().replace(/;$/, ""));
+  if (result.imports.length && !imports.length) throw new Error("Missing canonical component import evidence.");
+  return { imports, exports: result.exports.map(([name]) => name), wit };
 }
 
 /** Build bounded evidence from bytes, independently checking declarations against the claimed job. */

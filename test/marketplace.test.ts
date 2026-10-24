@@ -8,6 +8,7 @@ import { approvalRule, canApprove, canSetRole, grantDiff, reachOf, type Actor } 
 import { CLIENT_REVISION, SCAN_POLICY, VALIDATOR, PROMPT_VERSION, SCAN_LEASE_MS } from "../src/marketplace/scanning";
 import { BodyLimitError, readLimited } from "../src/marketplace/uploads";
 import { MarketplaceStore } from "../src/marketplace/store";
+import { signText } from "../src/marketplace/signing";
 import { hub, installFakeIssuer, login, type Client } from "./helpers";
 
 const SITE = "https://site.test";
@@ -371,15 +372,49 @@ describe("submission, review and delivery", () => {
 describe("quarantine and publication pipeline", () => {
   let creatorId = 2535400000006200n;
   /** Create an explicitly established project with one human-approved baseline. */
-  async function established(slug: string) {
+  async function established(slug: string, version = "1.0.0") {
     const owner = await signIn(OWNER, "OreKeeper");
     const gamertag = `Creator${String(++creatorId).slice(-4)}`;
     const creator = await signIn(String(creatorId), gamertag);
-    const initial = await (await submit(creator, slug, "1.0.0", { hud: true })).json() as { id: string };
+    const initial = await (await submit(creator, slug, version, { hud: true })).json() as { id: string };
     expect((await owner.post(`/staff/versions/${initial.id}/decision`, { decision: "approve" })).status).toBe(200);
     expect((await owner.post(`/staff/mods/${slug}/trust`, { trusted: true, reason: "Established project reviewed by staff" })).status).toBe(200);
     return { owner, creator, initial, gamertag };
   }
+
+  it("persists original signed bytes across policy changes and store restarts", async () => {
+    const { initial } = await established("historical-signature", "8.7.41");
+    const original = await (await api("/mods/historical-signature")).json() as any;
+    const historical = JSON.stringify({ ...JSON.parse(original.release.statement), policy: "historical-policy", client_revision: "a".repeat(40) });
+    const signature = await signText(env.MARKETPLACE_SIGNING_KEY!, historical);
+    await runInDurableObject(hub(), (_: Hub, state) => {
+      expect(state.storage.sql.exec<{ statement: string }>("SELECT statement FROM mod_versions WHERE id = ?", Number(initial.id)).toArray()[0]!.statement).toBe(original.release.statement);
+      // Model a release signed by an older server, then restart under today's contract/policy.
+      state.storage.sql.exec("UPDATE mod_versions SET statement = ?, signature = ? WHERE id = ?", historical, signature, Number(initial.id));
+      const restored = new MarketplaceStore(state.storage.sql, new Set([OWNER]));
+      expect(restored.statement(Number(initial.id))).toBe(historical);
+    });
+    for (const path of ["/mods/historical-signature", `/mods/historical-signature/releases/${original.version}/${original.sha256}`]) {
+      expect(await (await api(path)).json()).toMatchObject({ release: { statement: historical, signature } });
+    }
+    const key = await crypto.subtle.importKey("spki", Uint8Array.from(atob(PUBLIC_KEY), c => c.charCodeAt(0)), "Ed25519", false, ["verify"]);
+    expect(await crypto.subtle.verify("Ed25519", key, Uint8Array.from(atob(signature.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0)), new TextEncoder().encode(historical))).toBe(true);
+  });
+
+  it("holds legacy signatures without original statement bytes for fresh scanning and review", async () => {
+    const { initial, owner } = await established("missing-statement", "8.7.42");
+    await runInDurableObject(hub(), (_: Hub, state) => {
+      state.storage.sql.exec("UPDATE mod_versions SET statement = NULL WHERE id = ?", Number(initial.id));
+      state.storage.sql.exec("DELETE FROM market_schema WHERE version = 2");
+      new MarketplaceStore(state.storage.sql, new Set([OWNER]));
+      expect(state.storage.sql.exec("SELECT 1 FROM mod_approvals WHERE version_id = ?", Number(initial.id)).toArray()).toHaveLength(0);
+    });
+    expect((await api("/mods/missing-statement")).status).toBe(404);
+    expect(await (await owner.get(`/staff/versions/${initial.id}`)).json()).toMatchObject({ status: "submitted", scan: { state: "queued" } });
+    await scanOne();
+    expect((await owner.post(`/staff/versions/${initial.id}/decision`, { decision: "approve" })).status).toBe(200);
+    expect((await api("/mods/missing-statement")).status).toBe(200);
+  });
 
   it("serves the exact older signed release and signs expiring revocation evidence", async () => {
     const owner = await signIn(OWNER, "OreKeeper");

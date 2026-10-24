@@ -144,6 +144,16 @@ Create both private R2 buckets before merging. Configure `MARKETPLACE_ORIGIN`,
 `MARKETPLACE_SIGNING_KEY`, optional `MICROSOFT_CLIENT_SECRET`, and
 `MARKETPLACE_SCANNER_TOKEN`. Never place credentials in this repository.
 
+For the initial signer, run `node scripts/marketplace-signing.mjs provision /path/to/client-checkout`.
+It generates Ed25519 material in memory, sends the PKCS#8 private half on stdin to
+GitHub's encrypted `production` environment secret, and writes only the raw public
+half to the client key set. It refuses to replace an existing signer. Review and
+publish that client pin, update this repository's immutable `source.json` revision,
+and run `pnpm source:fetch`. Main deployment checks the secret against those client
+inputs before configuring the Worker. Pull requests never receive the secret.
+Keep the client and API trust pins aligned; rotate deliberately with overlapping
+client public keys before changing the signer. Local fixtures use a separate key.
+
 Build the separate scanner image from the repository root:
 
 ```sh
