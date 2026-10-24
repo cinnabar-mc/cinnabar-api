@@ -381,6 +381,31 @@ describe("quarantine and publication pipeline", () => {
     return { owner, creator, initial, gamertag };
   }
 
+  it("serves the exact older signed release and signs expiring revocation evidence", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const creator = await signIn("2535400000006199", "PinnedReleaseCreator");
+    const initial = await (await submit(creator, "pinned-client", "7.4.91", { hud: true })).json() as { id: string };
+    expect((await owner.post(`/staff/versions/${initial.id}/decision`, { decision: "approve" })).status).toBe(200);
+    const baseline = await (await owner.get(`/staff/versions/${initial.id}`)).json() as { sha256: string };
+    const path = `/mods/pinned-client/releases/${baseline.sha256}`;
+    const original = await (await api(path)).json();
+    expect(original).toMatchObject({ release: { statement: expect.any(String), signature: expect.any(String) } });
+    const next = await (await submit(creator, "pinned-client", "7.4.92", { hud: true })).json() as { id: string };
+    expect((await owner.post(`/staff/versions/${next.id}/decision`, { decision: "approve" })).status).toBe(200);
+    expect(await (await api(path)).json()).toEqual(original);
+    expect((await api(`/mods/other-project/releases/${baseline.sha256}`)).status).toBe(404);
+    expect((await owner.post(`/staff/versions/${initial.id}/pull`, { reason: "Synthetic revoked release" })).status).toBe(200);
+    expect((await api(path)).status).toBe(404);
+    const response = await api("/mods/revocations");
+    const text = await response.text();
+    const body = JSON.parse(text) as { issued_at: number; expires_at: number };
+    expect(body.issued_at).toBeLessThanOrEqual(Date.now());
+    expect(body.expires_at - body.issued_at).toBe(15 * 60_000);
+    const key = await crypto.subtle.importKey("spki", Uint8Array.from(atob(PUBLIC_KEY), c => c.charCodeAt(0)), { name: "Ed25519" }, false, ["verify"]);
+    const signature = Uint8Array.from(atob(response.headers.get("X-Cinnabar-Signature")!.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+    expect(await crypto.subtle.verify("Ed25519", key, signature, new TextEncoder().encode(text))).toBe(true);
+  });
+
   it("authenticates uploads before reading bodies and gives scanner tokens no staff privileges", async () => {
     expect((await api("/submissions", { method: "POST", body: "invalid body" })).status).toBe(401);
     expect((await api("/internal/marketplace/claim", { method: "POST" })).status).toBe(401);

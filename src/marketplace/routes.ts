@@ -181,6 +181,10 @@ marketplaceRoutes.get("/mods/media/:sha256", async c => {
     "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; sandbox" });
 });
 marketplaceRoutes.get("/mods/:slug", async (c) => reply(c, await call(c, { op: "mod", slug: c.req.param("slug") }), "public, max-age=30"));
+marketplaceRoutes.get("/mods/:slug/releases/:sha256", async c => {
+  const hash = c.req.param("sha256");
+  return /^[0-9a-f]{64}$/.test(hash) ? reply(c, await call(c, { op: "release", slug: c.req.param("slug"), sha256: hash })) : c.notFound();
+});
 
 marketplaceRoutes.post("/mods/:slug/send", async (c) =>
   reply(c, await call(c, { op: "send", slug: c.req.param("slug"), ...(await caller(c)) })));

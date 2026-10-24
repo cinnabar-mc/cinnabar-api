@@ -317,6 +317,14 @@ export class MarketplaceStore {
       policy: SCAN_POLICY, client_revision: CLIENT_REVISION, scan_job: p.job_id, publication: p.publish_mode });
   }
 
+  /** Returns exact signed metadata for a still-public digest, including an older library selection. */
+  release(slug: string, sha256: string): MarketResult {
+    const listing = this.listing(slug);
+    const v = this.versions("v.slug = ? AND v.sha256 = ? AND v.status = 'approved' AND v.signature IS NOT NULL AND v.pulled = 0", slug, sha256)[0];
+    if (!listing || listing.hidden || this.account(listing.creator)?.suspended || !v || this.pipeline(v.id)?.state !== "complete") return fail(404, "No such release.");
+    return ok({ release: { statement: this.statement(v.id), signature: v.signature } });
+  }
+
   /** Atomically exposes a signed release after rechecking every gate following external I/O. */
   publish(versionId: number, statement: string, signature: string, now: number): boolean {
     if (!this.publicationReady(versionId, now) || this.statement(versionId) !== statement) return false;
@@ -327,11 +335,11 @@ export class MarketplaceStore {
   }
 
   /** Pulled versions with the reason staff gave, as the canonical body of the signed revocation list. */
-  revocations(): string {
+  revocations(now: number): string {
     const revoked = this.sql.exec<{ slug: string; version: string; sha256: string; pull_reason: string }>(
       "SELECT slug, version, sha256, pull_reason FROM mod_versions WHERE pulled = 1 ORDER BY id").toArray()
       .map((v) => ({ slug: v.slug, version: v.version, sha256: v.sha256, reason: v.pull_reason }));
-    return JSON.stringify({ revoked });
+    return JSON.stringify({ issued_at: now, expires_at: now + 15 * 60_000, revoked });
   }
 
   // --- Player writes -------------------------------------------------------------------------------------
@@ -800,6 +808,7 @@ export class MarketplaceStore {
 
 /** One marketplace request from the Worker, carrying the caller's session hash and CSRF header. */
 export type MarketCall = Caller & (
+  | { op: "release"; slug: string; sha256: string }
   | { op: "me" } | { op: "mods" } | { op: "mod"; slug: string } | { op: "mine" } | { op: "queue" } | { op: "reports" }
   | { op: "people" } | { op: "audit" } | { op: "signout" }
   | { op: "send"; slug: string } | { op: "report"; slug: string; body: unknown }
@@ -821,6 +830,7 @@ export function handle(store: MarketplaceStore, call: MarketCall, now: number): 
     case "me": return store.me(call, now);
     case "mods": return store.mods();
     case "mod": return store.mod(call.slug);
+    case "release": return store.release(call.slug, call.sha256);
     case "mine": return store.mine(call, now);
     case "queue": return store.queue(call, now);
     case "reports": return store.reports(call, now);

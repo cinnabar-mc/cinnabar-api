@@ -43,6 +43,12 @@ Public component/media URLs are `/v1/mods/assets/<sha256>` and
 approved, unpulled releases with an active creator and visible listing qualify.
 Responses use `no-store` and `nosniff`; private files never use a public cache path.
 Staff fetch quarantined components through `/v1/staff/versions/<id>/file`.
+Clients fetch the exact signed statement and signature from
+`GET /v1/mods/<slug>/releases/<sha256>`, including an older approved library selection.
+Pulled, hidden, unsigned or suspended-creator releases are unavailable. Revocations
+include signed millisecond `issued_at` and `expires_at` timestamps, valid for fifteen
+minutes. Clients must reject expired/rollback snapshots, retain known revocations,
+and hold managed mods when current revocation evidence is unavailable.
 Creators and active staff fetch pending screenshots through authenticated
 `GET /v1/me/mods/<id>/media/<sha256>`; other accounts receive 404. Public listing
 responses include grants, category/license, release notes/history, publication mode

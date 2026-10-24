@@ -581,7 +581,7 @@ export class Hub extends DurableObject<Env> {
 
   /** The signed list of pulled versions; the signature is null until a signing key is configured. */
   async modRevocations(): Promise<{ body: string; signature: string | null }> {
-    const body = this.market.revocations();
+    const body = this.market.revocations(Date.now());
     const key = this.env.MARKETPLACE_SIGNING_KEY;
     return { body, signature: key ? await signText(key, body) : null };
   }
