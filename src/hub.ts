@@ -1,6 +1,8 @@
 import { catalog, admitLoadout } from "./cosmetics";
 import { loadCatalog, type Catalog } from "./catalog-store";
 import { DurableObject } from "cloudflare:workers";
+import { MarketplaceStore, handle, type MarketCall, type MarketResult } from "./marketplace/store";
+import { signText } from "./marketplace/signing";
 import { PresenceHistory } from "./presence-history";
 import { count } from "./metrics";
 import { IssuerUnavailable, encodeBase64Url, identityUuid, issuerKeys, verifyProof } from "./identity";
@@ -97,11 +99,14 @@ export class Hub extends DurableObject<Env> {
    */
   private readonly lookupBudgets = new Map<string, LookupBudget>();
   private cosmeticCatalog: Catalog = catalog;
+  private readonly market: MarketplaceStore;
   private readonly entitlements = new Map<string, Set<string>>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.history = new PresenceHistory(ctx.storage.sql, env.API_CACHE, env.METRICS);
+    this.market = new MarketplaceStore(ctx.storage.sql,
+      new Set((env.OWNER_XUIDS ?? "").split(",").map((xuid) => xuid.trim()).filter((xuid) => /^[0-9]{1,20}$/.test(xuid))));
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS lookup_budgets (
       xuid TEXT PRIMARY KEY, tokens REAL NOT NULL, updated_at INTEGER NOT NULL
     )`);
@@ -332,6 +337,11 @@ export class Hub extends DurableObject<Env> {
       case "proof":
         return msg.type === "proof" ? this.onProof(ws, attachment, msg.signature) : this.reject(ws);
       case "ready":
+        if (msg.type === "mod_library_remove") {
+          if (this.market.removeLibrary(attachment.xuid, msg.slug, msg.sha256, msg.sent_at)) this.notifyModLibrary(attachment.xuid);
+          else send(ws, { type: "mod_library", mods: this.market.library(attachment.xuid) });
+          return;
+        }
         if (msg.type === "visibility") return this.onVisibility(ws, attachment, msg.visible);
         if (msg.type === "lookup") return this.onLookup(ws, attachment, msg, now);
         if (msg.type === "loadout") return this.onLoadout(ws, attachment, msg);
@@ -418,7 +428,9 @@ export class Hub extends DurableObject<Env> {
       .map((session) => session.loadout).filter((value): value is LoadoutState => value !== undefined)
       .sort((a, b) => b.revision - a.revision)[0];
     this.save(ws, { stage: "ready", xuid, displayName, uuid, channel, visible, loadout, lastSeen: now });
-    send(ws, { type: "welcome", xuid, loadout_revision: loadout?.revision ?? 0, owned_cosmetics: this.ownedCosmetics(xuid), ...SERVER_PARAMETERS });
+    const modLibrary = this.market.library(xuid);
+    send(ws, { type: "welcome", xuid, loadout_revision: loadout?.revision ?? 0, owned_cosmetics: this.ownedCosmetics(xuid),
+      ...(modLibrary.length ? { mod_library: modLibrary } : {}), ...SERVER_PARAMETERS });
 
     if (latest && compareReleases(latest.version, latest.build, pending.clientVersion, pending.clientBuild) > 0) {
       send(ws, { type: "release", ...latest });
@@ -518,6 +530,68 @@ export class Hub extends DurableObject<Env> {
     return { type: "emote", xuid: state.xuid, uuid: state.uuid, emote_id: active?.id ?? null,
       elapsed_ms: active ? Math.min(0xffffffff, active.elapsed + age) : 0,
       valid_for_ms: active ? EMOTE_TTL_MS - age : 0 };
+  }
+
+  /**
+   * Answers one marketplace request. Completed approvals are signed when a signing key is configured, and players
+   * whose library changed get it pushed to every live client.
+   */
+  async marketplace(call: MarketCall): Promise<MarketResult> {
+    const result = handle(this.market, call, Date.now());
+    if (call.op === "me" && result.status === 200) {
+      const account = (result.body as { account: { xuid: string } | null }).account;
+      (result.body as { game_online: boolean }).game_online = !!account && [...(this.byXuid.get(account.xuid) ?? [])]
+        .some((ws) => this.sessions.get(ws)?.stage === "ready");
+    }
+    if (result.approved !== undefined) {
+      const published = await this.publishMod(result.approved);
+      if (!published) return { status: 503, body: { error: "Publication is pending. The release remains private; retry after configuration or storage recovers." } };
+      // Return the committed view, including status and signature, rather than the pre-signing candidate.
+      if (call.op === "decide") result.body = this.market.version(call, result.approved, Date.now()).body;
+    }
+    for (const xuid of new Set(result.notify ?? [])) {
+      this.notifyModLibrary(xuid);
+    }
+    return { status: result.status, body: result.body };
+  }
+
+  /** Broadcasts one account's current selections to its own authenticated clients only. */
+  private notifyModLibrary(xuid: string): void {
+    const mods = this.market.library(xuid);
+    for (const ws of this.byXuid.get(xuid) ?? []) if (this.sessions.get(ws)?.stage === "ready") send(ws, { type: "mod_library", mods });
+  }
+
+  /** Copy verified artifacts to distribution, sign, then recheck live database gates before exposing anything. */
+  private async publishMod(id: number): Promise<boolean> {
+    this.market.promotionAttempt(id, Date.now());
+    const key = this.env.MARKETPLACE_SIGNING_KEY;
+    const candidate = key && this.market.publicationReady(id, Date.now());
+    if (!candidate || !key) return false;
+    try {
+      for (const objectKey of [`mods/${candidate.sha256}`, ...candidate.media.map(m => `media/${m.sha256}`)]) {
+        const object = await this.env.MOD_QUARANTINE.get(objectKey)
+          ?? (candidate.legacy ? await this.env.MOD_FILES.get(objectKey) : null);
+        if (!object) return false;
+        await this.env.MOD_FILES.put(objectKey, object.body, { httpMetadata: object.httpMetadata });
+      }
+      const signature = await signText(key, candidate.statement);
+      return this.market.publish(id, candidate.statement, signature, Date.now());
+    } catch {
+      // Pending promotions survive in SQLite. Cron retries; unsigned bytes never become public.
+      return false;
+    }
+  }
+
+  /** Cron recovery for committed decisions interrupted during R2 promotion or signing. */
+  async recoverModPublications(): Promise<void> {
+    for (const id of this.market.pendingPublications()) await this.publishMod(id);
+  }
+
+  /** The signed list of pulled versions; the signature is null until a signing key is configured. */
+  async modRevocations(): Promise<{ body: string; signature: string | null }> {
+    const body = this.market.revocations(Date.now());
+    const key = this.env.MARKETPLACE_SIGNING_KEY;
+    return { body, signature: key ? await signText(key, body) : null };
   }
 
   /** Reads paid ownership from the durable database, including after hibernation. */
