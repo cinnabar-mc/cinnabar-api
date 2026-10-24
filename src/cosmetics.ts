@@ -6,6 +6,41 @@ import { loadCatalog, refreshCatalogOnMiss, type Catalog } from "./catalog-store
 export const catalog = catalogJson;
 export type Item = typeof catalog.items[number];
 const slots = new Set<string>(schema.$defs.CosmeticSlot["x-known-slots"]);
+type Asset = Item["assets"]["geometry"];
+type AssetEntry = { kind: string; asset: Asset; license: string };
+const assetIndexes = new WeakMap<Catalog, Map<string, AssetEntry>>();
+const catalogBodies = new WeakMap<Catalog, Promise<{ body: string; etag: string }>>();
+
+/** Builds the digest lookup once per admitted release instead of allocating and scanning every descriptor per request. */
+function assetsFor(current: Catalog): Map<string, AssetEntry> {
+  let entries = assetIndexes.get(current);
+  if (!entries) {
+    entries = new Map();
+    for (const item of current.items) {
+      for (const [kind, asset] of Object.entries(item.assets)) {
+        if (!entries.has(asset.sha256)) entries.set(asset.sha256, { kind, asset, license: item.license });
+      }
+    }
+    for (const item of current.emotes) {
+      if (!entries.has(item.clip.sha256)) entries.set(item.clip.sha256, { kind: "clip", asset: item.clip, license: item.license });
+    }
+    assetIndexes.set(current, entries);
+  }
+  return entries;
+}
+
+/** Encodes and hashes each immutable catalog value once, sharing only completed JSON metadata between requests. */
+async function encodedCatalog(current: Catalog): Promise<{ body: string; etag: string }> {
+  let encoded = catalogBodies.get(current);
+  if (!encoded) {
+    const body = JSON.stringify(current);
+    encoded = crypto.subtle.digest("SHA-256", new TextEncoder().encode(body)).then((digest) => ({
+      body, etag: `"${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")}"`,
+    }));
+    catalogBodies.set(current, encoded);
+  }
+  return encoded;
+}
 
 /** Ignores unsupported content and rejects a whole loadout for wrong-slot or unowned known items. */
 export function admitLoadout(
@@ -25,9 +60,7 @@ export function admitLoadout(
 
 /** Serves a versioned catalog whose ETag binds every item and asset digest. */
 export async function catalogResponse(bucket?: R2Bucket): Promise<Response> {
-  const body = JSON.stringify(bucket ? await loadCatalog(bucket) : catalog);
-  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body)));
-  const etag = `"${Array.from(hash, (b) => b.toString(16).padStart(2, "0")).join("")}"`;
+  const { body, etag } = await encodedCatalog(bucket ? await loadCatalog(bucket) : catalog);
   return new Response(body, { headers: { ETag: etag, "Content-Type": "application/json" } });
 }
 
@@ -43,16 +76,12 @@ export const revalidateCatalog: MiddlewareHandler = async (c, next) => {
 /** Serves only reviewed, catalog-addressed R2 objects; clients verify the declared digest and size. */
 export async function assetResponse(hash: string, bucket: R2Bucket): Promise<Response> {
   if (!/^[a-f0-9]{64}$/.test(hash)) return new Response(null, { status: 404 });
-  /** Finds the immutable descriptor and its delivery headers in an admitted release. */
-  const find = (current: Catalog) => [
-    ...current.items.flatMap((item) => Object.entries(item.assets).map(([kind, asset]) => ({ kind, asset, license: item.license }))),
-    ...current.emotes.map((item) => ({ kind: "clip", asset: item.clip, license: item.license })),
-  ].find(({ asset }) => asset.sha256 === hash);
   const current = await loadCatalog(bucket);
-  const entry = find(current) ?? find(await refreshCatalogOnMiss(bucket));
-  if (!entry) return new Response(null, { status: 404 });
+  const entry = assetsFor(current).get(hash) ?? assetsFor(await refreshCatalogOnMiss(bucket)).get(hash);
+  if (!entry) return new Response(null, { status: 404, headers: { "Cache-Control": "public, max-age=10" } });
   const object = await bucket.get(hash);
-  if (!object || object.size !== entry.asset.bytes) return new Response(null, { status: 404 });
+  if (!object) return new Response(null, { status: 404 });
+  if (object.size !== entry.asset.bytes) { await object.body.cancel(); return new Response(null, { status: 404 }); }
   return new Response(object.body, { headers: {
     "Content-Type": entry.kind === "texture" ? "image/png" : "application/json",
     ETag: `"${hash}"`,

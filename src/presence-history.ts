@@ -1,45 +1,58 @@
-const MINUTE_MS = 60_000;
-const DAY_MS = 24 * 60 * MINUTE_MS;
+import { advanceHistory, historyStart, loadHistory, DAY_MS, HISTORY_KEY, MINUTE_MS, type HistorySnapshot, type PresenceSample } from "./history-snapshot";
+import { count } from "./metrics";
+
 const RETENTION_MS = 90 * DAY_MS;
+const RETRY_MAX_MS = 60 * MINUTE_MS;
+const MAX_FAILURES = Math.ceil(Math.log2(RETRY_MAX_MS / MINUTE_MS)) + 1;
 
-export const HISTORY_RANGES = {
-  "24h": { duration: DAY_MS, interval: MINUTE_MS },
-  "7d": { duration: 7 * DAY_MS, interval: 10 * MINUTE_MS },
-  "30d": { duration: 30 * DAY_MS, interval: 60 * MINUTE_MS },
-} as const;
-export type HistoryRange = keyof typeof HISTORY_RANGES;
-
-export interface OnlineHistory {
-  range: HistoryRange;
-  interval_ms: number;
-  from: number;
-  to: number;
-  points: { at: number; online: number; peak: number; samples: number }[];
-}
-
-/** Stores anonymous minute samples and returns bounded, averaged chart buckets. */
+/** Stores minute observations and incrementally publishes charts independently of public request traffic. */
 export class PresenceHistory {
-  constructor(private readonly sql: SqlStorage) {
+  private snapshot: HistorySnapshot | null | undefined;
+  private publication: Promise<void> = Promise.resolve();
+
+  constructor(private readonly sql: SqlStorage, private readonly bucket: R2Bucket, private readonly metrics?: AnalyticsEngineDataset) {
     sql.exec("CREATE TABLE IF NOT EXISTS presence_samples (at INTEGER PRIMARY KEY, online INTEGER NOT NULL)");
+    sql.exec("CREATE TABLE IF NOT EXISTS presence_publication (id INTEGER PRIMARY KEY, failures INTEGER NOT NULL, retry_at INTEGER NOT NULL)");
   }
 
   /** Keeps the first observation per minute, including zero; retries cannot add weight. */
   record(now: number, online: number): void {
     const at = Math.floor(now / MINUTE_MS) * MINUTE_MS;
-    this.sql.exec("INSERT OR IGNORE INTO presence_samples (at, online) VALUES (?, ?)", at, online);
-    this.sql.exec("DELETE FROM presence_samples WHERE at < ?", at - RETENTION_MS);
+    const insert = this.sql.exec("INSERT OR IGNORE INTO presence_samples (at, online) VALUES (?, ?)", at, online);
+    const cleanup = this.sql.exec("DELETE FROM presence_samples WHERE at < ?", at - RETENTION_MS);
+    count(this.metrics, "history_rows_written", insert.rowsWritten + cleanup.rowsWritten);
   }
 
-  /** Returns measured buckets only. A missing bucket is a gap, never an inferred zero. */
-  read(now: number, range: HistoryRange): OnlineHistory {
-    const { duration, interval } = HISTORY_RANGES[range];
-    const to = Math.floor(now / MINUTE_MS) * MINUTE_MS;
-    const from = Math.floor((to - duration) / interval) * interval;
-    const points = this.sql.exec<OnlineHistory["points"][number]>(`
-      SELECT CAST(at / ? AS INTEGER) * ? AS at, AVG(online) AS online,
-             MAX(online) AS peak, COUNT(*) AS samples
-      FROM presence_samples WHERE at >= ? AND at <= ? GROUP BY 1 ORDER BY 1
-    `, interval, interval, from, to).toArray();
-    return { range, interval_ms: interval, from, to, points };
+  /** Serializes overlapping cron deliveries so an older publication cannot overwrite a newer checkpoint. */
+  publish(now: number): Promise<void> {
+    const publication = this.publication.then(() => this.update(now));
+    this.publication = publication.catch(() => {});
+    return publication;
+  }
+
+  /** Reads only new samples after a durable R2 checkpoint, including missed minutes after a failed upload. */
+  private async update(now: number): Promise<void> {
+    const retry = this.sql.exec<{ failures: number; retry_at: number }>("SELECT failures, retry_at FROM presence_publication WHERE id = 1").toArray()[0];
+    if (retry && retry.retry_at > now) return;
+    try {
+      this.snapshot ??= await loadHistory(this.bucket);
+      const through = Math.floor(now / MINUTE_MS) * MINUTE_MS;
+      if (this.snapshot && this.snapshot.through >= through) return;
+      const cursor = this.sql.exec<PresenceSample>(
+        "SELECT at, online FROM presence_samples WHERE at > ? AND at <= ? ORDER BY at",
+        Math.max(this.snapshot?.through ?? -Infinity, historyStart(through) - 1), through,
+      );
+      const samples = cursor.toArray();
+      count(this.metrics, "history_rows_read", cursor.rowsRead);
+      const next = advanceHistory(this.snapshot ?? null, samples, through);
+      await this.bucket.put(HISTORY_KEY, JSON.stringify(next), { httpMetadata: { contentType: "application/json" } });
+      this.snapshot = next;
+      if (retry) this.sql.exec("DELETE FROM presence_publication WHERE id = 1");
+    } catch (error) {
+      const failures = Math.min((retry?.failures ?? 0) + 1, MAX_FAILURES);
+      this.sql.exec("INSERT OR REPLACE INTO presence_publication (id, failures, retry_at) VALUES (1, ?, ?)",
+        failures, now + Math.min(RETRY_MAX_MS, MINUTE_MS * 2 ** (failures - 1)));
+      throw error;
+    }
   }
 }

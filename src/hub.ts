@@ -3,7 +3,8 @@ import { loadCatalog, type Catalog } from "./catalog-store";
 import { DurableObject } from "cloudflare:workers";
 import { MarketplaceStore, handle, type MarketCall, type MarketResult } from "./marketplace/store";
 import { signText } from "./marketplace/signing";
-import { PresenceHistory, type HistoryRange, type OnlineHistory } from "./presence-history";
+import { PresenceHistory } from "./presence-history";
+import { count } from "./metrics";
 import { IssuerUnavailable, encodeBase64Url, identityUuid, issuerKeys, verifyProof } from "./identity";
 import {
   Close,
@@ -99,15 +100,17 @@ export class Hub extends DurableObject<Env> {
   private readonly lookupBudgets = new Map<string, LookupBudget>();
   private cosmeticCatalog: Catalog = catalog;
   private readonly market: MarketplaceStore;
+  private readonly entitlements = new Map<string, Set<string>>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.history = new PresenceHistory(ctx.storage.sql);
+    this.history = new PresenceHistory(ctx.storage.sql, env.API_CACHE, env.METRICS);
     this.market = new MarketplaceStore(ctx.storage.sql,
       new Set((env.OWNER_XUIDS ?? "").split(",").map((xuid) => xuid.trim()).filter((xuid) => /^[0-9]{1,20}$/.test(xuid))));
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS lookup_budgets (
       xuid TEXT PRIMARY KEY, tokens REAL NOT NULL, updated_at INTEGER NOT NULL
     )`);
+    ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS lookup_budgets_expiry ON lookup_budgets (updated_at)");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS cosmetic_entitlements (xuid TEXT NOT NULL, item_id TEXT NOT NULL, PRIMARY KEY (xuid, item_id))");
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS hub_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     ctx.storage.sql.exec("INSERT OR IGNORE INTO hub_config (key, value) VALUES ('ip_salt', ?)", crypto.randomUUID());
@@ -155,13 +158,10 @@ export class Hub extends DurableObject<Env> {
   }
 
   /** Records the current authoritative count independently of website visitors. */
-  recordOnlineCount(): void {
-    this.history.record(Date.now(), this.onlineCount());
-  }
-
-  /** Reads anonymous samples for a supported chart window. */
-  onlineHistory(range: HistoryRange): OnlineHistory {
-    return this.history.read(Date.now(), range);
+  async recordOnlineCount(): Promise<void> {
+    const now = Date.now();
+    this.history.record(now, this.onlineCount());
+    await this.history.publish(now);
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -348,11 +348,10 @@ export class Hub extends DurableObject<Env> {
   override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     this.cosmeticCatalog = await loadCatalog(this.env.COSMETIC_ASSETS);
     this.sockets.delete(ws);
-    this.forget(ws);
     try {
-      ws.close(code, reason);
-    } catch {
-      // Already closed, or a reserved code (1005/1006) that can't be echoed.
+      this.forget(ws);
+    } finally {
+      try { ws.close(code, reason); } catch { /* Already closed, or a reserved close code. */ }
     }
   }
 
@@ -452,7 +451,6 @@ export class Hub extends DurableObject<Env> {
     const watching = message.xuids === undefined && message.uuids === undefined
       ? state.watching ?? [] : [...new Set([...(message.xuids ?? []), ...(message.uuids ?? [])])];
     const previous = new Set(state.watching ?? []);
-    for (const id of previous) unindex(this.emoteWatchers, id, ws);
     const emote = state.visible && message.emote_id !== null
       ? { id: message.emote_id, elapsed: message.elapsed_ms, updated: now } : undefined;
     const next = { ...state, watching, emote };
@@ -590,9 +588,18 @@ export class Hub extends DurableObject<Env> {
 
   /** Reads paid ownership from the durable database, including after hibernation. */
   private ownedCosmetics(xuid: string): string[] {
-    return this.ctx.storage.sql.exec<{ item_id: string }>(
+    return [...this.ownedCosmeticIds(xuid)];
+  }
+
+  /** Caches grants only while an account has connected sockets; administrative changes invalidate them. */
+  private ownedCosmeticIds(xuid: string): Set<string> {
+    const cached = this.entitlements.get(xuid);
+    if (cached) return cached;
+    const items = new Set(this.ctx.storage.sql.exec<{ item_id: string }>(
       "SELECT item_id FROM cosmetic_entitlements WHERE xuid = ? ORDER BY item_id", xuid,
-    ).toArray().map((row) => row.item_id);
+    ).toArray().map((row) => row.item_id));
+    if (this.byXuid.has(xuid)) this.entitlements.set(xuid, items);
+    return items;
   }
 
   /** Applies a validated administrative grant or revocation atomically and updates connected accounts. */
@@ -606,6 +613,7 @@ export class Hub extends DurableObject<Env> {
         else this.ctx.storage.sql.exec("DELETE FROM cosmetic_entitlements WHERE xuid = ? AND item_id = ?", xuid, id);
       }
     });
+    this.entitlements.delete(xuid);
     const items = this.ownedCosmetics(xuid);
     for (const ws of this.byXuid.get(xuid) ?? []) {
       send(ws, { type: "cosmetic_ownership", owned_cosmetics: items });
@@ -635,9 +643,7 @@ export class Hub extends DurableObject<Env> {
 
   /** Rechecks grants for new state and replay so a revoked grant cannot survive hibernation. */
   private ownedLoadout(xuid: string, slots: Record<string, string | null>): Record<string, string | null> | null {
-    return admitLoadout(slots, (id) => this.ctx.storage.sql.exec(
-      "SELECT 1 FROM cosmetic_entitlements WHERE xuid = ? AND item_id = ?", xuid, id,
-    ).toArray().length !== 0, this.cosmeticCatalog.items);
+    return admitLoadout(slots, (id) => this.ownedCosmeticIds(xuid).has(id), this.cosmeticCatalog.items);
   }
 
   /** Recomputes the newest session snapshot for each mutually nearby watcher. */
@@ -675,6 +681,10 @@ export class Hub extends DurableObject<Env> {
     const xuids = [...new Set(lookup.xuids)];
     const uuids = [...new Set(lookup.uuids)];
     const cost = xuids.length + uuids.length;
+    if (cost === 0) {
+      send(ws, { type: "lookup_result", id: lookup.id, cinnabar: [], ...(lookup.uuids !== undefined ? { cinnabar_uuids: [] } : {}) });
+      return;
+    }
     const tokens = this.lookupTokens(state.xuid, now);
     const admitted = tokens >= cost;
     const lookupBudget = { tokens: admitted ? tokens - cost : tokens, updatedAt: now };
@@ -705,12 +715,7 @@ export class Hub extends DurableObject<Env> {
 
   /** Emits one point per counter per invocation; callers aggregate loops, and analytics failures are dropped. */
   private count(event: "admission_refused" | "authentication_failed" | "overload_closed" | "lookup", value = 1): void {
-    if (value === 0) return;
-    try {
-      this.env.METRICS?.writeDataPoint({ blobs: [event], doubles: [value] });
-    } catch {
-      // Metrics must never interrupt admission, accounting, or socket cleanup.
-    }
+    count(this.env.METRICS, event, value);
   }
 
   /** Keeps the earliest alarm so handshake deadlines and budget expiry share one timer. */
@@ -746,11 +751,10 @@ export class Hub extends DurableObject<Env> {
   }
 
   private close(ws: WebSocket, code: number, reason: string): void {
-    this.forget(ws);
     try {
-      ws.close(code, reason);
-    } catch {
-      // Already closing.
+      this.forget(ws);
+    } finally {
+      try { ws.close(code, reason); } catch { /* Already closing. */ }
     }
   }
 
@@ -766,6 +770,7 @@ export class Hub extends DurableObject<Env> {
 
   /** Updates socket state and retains its flood budget across handshake transitions and wakes. */
   private save(ws: WebSocket, session: Session & { traffic?: Traffic; ipHash?: string }, persist = true): void {
+    const previous = this.sessions.get(ws);
     const attachment: Attachment = {
       ...session,
       traffic: session.traffic ?? this.sessions.get(ws)?.traffic ?? {
@@ -786,10 +791,17 @@ export class Hub extends DurableObject<Env> {
     }
     this.sessions.set(ws, attachment);
     if (attachment.stage === "ready") {
-      index(this.byXuid, attachment.xuid, ws);
-      index(this.byUuid, attachment.uuid, ws);
-      index(this.byChannel, attachment.channel, ws);
-      for (const id of attachment.watching ?? []) index(this.emoteWatchers, id, ws);
+      if (previous?.stage !== "ready") {
+        index(this.byXuid, attachment.xuid, ws);
+        index(this.byUuid, attachment.uuid, ws);
+        index(this.byChannel, attachment.channel, ws);
+      }
+      const before = previous?.stage === "ready" ? previous.watching : undefined;
+      if (before !== attachment.watching) {
+        const watching = new Set(attachment.watching);
+        for (const id of before ?? []) if (!watching.delete(id)) unindex(this.emoteWatchers, id, ws);
+        for (const id of watching) index(this.emoteWatchers, id, ws);
+      }
       const budget = attachment.lookupBudget;
       const current = this.lookupBudgets.get(attachment.xuid);
       if (budget && (!current || budget.updatedAt > current.updatedAt
@@ -821,12 +833,19 @@ export class Hub extends DurableObject<Env> {
       // The socket is already gone, and with it the attachment.
     }
     if (attachment?.stage === "ready") {
-      if (attachment.emote) this.broadcastEmote({ ...attachment, emote: undefined }, Date.now());
-      if (attachment.loadout) this.broadcastLoadout(attachment);
       for (const id of attachment.watching ?? []) unindex(this.emoteWatchers, id, ws);
       unindex(this.byXuid, attachment.xuid, ws);
       unindex(this.byUuid, attachment.uuid, ws);
       unindex(this.byChannel, attachment.channel, ws);
+      if (!this.byXuid.has(attachment.xuid)) this.entitlements.delete(attachment.xuid);
+      if (attachment.visible || (!this.byXuid.has(attachment.xuid) && this.linger.has(attachment.xuid))) {
+        const deadline = Date.now() + PRESENCE_LINGER_MS;
+        this.linger.set(attachment.xuid, deadline);
+        this.linger.set(attachment.uuid, deadline);
+        this.ctx.waitUntil(this.scheduleAlarm(deadline));
+      }
+      if (attachment.emote) this.broadcastEmote({ ...attachment, emote: undefined }, Date.now());
+      if (attachment.loadout) this.broadcastLoadout(attachment);
       const budget = this.lookupBudgets.get(attachment.xuid);
       if (!this.byXuid.has(attachment.xuid) && budget
         && this.lookupTokens(attachment.xuid, Date.now()) < SERVER_PARAMETERS.lookup_bucket_capacity) {
@@ -834,12 +853,6 @@ export class Hub extends DurableObject<Env> {
           "INSERT OR REPLACE INTO lookup_budgets (xuid, tokens, updated_at) VALUES (?, ?, ?)",
           attachment.xuid, budget.tokens, budget.updatedAt,
         );
-      }
-      if (attachment.visible || (!this.byXuid.has(attachment.xuid) && this.linger.has(attachment.xuid))) {
-        const deadline = Date.now() + PRESENCE_LINGER_MS;
-        this.linger.set(attachment.xuid, deadline);
-        this.linger.set(attachment.uuid, deadline);
-        this.ctx.waitUntil(this.scheduleAlarm(deadline));
       }
     }
   }
