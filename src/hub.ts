@@ -337,6 +337,11 @@ export class Hub extends DurableObject<Env> {
       case "proof":
         return msg.type === "proof" ? this.onProof(ws, attachment, msg.signature) : this.reject(ws);
       case "ready":
+        if (msg.type === "mod_library_remove") {
+          if (this.market.removeLibrary(attachment.xuid, msg.slug, msg.sha256, msg.sent_at)) this.notifyModLibrary(attachment.xuid);
+          else send(ws, { type: "mod_library", mods: this.market.library(attachment.xuid) });
+          return;
+        }
         if (msg.type === "visibility") return this.onVisibility(ws, attachment, msg.visible);
         if (msg.type === "lookup") return this.onLookup(ws, attachment, msg, now);
         if (msg.type === "loadout") return this.onLoadout(ws, attachment, msg);
@@ -545,12 +550,15 @@ export class Hub extends DurableObject<Env> {
       if (call.op === "decide") result.body = this.market.version(call, result.approved, Date.now()).body;
     }
     for (const xuid of new Set(result.notify ?? [])) {
-      const mods = this.market.library(xuid);
-      for (const ws of this.byXuid.get(xuid) ?? []) {
-        if (this.sessions.get(ws)?.stage === "ready") send(ws, { type: "mod_library", mods });
-      }
+      this.notifyModLibrary(xuid);
     }
     return { status: result.status, body: result.body };
+  }
+
+  /** Broadcasts one account's current selections to its own authenticated clients only. */
+  private notifyModLibrary(xuid: string): void {
+    const mods = this.market.library(xuid);
+    for (const ws of this.byXuid.get(xuid) ?? []) if (this.sessions.get(ws)?.stage === "ready") send(ws, { type: "mod_library", mods });
   }
 
   /** Copy verified artifacts to distribution, sign, then recheck live database gates before exposing anything. */

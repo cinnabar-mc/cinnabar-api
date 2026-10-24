@@ -44,11 +44,14 @@ approved, unpulled releases with an active creator and visible listing qualify.
 Responses use `no-store` and `nosniff`; private files never use a public cache path.
 Staff fetch quarantined components through `/v1/staff/versions/<id>/file`.
 Clients fetch the exact signed statement and signature from
-`GET /v1/mods/<slug>/releases/<sha256>`, including an older approved library selection.
+`GET /v1/mods/<slug>/releases/<version>/<sha256>`, including an older approved library selection.
 Pulled, hidden, unsigned or suspended-creator releases are unavailable. Revocations
 include signed millisecond `issued_at` and `expires_at` timestamps, valid for fifteen
 minutes. Clients must reject expired/rollback snapshots, retain known revocations,
 and hold managed mods when current revocation evidence is unavailable.
+An authenticated game socket can send `mod_library_remove` with `slug`, `sha256`
+and the exact `sent_at` timestamp. It removes that account's matching selection
+and broadcasts its new library; stale requests cannot remove a later website send.
 Creators and active staff fetch pending screenshots through authenticated
 `GET /v1/me/mods/<id>/media/<sha256>`; other accounts receive 404. Public listing
 responses include grants, category/license, release notes/history, publication mode

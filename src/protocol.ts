@@ -123,6 +123,7 @@ export type ServerMessage =
   | { type: "emote"; xuid: string; uuid: string; emote_id: string | null; elapsed_ms: number; valid_for_ms: number };
 
 interface ClientMessages {
+  mod_library_remove: { type: "mod_library_remove"; slug: string; sha256: string; sent_at: string };
   hello: Hello;
   proof: Proof;
   visibility: Visibility;
@@ -132,7 +133,7 @@ interface ClientMessages {
 }
 export type ClientMessage = ClientMessages[keyof ClientMessages];
 
-const defNames = { hello: "Hello", proof: "Proof", visibility: "Visibility", lookup: "Lookup", emote_state: "EmoteState", loadout: "LoadoutState" } as const;
+const defNames = { hello: "Hello", proof: "Proof", visibility: "Visibility", lookup: "Lookup", emote_state: "EmoteState", loadout: "LoadoutState", mod_library_remove: "ModLibraryRemove" } as const;
 
 /** Returns a validator for one `$defs` entry of schema/v1.json, so the schema stays the single source of limits. */
 function validatorFor(def: string): Validator {

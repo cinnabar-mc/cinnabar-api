@@ -148,6 +148,9 @@
         },
         {
           "$ref": "#/$defs/LoadoutState"
+        },
+        {
+          "$ref": "#/$defs/ModLibraryRemove"
         }
       ]
     },
@@ -1216,6 +1219,17 @@
             "maxLength": 500
           }
         }
+      }
+    },
+    "ModLibraryRemove": {
+      "description": "An authenticated game client removes its exact website send request; stale requests are harmless.",
+      "type": "object",
+      "required": ["type", "slug", "sha256", "sent_at"],
+      "properties": {
+        "type": {"const": "mod_library_remove"},
+        "slug": {"$ref": "#/$defs/ModLibraryEntries/items/properties/slug"},
+        "sha256": {"$ref": "#/$defs/ModLibraryEntries/items/properties/sha256"},
+        "sent_at": {"$ref": "#/$defs/Timestamp"}
       }
     },
     "ModLibrary": {
