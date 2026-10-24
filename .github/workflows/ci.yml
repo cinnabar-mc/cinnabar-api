@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.API_RUNNER || '"ubuntu-latest"') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
@@ -31,7 +31,7 @@ jobs:
   deploy:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.API_RUNNER || '"ubuntu-latest"') }}
     timeout-minutes: 15
     # The environment only admits main, so pull request runs never see the token.
     environment: production
