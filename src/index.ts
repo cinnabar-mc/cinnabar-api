@@ -76,6 +76,19 @@ app.post("/v1/cosmetics/login-rewards", async (c) => {
   });
 });
 
+app.delete("/v1/cosmetics/login-rewards", async (c) => {
+  c.header("Cache-Control", "no-store");
+  if (!(await authorizePublisher(c.req.header("Authorization"), c.env))) return c.body(null, 401);
+  const text = await readBounded(c.req.raw.body, 1024);
+  if (text === null) return c.body(null, 400);
+  let value: unknown;
+  try { value = JSON.parse(text); } catch { return c.body(null, 400); }
+  const command = loginRewardCommand(value);
+  if (!command) return c.body(null, 400);
+  const result = await hubFor(c.env).stopLoginReward(command.item_id);
+  return result === null ? c.body(null, 400) : c.json(result);
+});
+
 app.post("/v1/releases", async (c) => {
   if (!(await bearerMatches(c.req.header("Authorization"), c.env.RELEASE_HOOK_SECRET))) return c.body(null, 401);
   const declared = Number(c.req.header("Content-Length") ?? 0);
