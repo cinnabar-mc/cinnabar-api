@@ -1,6 +1,6 @@
 {
   "repository": "cinnabar-mc/cinnabar",
-  "revision": "135294d9f58eb259ac6dc7fc3d24d10b73a1cb02",
+  "revision": "c277efbffd1ce418058d2e7e366adb7caae87f18",
   "inputs": {
     "grants": "crates/mod-host/src/grants.rs",
     "wit": "crates/mod-api/wit/extension.wit",

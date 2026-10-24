@@ -40,6 +40,8 @@ test('checks canonical WIT interface versions rather than rewritten JavaScript s
     ['cinnabar:extension/hud@0.1.0', 'pass'],
     ['cinnabar:extension/hud@9.0.0', 'block'],
     ['cinnabar:extension/hud', 'block'],
+    ['cinnabar:extension/touch@0.1.0', 'pass'],
+    ['cinnabar:extension/touch@9.0.0', 'block'],
     ['cinnabar:world-draw/assets@0.1.0', 'pass'],
     ['cinnabar:world-draw/assets@9.0.0', 'block'],
   ]) {
