@@ -1,5 +1,5 @@
 import { catalogResponse, assetResponse, revalidateCatalog } from "./cosmetics";
-import { authorizePublisher, entitlementCommand } from "./cosmetics-admin";
+import { authorizePublisher, entitlementCommand, loginRewardCommand } from "./cosmetics-admin";
 import { Hono } from "hono";
 import { publicCache } from "./public-cache";
 import { count } from "./metrics";
@@ -57,6 +57,23 @@ app.post("/v1/cosmetics/entitlements", async (c) => {
   if (!command) return c.body(null, 400);
   const result = await hubFor(c.env).setCosmeticEntitlements(command.xuid, command.item_ids, command.owned);
   return result === null ? c.body(null, 400) : c.json({ owned_cosmetics: result });
+});
+
+app.post("/v1/cosmetics/login-rewards", async (c) => {
+  c.header("Cache-Control", "no-store");
+  if (!(await authorizePublisher(c.req.header("Authorization"), c.env))) return c.body(null, 401);
+  const text = await readBounded(c.req.raw.body, 1024);
+  if (text === null) return c.body(null, 400);
+  let value: unknown;
+  try { value = JSON.parse(text); } catch { return c.body(null, 400); }
+  const command = loginRewardCommand(value);
+  if (!command) return c.body(null, 400);
+  const reward = await hubFor(c.env).startLoginReward(command.item_id);
+  return reward === null ? c.body(null, 400) : c.json({
+    item_id: reward.item_id,
+    starts_at: new Date(reward.starts_at).toISOString(),
+    ends_at: new Date(reward.ends_at).toISOString(),
+  });
 });
 
 app.post("/v1/releases", async (c) => {
