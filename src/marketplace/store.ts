@@ -105,6 +105,7 @@ export class MarketplaceStore {
         status TEXT NOT NULL DEFAULT 'open', resolution TEXT NOT NULL DEFAULT '', resolved_by TEXT)`,
       `CREATE TABLE IF NOT EXISTS mod_library (xuid TEXT NOT NULL, slug TEXT NOT NULL, version_id INTEGER NOT NULL,
         sent_at INTEGER NOT NULL, PRIMARY KEY (xuid, slug))`,
+      `CREATE TABLE IF NOT EXISTS mod_library_clock (xuid TEXT PRIMARY KEY, sent_at INTEGER NOT NULL)`,
       `CREATE TABLE IF NOT EXISTS staff_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL,
         actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL, note TEXT NOT NULL)`,
       `CREATE TABLE IF NOT EXISTS mod_pipeline (version_id INTEGER PRIMARY KEY, metadata TEXT NOT NULL,
@@ -142,6 +143,11 @@ export class MarketplaceStore {
         (SELECT id FROM mod_versions WHERE signature IS NOT NULL AND statement IS NULL)`);
       sql.exec("UPDATE mod_versions SET status = 'submitted', signature = NULL WHERE signature IS NOT NULL AND statement IS NULL");
       sql.exec("INSERT INTO market_schema (version) VALUES (2)");
+    }
+    // Preserve send identities across removals and restarts, including libraries created before the clock existed.
+    if (!sql.exec("SELECT 1 FROM market_schema WHERE version = 3").toArray().length) {
+      sql.exec("INSERT OR IGNORE INTO mod_library_clock (xuid, sent_at) SELECT xuid, MAX(sent_at) FROM mod_library GROUP BY xuid");
+      sql.exec("INSERT INTO market_schema (version) VALUES (3)");
     }
   }
 
@@ -369,10 +375,28 @@ export class MarketplaceStore {
     if (!live) return fail(404, "No public mod with that name.");
     const xuid = session.account.xuid;
     const count = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM mod_library WHERE xuid = ? AND slug != ?", xuid, slug).one().n;
-    if (count >= MAX_LIBRARY) return fail(409, "Your library is full. Remove a mod in game first.");
+    if (count >= MAX_LIBRARY) return fail(409, "Your library is full. Remove a mod from your library first.");
+    const sentAt = this.sql.exec<{ sent_at: number }>(`INSERT INTO mod_library_clock (xuid, sent_at) VALUES (?, ?)
+      ON CONFLICT (xuid) DO UPDATE SET sent_at = MAX(excluded.sent_at, mod_library_clock.sent_at + 1)
+      RETURNING sent_at`, xuid, now).one().sent_at;
     this.sql.exec(`INSERT INTO mod_library (xuid, slug, version_id, sent_at) VALUES (?, ?, ?, ?)
-      ON CONFLICT (xuid, slug) DO UPDATE SET version_id = excluded.version_id, sent_at = excluded.sent_at`, xuid, slug, live.id, now);
+      ON CONFLICT (xuid, slug) DO UPDATE SET version_id = excluded.version_id, sent_at = excluded.sent_at`, xuid, slug, live.id, sentAt);
     return ok({ queued: true, version: live.version }, { notify: [xuid] });
+  }
+
+  /** Authorizes a browser removal and broadcasts only a successfully removed exact selection. */
+  removeSelection(caller: Caller, slug: string, input: unknown, now: number): MarketResult {
+    const session = this.writer(caller, now);
+    if ("status" in session) return session;
+    const body = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
+    const at = typeof body.sent_at === "string" && body.sent_at.length <= 32 ? Date.parse(body.sent_at) : NaN;
+    if (typeof body.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(body.sha256) || !Number.isSafeInteger(at)
+      || new Date(at).toISOString() !== body.sent_at) return fail(422, "Choose a library selection with its hash and send timestamp.");
+    const xuid = session.account.xuid;
+    if (!this.removeLibrary(xuid, slug, body.sha256, String(body.sent_at))) {
+      return fail(409, "Your library changed. Review the current selection and try again.");
+    }
+    return ok({ removed: true }, { notify: [xuid] });
   }
 
   /** Removes only the authenticated account's exact send request; stale removals cannot erase a later send. */
@@ -834,7 +858,7 @@ export type MarketCall = Caller & (
   | { op: "release"; slug: string; version: string; sha256: string }
   | { op: "me" } | { op: "mods" } | { op: "mod"; slug: string } | { op: "mine" } | { op: "queue" } | { op: "reports" }
   | { op: "people" } | { op: "audit" } | { op: "signout" }
-  | { op: "send"; slug: string } | { op: "report"; slug: string; body: unknown }
+  | { op: "send"; slug: string } | { op: "remove"; slug: string; body: unknown } | { op: "report"; slug: string; body: unknown }
   | { op: "upload-auth" } | { op: "precheck"; body: unknown } | { op: "submit"; body: unknown; file: { sha256: string; bytes: number; grants: Grants | null; media?: MediaFile[] } }
   | { op: "version"; id: number } | { op: "decide"; id: number; body: unknown } | { op: "pull"; id: number; body: unknown }
   | { op: "hide"; slug: string; body: unknown } | { op: "resolve"; id: number; body: unknown }
@@ -860,6 +884,7 @@ export function handle(store: MarketplaceStore, call: MarketCall, now: number): 
     case "people": return store.people(call, now);
     case "audit": return store.audit(call, now);
     case "send": return store.send(call, call.slug, now);
+    case "remove": return store.removeSelection(call, call.slug, call.body, now);
     case "report": return store.report(call, call.slug, call.body, now);
     case "precheck": return store.precheck(call, call.body, now);
     case "upload-auth": return store.uploadAllowed(call, now);

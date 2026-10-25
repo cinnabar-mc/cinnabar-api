@@ -189,6 +189,12 @@ marketplaceRoutes.get("/mods/:slug/releases/:version/:sha256", async c => {
 marketplaceRoutes.post("/mods/:slug/send", async (c) =>
   reply(c, await call(c, { op: "send", slug: c.req.param("slug"), ...(await caller(c)) })));
 
+marketplaceRoutes.post("/mods/:slug/remove", async (c) => {
+  const body = await readJson(c);
+  if (body === null) return c.json({ error: "Send the library selection as JSON." }, 400);
+  return reply(c, await call(c, { op: "remove", slug: c.req.param("slug"), body, ...(await caller(c)) }));
+});
+
 marketplaceRoutes.post("/mods/:slug/reports", async (c) => {
   const body = await readJson(c);
   if (body === null) return c.json({ error: "Send the report as JSON." }, 400);

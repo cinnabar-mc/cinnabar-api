@@ -416,6 +416,68 @@ describe("quarantine and publication pipeline", () => {
     expect((await api("/mods/missing-statement")).status).toBe(200);
   });
 
+  it("removes exact browser library selections with session, CSRF and stale-send protection", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const creator = await signIn("2535400000006291", "RemovalCreator");
+    const player = await signIn("2535400000006292", "RemovalPlayer");
+    const other = await signIn("2535400000006293", "OtherRemovalPlayer");
+    const version = await (await submit(creator, "browser-removal", "7.4.93", { hud: true })).json() as { id: string };
+    expect((await owner.post(`/staff/versions/${version.id}/decision`, { decision: "approve" })).status).toBe(200);
+    expect((await player.post("/mods/browser-removal/send")).status).toBe(200);
+    const read = async () => (await (await player.get("/me")).json() as {
+      library: { slug: string; sha256: string; sent_at: string }[];
+    }).library;
+    const selected = (await read())[0]!;
+    await runInDurableObject(hub(), (_: Hub, state) => {
+      state.storage.sql.exec("DELETE FROM mod_library_clock WHERE xuid = ?", "2535400000006292");
+      state.storage.sql.exec("DELETE FROM market_schema WHERE version = 3");
+      new MarketplaceStore(state.storage.sql, new Set([OWNER]));
+    });
+    const path = "/mods/browser-removal/remove";
+    expect((await api(path, { method: "POST", headers: { Origin: SITE }, body: JSON.stringify(selected) })).status).toBe(401);
+    expect((await api(path, { method: "POST", headers: { Origin: SITE, Cookie: player.cookie }, body: JSON.stringify(selected) })).status).toBe(403);
+    expect((await api(path, { method: "POST", headers: { Origin: "https://evil.test", Cookie: player.cookie,
+      "X-Cinnabar-CSRF": player.csrf }, body: JSON.stringify(selected) })).status).toBe(403);
+    expect((await other.post(path, { ...selected, xuid: "2535400000006292" })).status).toBe(409);
+    expect((await player.post(path, null)).status).toBe(400);
+    for (const body of [{}, [], { ...selected, sha256: "invalid" }, { ...selected, sent_at: "invalid" },
+      { ...selected, sent_at: 123 }, { ...selected, sent_at: "x".repeat(1000) }]) {
+      expect((await player.post(path, body)).status).toBe(422);
+    }
+    expect(await read()).toEqual([selected]);
+    // A later send of the very same bytes is still a different selection.
+    await runInDurableObject(hub(), (_: Hub, state) => {
+      const store = new MarketplaceStore(state.storage.sql, new Set([OWNER]));
+      const now = Date.parse(selected.sent_at);
+      store.signIn("2535400000006292", "RemovalPlayer", "removal-fixture-session", "removal-fixture-csrf", now);
+      expect(store.send({ session: "removal-fixture-session", csrf: "removal-fixture-csrf" }, "browser-removal", now).status).toBe(200);
+    });
+    expect((await player.post(path, selected)).status).toBe(409);
+    let current = (await read())[0]!;
+    expect(current.sent_at).not.toBe(selected.sent_at);
+    expect((await player.post(path, { ...current, sha256: "0".repeat(64) })).status).toBe(409);
+    await runInDurableObject(hub(), (_: Hub, state) => {
+      let store = new MarketplaceStore(state.storage.sql, new Set([OWNER]));
+      expect(store.removeLibrary("2535400000006292", current.slug, current.sha256, current.sent_at)).toBe(true);
+      store = new MarketplaceStore(state.storage.sql, new Set([OWNER]));
+      expect(store.send({ session: "removal-fixture-session", csrf: "removal-fixture-csrf" }, current.slug, Date.parse(current.sent_at)).status).toBe(200);
+    });
+    expect((await player.post(path, current)).status).toBe(409);
+    const readded = (await read())[0]!;
+    expect(readded.sent_at).not.toBe(current.sent_at);
+    current = readded;
+    // Hidden/pulled releases remain removable even though the catalogue cannot serve them.
+    expect((await owner.post(`/staff/versions/${version.id}/pull`, { reason: "Removal fixture withdrawal" })).status).toBe(200);
+    expect((await api("/mods/browser-removal")).status).toBe(404);
+    const { client } = await login({ xuid: "2535400000006292" });
+    open.push(client);
+    const removed = await player.post(path, current);
+    expect(removed.headers.get("Cache-Control")).toBe("no-store");
+    expect(await removed.json()).toEqual({ removed: true });
+    expect(await next(client, "browser removal push")).toMatchObject({ type: "mod_library", mods: [] });
+    expect(await read()).toEqual([]);
+  });
+
   it("serves the exact older signed release and signs expiring revocation evidence", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
     const creator = await signIn("2535400000006199", "PinnedReleaseCreator");

@@ -52,6 +52,13 @@ and hold managed mods when current revocation evidence is unavailable.
 An authenticated game socket can send `mod_library_remove` with `slug`, `sha256`
 and the exact `sent_at` timestamp. It removes that account's matching selection
 and broadcasts its new library; stale requests cannot remove a later website send.
+Browsers use `POST /v1/mods/<slug>/remove` with JSON `{sha256, sent_at}`, the host
+session cookie and `X-Cinnabar-CSRF`. Identity comes only from that session.
+A changed selection returns 409 so the website refreshes before another attempt.
+An account's persisted send clock advances timestamps even within the same clock
+millisecond, after deletion/re-addition and across restarts or clock adjustments.
+Its high-water mark is retained independently of active library entries.
+Removal works for hidden/pulled releases and does not uninstall local files.
 Creators and active staff fetch pending screenshots through authenticated
 `GET /v1/me/mods/<id>/media/<sha256>`; other accounts receive 404. Public listing
 responses include grants, category/license, release notes/history, publication mode
