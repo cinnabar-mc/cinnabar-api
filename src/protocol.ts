@@ -92,6 +92,17 @@ export interface ReleaseRecord {
   build?: number;
   published_at: string;
 }
+/** A mod the player sent to their game from the website; `pulled` versions must be turned off with staff's reason. */
+export interface ModLibraryEntry {
+  slug: string;
+  version: string;
+  sha256: string;
+  bytes: number;
+  grants: Record<string, boolean | string[]>;
+  sent_at: string;
+  pulled: boolean;
+  pull_reason?: string;
+}
 export interface ReleaseHookRequest {
   channel: Channel;
   version: string;
@@ -102,7 +113,9 @@ export type ServerMessage =
   | ({ xuid: string; uuid: string } & LoadoutState)
   | { type: "challenge"; nonce: string }
   | { type: "cosmetic_ownership"; owned_cosmetics: string[] }
-  | ({ type: "welcome"; xuid: string; loadout_revision?: number; owned_cosmetics?: string[] } & WelcomeParameters)
+  | ({ type: "welcome"; xuid: string; loadout_revision?: number; owned_cosmetics?: string[]; mod_library?: ModLibraryEntry[] }
+    & WelcomeParameters)
+  | { type: "mod_library"; mods: ModLibraryEntry[] }
   | { type: "error"; code: "unauthorized" | "invalid_loadout" }
   | { type: "error"; code: "rate_limited"; id: number }
   | { type: "lookup_result"; id: number; cinnabar: string[]; cinnabar_uuids?: string[] }
@@ -110,6 +123,7 @@ export type ServerMessage =
   | { type: "emote"; xuid: string; uuid: string; emote_id: string | null; elapsed_ms: number; valid_for_ms: number };
 
 interface ClientMessages {
+  mod_library_remove: { type: "mod_library_remove"; slug: string; sha256: string; sent_at: string };
   hello: Hello;
   proof: Proof;
   visibility: Visibility;
@@ -119,7 +133,7 @@ interface ClientMessages {
 }
 export type ClientMessage = ClientMessages[keyof ClientMessages];
 
-const defNames = { hello: "Hello", proof: "Proof", visibility: "Visibility", lookup: "Lookup", emote_state: "EmoteState", loadout: "LoadoutState" } as const;
+const defNames = { hello: "Hello", proof: "Proof", visibility: "Visibility", lookup: "Lookup", emote_state: "EmoteState", loadout: "LoadoutState", mod_library_remove: "ModLibraryRemove" } as const;
 
 /** Returns a validator for one `$defs` entry of schema/v1.json, so the schema stays the single source of limits. */
 function validatorFor(def: string): Validator {

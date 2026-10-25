@@ -5,6 +5,7 @@ import { publicCache } from "./public-cache";
 import { count } from "./metrics";
 import { isReleaseHookRequest } from "./protocol";
 import { hubFor } from "./routing";
+import { marketplaceRoutes } from "./marketplace/routes";
 import { DEFAULT_HISTORY_RANGE, HISTORY_RANGES, loadHistory, snapshotHistory, type HistoryRange } from "./history-snapshot";
 
 export { Hub } from "./hub";
@@ -106,6 +107,8 @@ app.post("/v1/releases", async (c) => {
   return c.body(null, 204);
 });
 
+app.route("/v1", marketplaceRoutes);
+
 app.get("/v1/connect", (c) => {
   if (c.req.header("Upgrade")?.toLowerCase() !== "websocket") return c.body(null, 426, { Upgrade: "websocket" });
   return hubFor(c.env).fetch(c.req.raw);
@@ -156,7 +159,10 @@ export default {
   fetch: app.fetch,
   /** Samples at execution time, so delayed cron delivery cannot fabricate past counts. */
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
-    try { await hubFor(env).recordOnlineCount(); }
-    catch (error) { count(env.METRICS, "history_publish_failed"); throw error; }
+    const results = await Promise.allSettled([
+      hubFor(env).recordOnlineCount().catch(error => { count(env.METRICS, "history_publish_failed"); throw error; }),
+      hubFor(env).recoverModPublications(),
+    ]);
+    for (const result of results) if (result.status === "rejected") throw result.reason;
   },
 } satisfies ExportedHandler<Env>;
