@@ -1159,6 +1159,20 @@
           }
         }
       }
+    },
+    "UniqueUserCountResponse": {
+      "type": "object",
+      "description": "GET /v1/users/count: verified accounts since tracking began, deduplicated across devices and reconnects, including visibility-off accounts.",
+      "required": [
+        "unique"
+      ],
+      "properties": {
+        "unique": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

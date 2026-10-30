@@ -23,6 +23,15 @@ app.get("/v1/presence/count", publicCache("public, max-age=30"), async (c) => {
   });
 });
 
+app.get("/v1/users/count", publicCache("public, max-age=60"), async (c) => {
+  c.header("Access-Control-Allow-Origin", "*");
+  try {
+    return c.json({ unique: await hubFor(c.env).uniqueUserCount() });
+  } catch {
+    return c.json({ error: "user count unavailable" }, 503, { "Retry-After": "60" });
+  }
+});
+
 app.get("/v1/presence/players", async (c) => {
   c.header("Cache-Control", "no-store");
   if (!(await bearerMatches(c.req.header("Authorization"), c.env.PRESENCE_READ_SECRET))) return c.body(null, 401);
