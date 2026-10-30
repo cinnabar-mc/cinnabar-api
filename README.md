@@ -11,6 +11,7 @@ messages against it.
 | --- | --- |
 | `GET /v1/health` | `{"ok":true,"api":"v1"}` |
 | `GET /v1/presence/count` | Public `{"online":0}` count of unique connected, authenticated accounts with visibility on. Allows cross-origin reads and caching for 30 seconds. No identifiers or retained offline presence. |
+| `GET /v1/users/count` | Public `{"unique":0}` total of verified accounts since tracking was deployed. Deduplicates reconnects and devices, includes visibility-off accounts, and persists after disconnects and restarts. Allows cross-origin reads and caching for 60 seconds; no historical backfill. |
 | `GET /v1/presence/players` | Private `{"names":[]}` list of verified names for those same online accounts. Requires a bearer token matching the `PRESENCE_READ_SECRET` Worker secret; never cached or exposed through CORS. |
 | `GET /v1/presence/history?range=24h` | Public anonymous player-count history. Ranges: `24h` (one minute), `7d` (ten minutes), `30d` (one hour). Allows cross-origin reads and caching for 60 seconds. |
 | `POST /v1/releases` | Release hook. `Authorization: Bearer <RELEASE_HOOK_SECRET>`, body `{"channel","version","build"}`; records and broadcasts only a newer (version, build) pair. Repeats and older records are no-ops. Omitted v1 builds mean zero. |
@@ -22,6 +23,7 @@ Public GET responses use the Cloudflare Cache API with lifetimes declared beside
 | --- | --- |
 | `/v1/health` | 60 seconds |
 | `/v1/presence/count` | 30 seconds |
+| `/v1/users/count` | 60 seconds |
 | `/v1/presence/history` | 60 seconds per supported range |
 | `/v1/cosmetics/catalog` | 300 seconds, with `If-None-Match` revalidation on cache hits and misses |
 | `/v1/cosmetics/assets/:hash` | One year, immutable |
@@ -67,6 +69,12 @@ so reconnecting clients supply their signed identity again.
   and failures. Sessions remain authenticated after the original token expires.
 
 ## Privacy
+
+- Unique-user tracking retains one salted account digest per successfully authenticated and admitted
+  account, indefinitely, separately from online presence. It stores no display names, raw XUIDs,
+  activity timestamps or IP addresses. Visibility controls presence; it does not opt out of this
+  aggregate. Only the total is public. Existing sessions count on their next successful login;
+  accounts that have not authenticated since deployment cannot be inferred from past online samples.
 
 - The public online count includes each visible connected account once, even with several sockets.
   Visibility off excludes that socket; an account counts while any of its fresh open sockets is visible.
