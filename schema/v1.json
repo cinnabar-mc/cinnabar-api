@@ -1235,20 +1235,18 @@
           "type": "object",
           "required": [
             "repository",
-            "supported_revisions"
+            "revision",
+            "api_revision"
           ],
           "properties": {
             "repository": {
               "$ref": "#/$defs/ModHostRepository"
             },
-            "supported_revisions": {
-              "type": "array",
-              "minItems": 1,
-              "maxItems": 128,
-              "uniqueItems": true,
-              "items": {
-                "$ref": "#/$defs/GitRevision"
-              }
+            "revision": {
+              "$ref": "#/$defs/GitRevision"
+            },
+            "api_revision": {
+              "$ref": "#/$defs/GitRevision"
             }
           }
         },
@@ -1300,7 +1298,8 @@
       "required": [
         "host_revision",
         "current_version",
-        "current_revision"
+        "current_revision",
+        "api_revisions"
       ],
       "properties": {
         "host_revision": {
@@ -1311,6 +1310,11 @@
         },
         "current_revision": {
           "$ref": "#/$defs/GitRevision"
+        },
+        "api_revisions": {
+          "type": "string",
+          "maxLength": 1311,
+          "pattern": "^[0-9a-f]{40}(,[0-9a-f]{40}){0,31}$"
         }
       }
     }

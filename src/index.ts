@@ -114,7 +114,7 @@ app.post("/v1/mod/releases", async (c) => {
 
 app.get("/v1/mod/update", async (c) => {
   c.header("Cache-Control", "no-store");
-  const query = { host_revision: c.req.query("host_revision") ?? "", current_version: c.req.query("current_version") ?? "", current_revision: c.req.query("current_revision") ?? "" };
+  const query = { api_revisions: c.req.query("api_revisions") ?? "", host_revision: c.req.query("host_revision") ?? "", current_version: c.req.query("current_version") ?? "", current_revision: c.req.query("current_revision") ?? "" };
   if (!isModUpdateQuery(query)) return c.body(null, 400);
   const release = await hubFor(c.env).modUpdate(query);
   return release ? c.json(release) : c.body(null, 204);

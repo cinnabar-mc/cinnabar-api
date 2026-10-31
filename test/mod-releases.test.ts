@@ -14,7 +14,7 @@ function release(version = "1.0.0", host = HOST_A, revision = "1".repeat(40)): M
   return {
     manifest: {
       schema_version: 1, package: PACKAGE, version, revision,
-      host: { repository: REPOSITORY, supported_revisions: [host] },
+      host: { repository: REPOSITORY, revision: host, api_revision: host },
       artifact: { filename: "Example.wasm", size: 256, sha256: "c".repeat(64) },
     },
     download_url: `https://github.com/example/mod/releases/download/v${version}/Example.wasm`,
@@ -33,7 +33,7 @@ function publish(body: unknown, secret: string | null = "test-mod-hook-secret"):
 /** Requests an update from an exact host and installed mod identity. */
 function update(overrides: Partial<ModUpdateQuery> = {}): Promise<Response> {
   const query = new URLSearchParams({
-    host_revision: HOST_A,
+    host_revision: HOST_A, api_revisions: HOST_A,
     current_version: "0.1.0", current_revision: "0".repeat(40), ...overrides,
   });
   return exports.default.fetch(`https://api.test/v1/mod/update?${query}`);
@@ -51,7 +51,7 @@ describe("revision-aware mod releases", () => {
     expect((await publish(old)).status).toBe(204);
     expect((await publish(latest)).status).toBe(204);
     expect(await (await update()).json()).toEqual(old);
-    expect(await (await update({ host_revision: HOST_B })).json()).toEqual(latest);
+    expect(await (await update({ host_revision: HOST_B, api_revisions: HOST_B })).json()).toEqual(latest);
     await evictDurableObject(hub());
     expect(await (await update()).json()).toEqual(old);
   });
@@ -63,10 +63,25 @@ describe("revision-aware mod releases", () => {
     expect(await (await update()).json()).toEqual(release("1.10.0", HOST_A, "1a10a0".padEnd(40, "0")));
   });
 
-  it("never falls back for unknown native revisions", async () => {
+  it("never falls back for unsupported API revisions", async () => {
     await publish(release());
-    expect((await update({ host_revision: HOST_B })).status).toBe(204);
+    expect((await update({ host_revision: HOST_B, api_revisions: HOST_B })).status).toBe(204);
     expect((await update()).headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("offers the same compatible mod to newer native commits without changing the mod build pin", async () => {
+    const body = release();
+    await publish(body);
+    expect(await (await update({ host_revision: HOST_B })).json()).toEqual(body);
+  });
+
+  it("keeps old API support when a new native build adds capabilities", async () => {
+    const old = release();
+    const next = release("2.0.0", HOST_B, "2".repeat(40));
+    await publish(old); await publish(next);
+    expect(await (await update()).json()).toEqual(old);
+    expect(await (await update({ host_revision: HOST_B, api_revisions: `${HOST_A},${HOST_B}` })).json()).toEqual(next);
+    expect(await (await update({ host_revision: HOST_B, api_revisions: `${HOST_A},${"f".repeat(40)}` })).json()).toEqual(old);
   });
 
   it("does not repeat the installed revision or downgrade a version", async () => {
@@ -78,9 +93,7 @@ describe("revision-aware mod releases", () => {
 
   it("accepts identical retries and rejects replacement of an existing version", async () => {
     const body = release();
-    body.manifest.host.supported_revisions.push(HOST_B);
     expect((await publish(body)).status).toBe(204);
-    body.manifest.host.supported_revisions.reverse();
     expect((await publish(body)).status).toBe(204);
     body.manifest.artifact.sha256 = "d".repeat(64);
     expect((await publish(body)).status).toBe(409);
@@ -92,7 +105,7 @@ describe("revision-aware mod releases", () => {
     const a = release();
     const b = release("1.0.0", HOST_B, "2".repeat(40));
     expect((await Promise.all([publish(a), publish(b)])).map((r) => r.status).sort()).toEqual([204, 409]);
-    const selected = [(await update()).status, (await update({ host_revision: HOST_B })).status].sort();
+    const selected = [(await update()).status, (await update({ host_revision: HOST_B, api_revisions: HOST_B })).status].sort();
     expect(selected).toEqual([200, 204]);
   });
 
@@ -114,8 +127,8 @@ describe("revision-aware mod releases", () => {
 
   it("rejects malformed, prerelease, abbreviated and unsafe metadata", async () => {
     for (const mutate of [
-      (r: ModRelease) => { r.manifest.host.supported_revisions = ["abcdef0"]; },
-      (r: ModRelease) => { r.manifest.host.supported_revisions = []; },
+      (r: ModRelease) => { r.manifest.host.api_revision = "abcdef0"; },
+      (r: ModRelease) => { r.manifest.host.revision = ""; },
       (r: ModRelease) => { r.manifest.version = "1.0.0-beta"; },
       (r: ModRelease) => { r.manifest.artifact.sha256 = "invalid"; },
       (r: ModRelease) => { r.download_url = "http://example.com/file.wasm"; },
@@ -129,7 +142,7 @@ describe("revision-aware mod releases", () => {
   });
 
   it("requires both complete installed identities", async () => {
-    for (const overrides of [{ host_revision: "abcdef0" }, { current_version: "" }, { current_revision: "" }]) {
+    for (const overrides of [{ api_revisions: "" }, { api_revisions: "abc" }, { host_revision: "abcdef0" }, { current_version: "" }, { current_revision: "" }]) {
       expect((await update(overrides)).status).toBe(400);
     }
     expect((await exports.default.fetch(`https://api.test/v1/mod/update`)).status).toBe(400);

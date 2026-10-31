@@ -8,7 +8,7 @@ export interface ModRelease {
     package: string;
     version: string;
     revision: string;
-    host: { repository: string; supported_revisions: string[] };
+    host: { repository: string; revision: string; api_revision: string };
     artifact: { filename: string; size: number; sha256: string };
   };
   download_url: string;
@@ -16,6 +16,7 @@ export interface ModRelease {
 
 export interface ModUpdateQuery {
   host_revision: string;
+  api_revisions: string;
   current_version: string;
   current_revision: string;
 }
@@ -55,32 +56,32 @@ export function publisherAllows(release: ModRelease, repository?: string, packag
     && release.download_url === `https://github.com/${repository}/releases/download/v${m.version}/${m.artifact.filename}`;
 }
 
-/** Requires exact full host and installed mod revisions; unknown identities never mean latest. */
+/** Requires full native/mod identities and a bounded list of supported API revisions. */
 export function isModUpdateQuery(value: unknown): value is ModUpdateQuery {
   return value !== undefined && queryValidator.validate(value).valid;
 }
 
-/** Removes unknown fields and orders revisions so equivalent publication retries are identical. */
+/** Removes unknown fields and orders fields so equivalent publication retries are identical. */
 function canonicalRelease(release: ModRelease): ModRelease {
   const { manifest: m } = release;
   return {
     manifest: {
       schema_version: 1, package: m.package, version: m.version, revision: m.revision,
-      host: { repository: m.host.repository, supported_revisions: [...m.host.supported_revisions].sort() },
+      host: { repository: m.host.repository, revision: m.host.revision, api_revision: m.host.api_revision },
       artifact: { filename: m.artifact.filename, size: m.artifact.size, sha256: m.artifact.sha256 },
     },
     download_url: release.download_url,
   };
 }
 
-/** Retains immutable releases and indexes the exact host commits each one supports. */
+/** Retains immutable releases and indexes the stable mod API revisions each one supports. */
 export class ModReleases {
   constructor(private readonly sql: SqlStorage) {
     sql.exec(`CREATE TABLE IF NOT EXISTS mod_releases (
       package TEXT NOT NULL, version TEXT NOT NULL, release TEXT NOT NULL,
       PRIMARY KEY (package, version)
     )`);
-    sql.exec(`CREATE TABLE IF NOT EXISTS mod_release_hosts (
+    sql.exec(`CREATE TABLE IF NOT EXISTS mod_release_apis (
       package TEXT NOT NULL, repository TEXT NOT NULL, revision TEXT NOT NULL, version TEXT NOT NULL,
       PRIMARY KEY (package, repository, revision, version)
     )`);
@@ -96,19 +97,20 @@ export class ModReleases {
     ).toArray()[0];
     if (existing) return existing.release === encoded;
     this.sql.exec("INSERT INTO mod_releases (package, version, release) VALUES (?, ?, ?)", m.package, m.version, encoded);
-    for (const revision of m.host.supported_revisions) {
-      this.sql.exec("INSERT INTO mod_release_hosts (package, repository, revision, version) VALUES (?, ?, ?, ?)",
-        m.package, m.host.repository, revision, m.version);
-    }
+    const revision = m.host.api_revision;
+    this.sql.exec("INSERT INTO mod_release_apis (package, repository, revision, version) VALUES (?, ?, ?, ?)",
+      m.package, m.host.repository, revision, m.version);
     return true;
   }
 
-  /** Selects the highest newer stable version supporting this exact host, without a fallback. */
+  /** Selects the highest newer stable version supporting this API generation, without a fallback. */
   update(query: ModUpdateQuery & { package: string; host_repository: string }): ModRelease | null {
+    const revisions = query.api_revisions.split(",");
+    const placeholders = revisions.map(() => "?").join(",");
     const rows = this.sql.exec<{ release: string }>(`SELECT r.release FROM mod_releases r
-      JOIN mod_release_hosts h ON h.package = r.package AND h.version = r.version
-      WHERE h.package = ? AND h.repository = ? AND h.revision = ?`,
-    query.package, query.host_repository, query.host_revision);
+      JOIN mod_release_apis h ON h.package = r.package AND h.version = r.version
+      WHERE h.package = ? AND h.repository = ? AND h.revision IN (${placeholders})`,
+    query.package, query.host_repository, ...revisions);
     let best: ModRelease | null = null;
     for (const row of rows) {
       const candidate = JSON.parse(row.release) as ModRelease;

@@ -16,7 +16,7 @@ messages against it.
 | `GET /v1/presence/history?range=24h` | Public anonymous player-count history. Ranges: `24h` (one minute), `7d` (ten minutes), `30d` (one hour). Allows cross-origin reads and caching for 60 seconds. |
 | `POST /v1/releases` | Release hook. `Authorization: Bearer <RELEASE_HOOK_SECRET>`, body `{"channel","version","build"}`; records and broadcasts only a newer (version, build) pair. Repeats and older records are no-ops. Omitted v1 builds mean zero. |
 | `POST /v1/mod/releases` | Requires a dedicated `MOD_RELEASE_HOOK_SECRET` bearer credential; the native release-hook credential is rejected. Publishes `{manifest, download_url}` for an immutable stable mod version. Identical retries return 204; changed metadata for that package/version returns 409. |
-| `GET /v1/mod/update` | Requires full `host_revision`, installed `current_version` and full `current_revision`; the official package and host repository are fixed server-side. Returns 200 with the newest newer compatible stable release or 204 with no body. Invalid or missing identities return 400. Responses are not cached. |
+| `GET /v1/mod/update` | Requires full `host_revision` and comma-separated supported `api_revisions`, installed `current_version` and full `current_revision`; the official package and host repository are fixed server-side. Returns 200 with the newest newer compatible stable release or 204 with no body. Invalid or missing identities return 400. Responses are not cached. |
 | `GET /v1/connect` | WebSocket. The client authenticates with a Minecraft multiplayer token plus an ES384 proof of its key, then can toggle visibility, look up which XUIDs or UUIDs recently used Cinnabar, and receives release pushes. |
 
 Public GET responses use the Cloudflare Cache API with lifetimes declared beside each route:
@@ -79,20 +79,26 @@ so reconnecting clients supply their signed identity again.
   accounts that have not authenticated since deployment cannot be inferred from past online samples.
 Mod release metadata is public and retained across deployments. The schema version 1
 manifest declares `package`, stable `version`, mod source `revision`,
-`host: {repository, supported_revisions}`, and `artifact: {filename, size, sha256}`.
+`host: {repository, revision, api_revision}`, and `artifact: {filename, size, sha256}`.
 The hook also supplies an HTTPS `download_url` without embedded credentials. The API
 does not fetch the publisher's URL or execute the artifact. The hook body is bounded
-to 16 KiB; manifests support at most 128 full host commit hashes and a 256 MiB artifact.
+to 16 KiB; manifests describe one stable mod API generation and at most a 256 MiB artifact.
 Only stable mod versions are currently supported; prereleases are rejected.
 
-Selection uses exact host repository and commit equality, then numeric semantic version
-precedence. It never infers compatibility from Git ancestry or hash ordering, returns
-the installed mod revision again, or downgrades the installed version. Releases for
-other host commits remain stored, so publishing for a new native build does not
-replace updates offered to older installations. Unknown commits and packages receive
-no update. A successful lookup returns the manifest and download URL; a generic native
-updater must verify size and digest, preserve settings and registration, install
-atomically and recover on load failure. Publishing metadata does not enable installation.
+Selection matches the server-configured host repository and the native build's supported
+mod API compatibility revisions, then numeric semantic version precedence. The native
+build's source commit is required but does not have to equal the mod's build pin.
+New native commits retaining support for the mod's API revision receive compatible
+updates without a build-pin change. Unsupported API revisions receive no update. The manifest records both
+the native commit used for the mod build and its stable API generation.
+
+The host lists supported API revisions. Unrelated releases keep the same list; new
+capabilities append a revision while retaining older entries; breaking changes remove
+revisions that are no longer supported. A mod using a new capability requires its new
+API revision, so older hosts keep their last compatible release.
+No Git ancestry or commit ordering is assumed. Selection never repeats the installed
+mod revision or downgrades the installed version. The native updater must verify the
+selected API revision is supported, identity, size and digest before atomic installation.
 
 Deploy this API support before configuring publishers to call the hook. A publisher
 must upload its release artifact before registering the matching metadata. Changing
