@@ -128,6 +128,17 @@ app.get("/v1/mod/assets/:hash", async (c) => {
   return downloadModAsset(hash, await hubFor(c.env).modAssetSize(hash), c.env.MOD_ASSETS);
 });
 
+app.get("/v1/mod/download", async (c) => {
+  c.header("Cache-Control", "no-store");
+  const release = await hubFor(c.env).latestModRelease();
+  if (!release) return c.body(null, 404);
+  const artifact = release.manifest.artifact;
+  const response = await downloadModAsset(artifact.sha256, artifact.size, c.env.MOD_ASSETS);
+  response.headers.set("Cache-Control", "no-store");
+  if (response.ok) response.headers.set("Content-Disposition", `attachment; filename="${artifact.filename}"`);
+  return response;
+});
+
 app.get("/v1/mod/update", async (c) => {
   c.header("Cache-Control", "no-store");
   const query = { api_revisions: c.req.query("api_revisions") ?? "", host_revision: c.req.query("host_revision") ?? "", current_version: c.req.query("current_version") ?? "", current_revision: c.req.query("current_revision") ?? "" };
