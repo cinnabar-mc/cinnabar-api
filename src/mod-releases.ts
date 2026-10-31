@@ -85,6 +85,7 @@ export class ModReleases {
       package TEXT NOT NULL, repository TEXT NOT NULL, revision TEXT NOT NULL, version TEXT NOT NULL,
       PRIMARY KEY (package, repository, revision, version)
     )`);
+    sql.exec("CREATE TABLE IF NOT EXISTS mod_release_assets (sha256 TEXT PRIMARY KEY, size INTEGER NOT NULL)");
   }
 
   /** Stores an immutable version, accepts retries, and rejects changed metadata for that version. */
@@ -100,6 +101,7 @@ export class ModReleases {
     const revision = m.host.api_revision;
     this.sql.exec("INSERT INTO mod_release_apis (package, repository, revision, version) VALUES (?, ?, ?, ?)",
       m.package, m.host.repository, revision, m.version);
+    this.sql.exec("INSERT OR IGNORE INTO mod_release_assets (sha256, size) VALUES (?, ?)", m.artifact.sha256, m.artifact.size);
     return true;
   }
 
@@ -119,5 +121,10 @@ export class ModReleases {
       if (!best || compareVersions(m.version, best.manifest.version) > 0) best = candidate;
     }
     return best;
+  }
+
+  /** Authorizes public reads only after release publication committed successfully. */
+  assetSize(hash: string): number | null {
+    return this.sql.exec<{ size: number }>("SELECT size FROM mod_release_assets WHERE sha256 = ?", hash).toArray()[0]?.size ?? null;
   }
 }
