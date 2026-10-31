@@ -99,7 +99,7 @@ app.delete("/v1/cosmetics/login-rewards", async (c) => {
   return result === null ? c.body(null, 400) : c.json(result);
 });
 
-app.post("/v1/mods/releases", async (c) => {
+app.post("/v1/mod/releases", async (c) => {
   if (!(await bearerMatches(c.req.header("Authorization"), c.env.MOD_RELEASE_HOOK_SECRET))) return c.body(null, 401);
   const limit = 16 * 1024;
   if (!(Number(c.req.header("Content-Length") ?? 0) <= limit)) return c.body(null, 400);
@@ -108,13 +108,13 @@ app.post("/v1/mods/releases", async (c) => {
   let body: unknown;
   try { body = JSON.parse(text); } catch { return c.body(null, 400); }
   if (!isModRelease(body)) return c.body(null, 400);
-  if (!publisherAllows(body, c.env.MOD_RELEASE_REPOSITORY, c.env.MOD_RELEASE_PACKAGES)) return c.body(null, 403);
+  if (!publisherAllows(body, c.env.MOD_RELEASE_REPOSITORY, c.env.MOD_RELEASE_PACKAGE, c.env.MOD_HOST_REPOSITORY)) return c.body(null, 403);
   return c.body(null, await hubFor(c.env).publishModRelease(body) ? 204 : 409);
 });
 
-app.get("/v1/mods/:package/update", async (c) => {
+app.get("/v1/mod/update", async (c) => {
   c.header("Cache-Control", "no-store");
-  const query = { ...c.req.query(), package: c.req.param("package") };
+  const query = { host_revision: c.req.query("host_revision"), current_version: c.req.query("current_version"), current_revision: c.req.query("current_revision") };
   if (!isModUpdateQuery(query)) return c.body(null, 400);
   const release = await hubFor(c.env).modUpdate(query);
   return release ? c.json(release) : c.body(null, 204);

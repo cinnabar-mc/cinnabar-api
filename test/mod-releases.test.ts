@@ -23,7 +23,7 @@ function release(version = "1.0.0", host = HOST_A, revision = "1".repeat(40)): M
 
 /** Exercises the authenticated HTTP publication boundary. */
 function publish(body: unknown, secret: string | null = "test-mod-hook-secret"): Promise<Response> {
-  return exports.default.fetch("https://api.test/v1/mods/releases", {
+  return exports.default.fetch("https://api.test/v1/mod/releases", {
     method: "POST",
     headers: secret === null ? {} : { Authorization: `Bearer ${secret}` },
     body: typeof body === "string" ? body : JSON.stringify(body),
@@ -33,10 +33,10 @@ function publish(body: unknown, secret: string | null = "test-mod-hook-secret"):
 /** Requests an update from an exact host and installed mod identity. */
 function update(overrides: Partial<ModUpdateQuery> = {}): Promise<Response> {
   const query = new URLSearchParams({
-    host_repository: REPOSITORY, host_revision: HOST_A,
+    host_revision: HOST_A,
     current_version: "0.1.0", current_revision: "0".repeat(40), ...overrides,
   });
-  return exports.default.fetch(`https://api.test/v1/mods/${PACKAGE}/update?${query}`);
+  return exports.default.fetch(`https://api.test/v1/mod/update?${query}`);
 }
 
 beforeEach(async () => {
@@ -63,15 +63,9 @@ describe("revision-aware mod releases", () => {
     expect(await (await update()).json()).toEqual(release("1.10.0", HOST_A, "1a10a0".padEnd(40, "0")));
   });
 
-  it("never falls back across unknown revisions, repositories or packages", async () => {
+  it("never falls back for unknown native revisions", async () => {
     await publish(release());
-    for (const query of [{ host_revision: HOST_B }, { host_repository: "https://example.com/other.git" }]) {
-      expect((await update(query)).status).toBe(204);
-    }
-    const response = await exports.default.fetch(`https://api.test/v1/mods/unknown/update?${new URLSearchParams({
-      host_repository: REPOSITORY, host_revision: HOST_A, current_version: "0.1.0", current_revision: "0".repeat(40),
-    })}`);
-    expect(response.status).toBe(204);
+    expect((await update({ host_revision: HOST_B })).status).toBe(204);
     expect((await update()).headers.get("Cache-Control")).toBe("no-store");
   });
 
@@ -109,6 +103,7 @@ describe("revision-aware mod releases", () => {
   it("restricts publishing to the configured repository and packages", async () => {
     for (const mutate of [
       (r: ModRelease) => { r.manifest.package = "other-mod"; },
+      (r: ModRelease) => { r.manifest.host.repository = "https://example.com/other.git"; },
       (r: ModRelease) => { r.download_url = r.download_url.replace("example/mod", "other/mod"); },
       (r: ModRelease) => { r.download_url = r.download_url.replace("/v1.0.0/", "/latest/"); },
     ]) {
@@ -137,6 +132,6 @@ describe("revision-aware mod releases", () => {
     for (const overrides of [{ host_revision: "abcdef0" }, { current_version: "" }, { current_revision: "" }]) {
       expect((await update(overrides)).status).toBe(400);
     }
-    expect((await exports.default.fetch(`https://api.test/v1/mods/${PACKAGE}/update`)).status).toBe(400);
+    expect((await exports.default.fetch(`https://api.test/v1/mod/update`)).status).toBe(400);
   });
 });

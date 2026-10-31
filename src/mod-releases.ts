@@ -15,8 +15,6 @@ export interface ModRelease {
 }
 
 export interface ModUpdateQuery {
-  package: string;
-  host_repository: string;
   host_revision: string;
   current_version: string;
   current_revision: string;
@@ -49,9 +47,10 @@ export function isModRelease(value: unknown): value is ModRelease {
 }
 
 /** Restricts this publisher to configured packages and immutable assets in its own repository. */
-export function publisherAllows(release: ModRelease, repository?: string, packages?: string): boolean {
+export function publisherAllows(release: ModRelease, repository?: string, packageName?: string, hostRepository?: string): boolean {
   const m = release.manifest;
-  return !!repository && !!packages?.split(",").includes(m.package)
+  return !!repository && m.package === packageName
+    && !!hostRepository && m.host.repository === hostRepository
     && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)
     && release.download_url === `https://github.com/${repository}/releases/download/v${m.version}/${m.artifact.filename}`;
 }
@@ -105,7 +104,7 @@ export class ModReleases {
   }
 
   /** Selects the highest newer stable version supporting this exact host, without a fallback. */
-  update(query: ModUpdateQuery): ModRelease | null {
+  update(query: ModUpdateQuery & { package: string; host_repository: string }): ModRelease | null {
     const rows = this.sql.exec<{ release: string }>(`SELECT r.release FROM mod_releases r
       JOIN mod_release_hosts h ON h.package = r.package AND h.version = r.version
       WHERE h.package = ? AND h.repository = ? AND h.revision = ?`,

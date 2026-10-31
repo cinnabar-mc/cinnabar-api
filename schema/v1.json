@@ -1298,19 +1298,11 @@
     "ModUpdateQuery": {
       "type": "object",
       "required": [
-        "package",
-        "host_repository",
         "host_revision",
         "current_version",
         "current_revision"
       ],
       "properties": {
-        "package": {
-          "$ref": "#/$defs/ModPackage"
-        },
-        "host_repository": {
-          "$ref": "#/$defs/ModHostRepository"
-        },
         "host_revision": {
           "$ref": "#/$defs/GitRevision"
         },

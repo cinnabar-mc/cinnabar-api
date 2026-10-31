@@ -11,7 +11,8 @@
   "observability": { "enabled": false },
   "vars": {
     "MOD_RELEASE_REPOSITORY": "cinnabar-mc/cinnabar-client",
-    "MOD_RELEASE_PACKAGES": "cinnabar-client-mod",
+    "MOD_RELEASE_PACKAGE": "cinnabar-client-mod",
+    "MOD_HOST_REPOSITORY": "https://github.com/cinnabar-mc/cinnabar.git",
     "COSMETICS_REPOSITORY_ID": "1426158837",
     "COSMETICS_ADMIN_WORKFLOW": "cinnabar-mc/cinnabar-cosmetics/.github/workflows/entitlements.yml@refs/heads/main",
     // The authorization service's OIDC issuer for Minecraft multiplayer tokens.

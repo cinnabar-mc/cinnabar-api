@@ -15,8 +15,8 @@ messages against it.
 | `GET /v1/presence/players` | Private `{"names":[]}` list of verified names for those same online accounts. Requires a bearer token matching the `PRESENCE_READ_SECRET` Worker secret; never cached or exposed through CORS. |
 | `GET /v1/presence/history?range=24h` | Public anonymous player-count history. Ranges: `24h` (one minute), `7d` (ten minutes), `30d` (one hour). Allows cross-origin reads and caching for 60 seconds. |
 | `POST /v1/releases` | Release hook. `Authorization: Bearer <RELEASE_HOOK_SECRET>`, body `{"channel","version","build"}`; records and broadcasts only a newer (version, build) pair. Repeats and older records are no-ops. Omitted v1 builds mean zero. |
-| `POST /v1/mods/releases` | Requires a dedicated `MOD_RELEASE_HOOK_SECRET` bearer credential; the native release-hook credential is rejected. Publishes `{manifest, download_url}` for an immutable stable mod version. Identical retries return 204; changed metadata for that package/version returns 409. |
-| `GET /v1/mods/:package/update` | Requires `host_repository`, full `host_revision`, installed `current_version` and full `current_revision`. Returns 200 with the newest newer compatible stable release or 204 with no body. Invalid or missing identities return 400. Responses are not cached. |
+| `POST /v1/mod/releases` | Requires a dedicated `MOD_RELEASE_HOOK_SECRET` bearer credential; the native release-hook credential is rejected. Publishes `{manifest, download_url}` for an immutable stable mod version. Identical retries return 204; changed metadata for that package/version returns 409. |
+| `GET /v1/mod/update` | Requires full `host_revision`, installed `current_version` and full `current_revision`; the official package and host repository are fixed server-side. Returns 200 with the newest newer compatible stable release or 204 with no body. Invalid or missing identities return 400. Responses are not cached. |
 | `GET /v1/connect` | WebSocket. The client authenticates with a Minecraft multiplayer token plus an ES384 proof of its key, then can toggle visibility, look up which XUIDs or UUIDs recently used Cinnabar, and receives release pushes. |
 
 Public GET responses use the Cloudflare Cache API with lifetimes declared beside each route:
@@ -99,8 +99,8 @@ must upload its release artifact before registering the matching metadata. Chang
 bytes or compatibility metadata requires a new package version. Keep downloads for
 previously published versions available. Configure publisher credentials through its
 secret store, using the same value as this Worker's `MOD_RELEASE_HOOK_SECRET`.
-The configured `MOD_RELEASE_REPOSITORY` and comma-separated `MOD_RELEASE_PACKAGES`
-restrict that credential to its repository, packages and immutable versioned GitHub
+The configured `MOD_RELEASE_REPOSITORY` and `MOD_RELEASE_PACKAGE`
+restrict that credential to its repository and package and immutable versioned GitHub
 asset URLs. Deployments install the dedicated secret from the protected production
 environment; missing secrets disable publication. The publishing repository should
 keep its matching credential in a release environment restricted to release refs.

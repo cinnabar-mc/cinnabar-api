@@ -230,7 +230,7 @@ export class Hub extends DurableObject<Env> {
 
   /** Resolves only a newer mod compatible with the installed native commit. */
   modUpdate(query: ModUpdateQuery): ModRelease | null {
-    return this.mods.update(query);
+    return this.mods.update({ ...query, package: this.env.MOD_RELEASE_PACKAGE ?? "", host_repository: this.env.MOD_HOST_REPOSITORY ?? "" });
   }
 
   async latestRelease(channel: Channel): Promise<ReleaseRecord | null> {
