@@ -78,6 +78,52 @@ describe("revision-aware mod releases", () => {
     expect((await upload()).status).toBe(204);
   });
 
+  it("downloads the newest stable mod without a hash, credentials or installed identity", async () => {
+    const url = "https://api.test/v1/mod/download";
+    const empty = await exports.default.fetch(url);
+    expect(empty.status).toBe(404);
+    expect(empty.headers.get("Cache-Control")).toBe("no-store");
+    const latestBytes = BYTES.slice(); latestBytes[255] = 10;
+    const latestHash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", latestBytes))]
+      .map((b) => b.toString(16).padStart(2, "0")).join("");
+    await env.MOD_ASSETS.put(`mod-releases/${latestHash}`, latestBytes, { customMetadata: { sha256: latestHash } });
+    for (const version of ["1.10.0", "1.2.0", "1.9.0"]) {
+      const body = release(version);
+      if (version === "1.10.0") body.manifest.artifact.sha256 = latestHash;
+      expect((await publish(body)).status).toBe(204);
+    }
+    await evictDurableObject(hub());
+    const response = await exports.default.fetch(url);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Content-Type")).toBe("application/wasm");
+    expect(response.headers.get("Content-Disposition")).toBe('attachment; filename="Example.wasm"');
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(latestBytes);
+    expect((await hub().latestModRelease())?.manifest.version).toBe("1.10.0");
+    const immutable = await exports.default.fetch(`https://api.test/v1/mod/assets/${HASH}`);
+    expect(immutable.headers.get("Cache-Control")).toContain("immutable");
+    await immutable.arrayBuffer();
+  });
+
+  it("restricts the initial download to the configured package and host repository", async () => {
+    const official = release();
+    const otherPackage = release("9.0.0"); otherPackage.manifest.package = "other-mod";
+    const otherHost = release("8.0.0"); otherHost.manifest.host.repository = "https://example.com/other.git";
+    for (const body of [official, otherPackage, otherHost]) await hub().publishModRelease(body);
+    expect(await hub().latestModRelease()).toEqual(official);
+  });
+
+  it("advances the first-install download across API generations and keeps compatibility updates scoped", async () => {
+    await publish(release());
+    await publish(release("2.0.0", HOST_B, "2".repeat(40)));
+    expect((await hub().latestModRelease())?.manifest.version).toBe("2.0.0");
+    expect(await (await update()).json()).toEqual(served(release()));
+    await env.MOD_ASSETS.delete(`mod-releases/${HASH}`);
+    const response = await exports.default.fetch("https://api.test/v1/mod/download");
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+  });
+
   it("rejects corrupt, non-component and oversized uploads before publication", async () => {
     const url = `https://api.test/v1/mod/assets/${HASH}`;
     const headers = { Authorization: "Bearer test-mod-hook-secret" };

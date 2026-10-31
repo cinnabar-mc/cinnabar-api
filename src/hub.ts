@@ -233,6 +233,11 @@ export class Hub extends DurableObject<Env> {
     return this.mods.update({ ...query, package: this.env.MOD_RELEASE_PACKAGE ?? "", host_repository: this.env.MOD_HOST_REPOSITORY ?? "" });
   }
 
+  /** Resolves the newest official stable mod for a first installation. */
+  latestModRelease(): ModRelease | null {
+    return this.mods.latest(this.env.MOD_RELEASE_PACKAGE ?? "", this.env.MOD_HOST_REPOSITORY ?? "");
+  }
+
   /** Returns the expected byte count only for an artifact belonging to a published release. */
   modAssetSize(hash: string): number | null { return this.mods.assetSize(hash); }
 

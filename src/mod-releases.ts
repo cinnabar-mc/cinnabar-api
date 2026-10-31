@@ -123,6 +123,20 @@ export class ModReleases {
     return best;
   }
 
+  /** Selects the highest published stable version for a first installation. */
+  latest(packageName: string, hostRepository: string): ModRelease | null {
+    const rows = this.sql.exec<{ release: string }>(
+      "SELECT release FROM mod_releases WHERE package = ?", packageName,
+    );
+    let best: ModRelease | null = null;
+    for (const row of rows) {
+      const candidate = JSON.parse(row.release) as ModRelease;
+      if (candidate.manifest.host.repository !== hostRepository) continue;
+      if (!best || compareVersions(candidate.manifest.version, best.manifest.version) > 0) best = candidate;
+    }
+    return best;
+  }
+
   /** Authorizes public reads only after release publication committed successfully. */
   assetSize(hash: string): number | null {
     return this.sql.exec<{ size: number }>("SELECT size FROM mod_release_assets WHERE sha256 = ?", hash).toArray()[0]?.size ?? null;
