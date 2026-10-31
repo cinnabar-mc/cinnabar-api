@@ -4,6 +4,7 @@ import { Hono } from "hono";
 import { publicCache } from "./public-cache";
 import { count } from "./metrics";
 import { isModRelease, isModUpdateQuery, publisherAllows } from "./mod-releases";
+import { modAssetKey, uploadModAsset, downloadModAsset } from "./mod-assets";
 import { isReleaseHookRequest } from "./protocol";
 import { hubFor } from "./routing";
 import { DEFAULT_HISTORY_RANGE, HISTORY_RANGES, loadHistory, snapshotHistory, type HistoryRange } from "./history-snapshot";
@@ -109,7 +110,22 @@ app.post("/v1/mod/releases", async (c) => {
   try { body = JSON.parse(text); } catch { return c.body(null, 400); }
   if (!isModRelease(body)) return c.body(null, 400);
   if (!publisherAllows(body, c.env.MOD_RELEASE_REPOSITORY, c.env.MOD_RELEASE_PACKAGE, c.env.MOD_HOST_REPOSITORY)) return c.body(null, 403);
+  const asset = body.manifest.artifact;
+  const object = await c.env.MOD_ASSETS.head(modAssetKey(asset.sha256));
+  if (!object || object.size !== asset.size || object.customMetadata?.sha256 !== asset.sha256) return c.body(null, 409);
+  body.download_url = `${c.env.MOD_DOWNLOAD_BASE_URL}/v1/mod/assets/${asset.sha256}`;
   return c.body(null, await hubFor(c.env).publishModRelease(body) ? 204 : 409);
+});
+
+app.put("/v1/mod/assets/:hash", async (c) => {
+  if (!(await bearerMatches(c.req.header("Authorization"), c.env.MOD_RELEASE_HOOK_SECRET))) return c.body(null, 401);
+  return uploadModAsset(c.req.raw, c.req.param("hash"), c.env.MOD_ASSETS);
+});
+
+app.get("/v1/mod/assets/:hash", async (c) => {
+  const hash = c.req.param("hash");
+  if (!/^[0-9a-f]{64}$/.test(hash)) return c.body(null, 404);
+  return downloadModAsset(hash, await hubFor(c.env).modAssetSize(hash), c.env.MOD_ASSETS);
 });
 
 app.get("/v1/mod/update", async (c) => {

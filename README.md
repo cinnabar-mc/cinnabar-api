@@ -16,6 +16,8 @@ messages against it.
 | `GET /v1/presence/history?range=24h` | Public anonymous player-count history. Ranges: `24h` (one minute), `7d` (ten minutes), `30d` (one hour). Allows cross-origin reads and caching for 60 seconds. |
 | `POST /v1/releases` | Release hook. `Authorization: Bearer <RELEASE_HOOK_SECRET>`, body `{"channel","version","build"}`; records and broadcasts only a newer (version, build) pair. Repeats and older records are no-ops. Omitted v1 builds mean zero. |
 | `POST /v1/mod/releases` | Requires a dedicated `MOD_RELEASE_HOOK_SECRET` bearer credential; the native release-hook credential is rejected. Publishes `{manifest, download_url}` for an immutable stable mod version. Identical retries return 204; changed metadata for that package/version returns 409. |
+| `PUT /v1/mod/assets/:sha256` | Dedicated mod-publisher bearer credential required. Verifies the component header, SHA-256 and 32 MiB limit before storing it under its content hash. Uploading alone does not publish it. |
+| `GET /v1/mod/assets/:sha256` | Anonymous immutable WASM download, available only after metadata publication. Never exposes the private source repository or an upload credential. |
 | `GET /v1/mod/update` | Requires full `host_revision` and comma-separated supported `api_revisions`, installed `current_version` and full `current_revision`; the official package and host repository are fixed server-side. Returns 200 with the newest newer compatible stable release or 204 with no body. Invalid or missing identities return 400. Responses are not cached. |
 | `GET /v1/connect` | WebSocket. The client authenticates with a Minecraft multiplayer token plus an ES384 proof of its key, then can toggle visibility, look up which XUIDs or UUIDs recently used Cinnabar, and receives release pushes. |
 
@@ -82,7 +84,7 @@ manifest declares `package`, stable `version`, mod source `revision`,
 `host: {repository, revision, api_revision}`, and `artifact: {filename, size, sha256}`.
 The hook also supplies an HTTPS `download_url` without embedded credentials. The API
 does not fetch the publisher's URL or execute the artifact. The hook body is bounded
-to 16 KiB; manifests describe one stable mod API generation and at most a 256 MiB artifact.
+to 16 KiB; manifests describe one stable mod API generation and at most a 32 MiB artifact.
 Only stable mod versions are currently supported; prereleases are rejected.
 
 Selection matches the server-configured host repository and the native build's supported
@@ -329,3 +331,12 @@ and the number of observations (`samples`). `to` identifies the published observ
 can lag while publication is unavailable. The current bucket can be incomplete. Missing buckets
 are omitted and must be shown as gaps, not zero. Averages and peaks cover observed minutes only;
 a minute sample is not a record of every join and departure.
+
+Mod release binaries use the `MOD_ASSETS` R2 binding and the isolated
+`mod-releases/` prefix. The binding currently shares the existing asset bucket;
+cosmetics keys and catalogue behavior are unchanged. Uploads require the dedicated
+publisher credential, validate the actual bytes, and remain unavailable to public
+GET requests until a release record commits. Metadata publication refuses absent
+or size-mismatched objects and replaces the archive URL with the canonical API asset
+URL. This permits anonymous native downloads while the source repository stays
+private. Keep the GitHub URL in the publication request as publisher-scope evidence.

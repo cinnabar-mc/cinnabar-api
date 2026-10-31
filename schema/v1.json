@@ -1266,7 +1266,7 @@
             "size": {
               "type": "integer",
               "minimum": 8,
-              "maximum": 268435456
+              "maximum": 33554432
             },
             "sha256": {
               "type": "string",
