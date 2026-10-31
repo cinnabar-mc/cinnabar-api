@@ -3,6 +3,7 @@ import { authorizePublisher, entitlementCommand, loginRewardCommand } from "./co
 import { Hono } from "hono";
 import { publicCache } from "./public-cache";
 import { count } from "./metrics";
+import { isModRelease, isModUpdateQuery, publisherAllows } from "./mod-releases";
 import { isReleaseHookRequest } from "./protocol";
 import { hubFor } from "./routing";
 import { DEFAULT_HISTORY_RANGE, HISTORY_RANGES, loadHistory, snapshotHistory, type HistoryRange } from "./history-snapshot";
@@ -96,6 +97,27 @@ app.delete("/v1/cosmetics/login-rewards", async (c) => {
   if (!command) return c.body(null, 400);
   const result = await hubFor(c.env).stopLoginReward(command.item_id);
   return result === null ? c.body(null, 400) : c.json(result);
+});
+
+app.post("/v1/mods/releases", async (c) => {
+  if (!(await bearerMatches(c.req.header("Authorization"), c.env.MOD_RELEASE_HOOK_SECRET))) return c.body(null, 401);
+  const limit = 16 * 1024;
+  if (!(Number(c.req.header("Content-Length") ?? 0) <= limit)) return c.body(null, 400);
+  const text = await readBounded(c.req.raw.body, limit);
+  if (text === null) return c.body(null, 400);
+  let body: unknown;
+  try { body = JSON.parse(text); } catch { return c.body(null, 400); }
+  if (!isModRelease(body)) return c.body(null, 400);
+  if (!publisherAllows(body, c.env.MOD_RELEASE_REPOSITORY, c.env.MOD_RELEASE_PACKAGES)) return c.body(null, 403);
+  return c.body(null, await hubFor(c.env).publishModRelease(body) ? 204 : 409);
+});
+
+app.get("/v1/mods/:package/update", async (c) => {
+  c.header("Cache-Control", "no-store");
+  const query = { ...c.req.query(), package: c.req.param("package") };
+  if (!isModUpdateQuery(query)) return c.body(null, 400);
+  const release = await hubFor(c.env).modUpdate(query);
+  return release ? c.json(release) : c.body(null, 204);
 });
 
 app.post("/v1/releases", async (c) => {

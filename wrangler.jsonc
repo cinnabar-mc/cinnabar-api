@@ -10,6 +10,8 @@
   // Invocation logs would record request metadata such as client IPs, which the API promises not to keep.
   "observability": { "enabled": false },
   "vars": {
+    "MOD_RELEASE_REPOSITORY": "cinnabar-mc/cinnabar-client",
+    "MOD_RELEASE_PACKAGES": "cinnabar-client-mod",
     "COSMETICS_REPOSITORY_ID": "1426158837",
     "COSMETICS_ADMIN_WORKFLOW": "cinnabar-mc/cinnabar-cosmetics/.github/workflows/entitlements.yml@refs/heads/main",
     // The authorization service's OIDC issuer for Minecraft multiplayer tokens.

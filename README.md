@@ -15,6 +15,8 @@ messages against it.
 | `GET /v1/presence/players` | Private `{"names":[]}` list of verified names for those same online accounts. Requires a bearer token matching the `PRESENCE_READ_SECRET` Worker secret; never cached or exposed through CORS. |
 | `GET /v1/presence/history?range=24h` | Public anonymous player-count history. Ranges: `24h` (one minute), `7d` (ten minutes), `30d` (one hour). Allows cross-origin reads and caching for 60 seconds. |
 | `POST /v1/releases` | Release hook. `Authorization: Bearer <RELEASE_HOOK_SECRET>`, body `{"channel","version","build"}`; records and broadcasts only a newer (version, build) pair. Repeats and older records are no-ops. Omitted v1 builds mean zero. |
+| `POST /v1/mods/releases` | Requires a dedicated `MOD_RELEASE_HOOK_SECRET` bearer credential; the native release-hook credential is rejected. Publishes `{manifest, download_url}` for an immutable stable mod version. Identical retries return 204; changed metadata for that package/version returns 409. |
+| `GET /v1/mods/:package/update` | Requires `host_repository`, full `host_revision`, installed `current_version` and full `current_revision`. Returns 200 with the newest newer compatible stable release or 204 with no body. Invalid or missing identities return 400. Responses are not cached. |
 | `GET /v1/connect` | WebSocket. The client authenticates with a Minecraft multiplayer token plus an ES384 proof of its key, then can toggle visibility, look up which XUIDs or UUIDs recently used Cinnabar, and receives release pushes. |
 
 Public GET responses use the Cloudflare Cache API with lifetimes declared beside each route:
@@ -75,6 +77,33 @@ so reconnecting clients supply their signed identity again.
   activity timestamps or IP addresses. Visibility controls presence; it does not opt out of this
   aggregate. Only the total is public. Existing sessions count on their next successful login;
   accounts that have not authenticated since deployment cannot be inferred from past online samples.
+Mod release metadata is public and retained across deployments. The schema version 1
+manifest declares `package`, stable `version`, mod source `revision`,
+`host: {repository, supported_revisions}`, and `artifact: {filename, size, sha256}`.
+The hook also supplies an HTTPS `download_url` without embedded credentials. The API
+does not fetch the publisher's URL or execute the artifact. The hook body is bounded
+to 16 KiB; manifests support at most 128 full host commit hashes and a 256 MiB artifact.
+Only stable mod versions are currently supported; prereleases are rejected.
+
+Selection uses exact host repository and commit equality, then numeric semantic version
+precedence. It never infers compatibility from Git ancestry or hash ordering, returns
+the installed mod revision again, or downgrades the installed version. Releases for
+other host commits remain stored, so publishing for a new native build does not
+replace updates offered to older installations. Unknown commits and packages receive
+no update. A successful lookup returns the manifest and download URL; a generic native
+updater must verify size and digest, preserve settings and registration, install
+atomically and recover on load failure. Publishing metadata does not enable installation.
+
+Deploy this API support before configuring publishers to call the hook. A publisher
+must upload its release artifact before registering the matching metadata. Changing
+bytes or compatibility metadata requires a new package version. Keep downloads for
+previously published versions available. Configure publisher credentials through its
+secret store, using the same value as this Worker's `MOD_RELEASE_HOOK_SECRET`.
+The configured `MOD_RELEASE_REPOSITORY` and comma-separated `MOD_RELEASE_PACKAGES`
+restrict that credential to its repository, packages and immutable versioned GitHub
+asset URLs. Deployments install the dedicated secret from the protected production
+environment; missing secrets disable publication. The publishing repository should
+keep its matching credential in a release environment restricted to release refs.
 
 - The public online count includes each visible connected account once, even with several sockets.
   Visibility off excludes that socket; an account counts while any of its fresh open sockets is visible.

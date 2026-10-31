@@ -1,6 +1,7 @@
 import { UniqueUsers } from "./unique-users";
 import { catalog, admitLoadout } from "./cosmetics";
 import { loadCatalog, type Catalog } from "./catalog-store";
+import { ModReleases, type ModRelease, type ModUpdateQuery } from "./mod-releases";
 import { DurableObject } from "cloudflare:workers";
 import { PresenceHistory } from "./presence-history";
 import { LoginRewards, type LoginReward } from "./login-rewards";
@@ -80,6 +81,7 @@ const releaseKey = (channel: Channel) => `release:${channel}`;
  * authenticated, so lookups and broadcasts go through in-memory indexes rebuilt from attachments on each wake.
  */
 export class Hub extends DurableObject<Env> {
+  private readonly mods: ModReleases;
   private readonly history: PresenceHistory;
   private readonly sessions = new Map<WebSocket, Attachment>();
   private readonly byXuid = new Map<string, Set<WebSocket>>();
@@ -106,6 +108,7 @@ export class Hub extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.history = new PresenceHistory(ctx.storage.sql, env.API_CACHE, env.METRICS);
+    this.mods = new ModReleases(ctx.storage.sql);
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS lookup_budgets (
       xuid TEXT PRIMARY KEY, tokens REAL NOT NULL, updated_at INTEGER NOT NULL
     )`);
@@ -218,6 +221,16 @@ export class Hub extends DurableObject<Env> {
       for (const ws of this.byChannel.get(channel) ?? []) send(ws, { type: "release", ...record });
     }
     return record;
+  }
+
+  /** Publishes all release metadata and compatibility indexes atomically. */
+  publishModRelease(release: ModRelease): boolean {
+    return this.ctx.storage.transactionSync(() => this.mods.publish(release));
+  }
+
+  /** Resolves only a newer mod compatible with the installed native commit. */
+  modUpdate(query: ModUpdateQuery): ModRelease | null {
+    return this.mods.update(query);
   }
 
   async latestRelease(channel: Channel): Promise<ReleaseRecord | null> {
