@@ -3,6 +3,13 @@ export const DOWNLOAD_COUNT_KEY = "downloads/count-v1.json";
 const REFRESH_MS = 15 * 60_000;
 const pending = new WeakMap<R2Bucket, Promise<number>>();
 
+/** Identifies upstream failures without exposing response bodies or cache diagnostics. */
+export class DownloadSourceError extends Error {
+  constructor(readonly code: "source_unavailable" | "source_rate_limited", readonly status: number) {
+    super(code);
+  }
+}
+
 /** Coalesces concurrent reads and shares a fifteen-minute GitHub aggregate through R2. */
 export function downloadCount(bucket: R2Bucket): Promise<number> {
   const existing = pending.get(bucket);
@@ -41,7 +48,9 @@ async function githubDownloads(): Promise<number> {
       headers: { Accept: "application/vnd.github+json", "User-Agent": "Cinnabar-API", "X-GitHub-Api-Version": "2022-11-28" },
       redirect: "error", signal,
     });
-    if (!response.ok) throw new Error("GitHub downloads unavailable");
+    if (!response.ok) throw new DownloadSourceError(
+      response.status === 403 || response.status === 429 ? "source_rate_limited" : "source_unavailable", response.status,
+    );
     const releases: unknown = await response.json();
     if (!Array.isArray(releases) || releases.length > 100) throw new Error("Invalid releases");
     for (const release of releases) {

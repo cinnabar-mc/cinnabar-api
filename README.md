@@ -357,3 +357,8 @@ Requests share a fifteen-minute snapshot in the existing `API_CACHE` R2 bucket,
 plus a five-minute edge cache. A refresh reads all GitHub release pages before
 replacing the snapshot; invalid responses, timeouts and rate limits return 503
 without publishing a partial count. No GitHub credential is required.
+
+Unavailable download totals include a bounded `code`: `source_rate_limited` for
+GitHub 403/429, `source_unavailable` for other upstream HTTP failures, or
+`count_unavailable` for other failures. Upstream HTTP failures also include
+`source_status`. Responses never include upstream bodies or raw error details.
