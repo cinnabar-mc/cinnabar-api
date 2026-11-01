@@ -25,14 +25,19 @@ async function request(query = "") {
 }
 
 it("counts installers and updates but excludes metadata, support files, drafts and unrelated releases", async () => {
-  const upstream = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json([
+  const upstream = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    // Validate fetch options in workerd even though the network response is synthetic.
+    const request = new Request(input, init);
+    expect(request.redirect).toBe("manual");
+    return Response.json([
     release("v0.1.0", [["client.apk", 10], ["client.dmg", 2], ["client.exe", 3], ["client.msi", 4],
       ["client.AppImage", 5], ["update-payload-abc-client.msi", 6], ["update-beta.json", 100],
       ["SHA256SUMS.txt", 100], ["install.sh", 100], ["debug.zip", 100]]),
     release("nightly", [["client.apk", 7]]),
     release("v0.2.0", [["client.apk", 500]], true),
     release("runtime-dependencies", [["client.apk", 500]]),
-  ]));
+    ]);
+  });
   const response = await request();
   expect(response.status).toBe(200);
   expect(await response.json()).toEqual({downloads: 37});
@@ -102,4 +107,15 @@ it("clears in-flight work after a timeout and recovers", async () => {
   expect(await failed.json()).toEqual({error: "download count unavailable", code: "count_unavailable"});
   upstream.mockResolvedValue(Response.json([]));
   expect((await request()).status).toBe(200);
+});
+
+it("rejects redirects without following them or publishing a snapshot", async () => {
+  const upstream = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, {
+    status: 302, headers: {Location: "https://other.invalid/releases"},
+  }));
+  const response = await request();
+  expect(response.status).toBe(503);
+  expect(await response.json()).toEqual({error: "download count unavailable", code: "source_unavailable", source_status: 302});
+  expect(upstream).toHaveBeenCalledTimes(1);
+  expect(await env.API_CACHE.get(DOWNLOAD_COUNT_KEY)).toBeNull();
 });
