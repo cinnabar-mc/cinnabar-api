@@ -46,7 +46,7 @@ async function githubDownloads(): Promise<number> {
   for (let page = 1; page <= 10; page++) {
     const response = await fetch(`${RELEASES_URL}?per_page=100&page=${page}`, {
       headers: { Accept: "application/vnd.github+json", "User-Agent": "Cinnabar-API", "X-GitHub-Api-Version": "2022-11-28" },
-      redirect: "error", signal,
+      redirect: "manual", signal,
     });
     if (!response.ok) throw new DownloadSourceError(
       response.status === 403 || response.status === 429 ? "source_rate_limited" : "source_unavailable", response.status,
