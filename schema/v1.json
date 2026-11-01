@@ -1317,6 +1317,21 @@
           "pattern": "^[0-9a-f]{40}(,[0-9a-f]{40}){0,31}$"
         }
       }
+    },
+    "DownloadCountResponse": {
+      "description": "GET /v1/downloads/count: installer and update-package downloads on published versioned releases and the current nightly. Counts repeat downloads; excludes metadata and support files. Deleted assets cannot be reconstructed.",
+      "type": "object",
+      "required": [
+        "downloads"
+      ],
+      "properties": {
+        "downloads": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "additionalProperties": true
     }
   }
 }

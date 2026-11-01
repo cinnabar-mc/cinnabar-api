@@ -2,6 +2,7 @@ import { catalogResponse, assetResponse, revalidateCatalog } from "./cosmetics";
 import { authorizePublisher, entitlementCommand, loginRewardCommand } from "./cosmetics-admin";
 import { Hono } from "hono";
 import { publicCache } from "./public-cache";
+import { downloadCount } from "./download-count";
 import { count } from "./metrics";
 import { isModRelease, isModUpdateQuery, publisherAllows } from "./mod-releases";
 import { modAssetKey, uploadModAsset, downloadModAsset } from "./mod-assets";
@@ -17,6 +18,15 @@ const app = new Hono<{ Bindings: Env }>();
 
 app.get("/v1/health", publicCache("public, max-age=60"),
   (c) => c.json({ ok: true, api: "v1" }));
+
+app.get("/v1/downloads/count", publicCache("public, max-age=300"), async (c) => {
+  c.header("Access-Control-Allow-Origin", "*");
+  try {
+    return c.json({ downloads: await downloadCount(c.env.API_CACHE) });
+  } catch {
+    return c.json({ error: "download count unavailable" }, 503, { "Retry-After": "60" });
+  }
+});
 
 app.get("/v1/presence/count", publicCache("public, max-age=30"), async (c) => {
   const online = await hubFor(c.env).onlineCount();
