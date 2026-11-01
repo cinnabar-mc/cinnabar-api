@@ -9,6 +9,7 @@ messages against it.
 
 | Route | Purpose |
 | --- | --- |
+| `GET /v1/downloads/count` | Public `{"downloads":0}` total of installer and update-package downloads from GitHub client releases. Allows cross-origin reads. |
 | `GET /v1/health` | `{"ok":true,"api":"v1"}` |
 | `GET /v1/presence/count` | Public `{"online":0}` count of unique connected, authenticated accounts with visibility on. Allows cross-origin reads and caching for 30 seconds. No identifiers or retained offline presence. |
 | `GET /v1/users/count` | Public `{"unique":0}` total of verified accounts since tracking was deployed. Deduplicates reconnects and devices, includes visibility-off accounts, and persists after disconnects and restarts. Allows cross-origin reads and caching for 60 seconds; no historical backfill. |
@@ -27,6 +28,7 @@ Public GET responses use the Cloudflare Cache API with lifetimes declared beside
 | Route | Cache lifetime |
 | --- | --- |
 | `/v1/health` | 60 seconds |
+| `/v1/downloads/count` | 300 seconds |
 | `/v1/presence/count` | 30 seconds |
 | `/v1/users/count` | 60 seconds |
 | `/v1/presence/history` | 60 seconds per supported range |
@@ -341,3 +343,17 @@ GET requests until a release record commits. Metadata publication refuses absent
 or size-mismatched objects and replaces the archive URL with the canonical API asset
 URL. This permits anonymous native downloads while the source repository stays
 private. Keep the GitHub URL in the publication request as publisher-scope evidence.
+
+### Release download count
+
+The download aggregate counts APK, DMG, EXE, MSI and AppImage assets, including
+automatic update packages, on published `v`-numbered releases and the current
+`nightly` release in the client repository. It excludes update manifests, checksums,
+install scripts, debug archives and assets on unrelated releases. Repeat downloads
+count; this is not a count of users or successful installations. Replaced or deleted
+assets, including previous nightly packages, cannot be reconstructed.
+
+Requests share a fifteen-minute snapshot in the existing `API_CACHE` R2 bucket,
+plus a five-minute edge cache. A refresh reads all GitHub release pages before
+replacing the snapshot; invalid responses, timeouts and rate limits return 503
+without publishing a partial count. No GitHub credential is required.
