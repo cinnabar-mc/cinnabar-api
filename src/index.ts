@@ -2,7 +2,7 @@ import { catalogResponse, assetResponse, revalidateCatalog } from "./cosmetics";
 import { authorizePublisher, entitlementCommand, loginRewardCommand } from "./cosmetics-admin";
 import { Hono } from "hono";
 import { publicCache } from "./public-cache";
-import { downloadCount } from "./download-count";
+import { downloadCount, DownloadSourceError } from "./download-count";
 import { count } from "./metrics";
 import { isModRelease, isModUpdateQuery, publisherAllows } from "./mod-releases";
 import { modAssetKey, uploadModAsset, downloadModAsset } from "./mod-assets";
@@ -23,8 +23,11 @@ app.get("/v1/downloads/count", publicCache("public, max-age=300"), async (c) => 
   c.header("Access-Control-Allow-Origin", "*");
   try {
     return c.json({ downloads: await downloadCount(c.env.API_CACHE) });
-  } catch {
-    return c.json({ error: "download count unavailable" }, 503, { "Retry-After": "60" });
+  } catch (error) {
+    return c.json({ error: "download count unavailable",
+      code: error instanceof DownloadSourceError ? error.code : "count_unavailable",
+      ...(error instanceof DownloadSourceError ? { source_status: error.status } : {}),
+    }, 503, { "Retry-After": "60" });
   }
 });
 

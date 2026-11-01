@@ -77,6 +77,7 @@ it("does not publish a partial total when later pages fail, and retries successf
     .mockResolvedValueOnce(new Response(null, {status: 403}));
   const failed = await request();
   expect(failed.status).toBe(503);
+  expect(await failed.json()).toEqual({error: "download count unavailable", code: "source_rate_limited", source_status: 403});
   expect(failed.headers.get("Access-Control-Allow-Origin")).toBe("*");
   expect(failed.headers.get("Retry-After")).toBe("60");
   expect(failed.headers.get("Cache-Control")).toBeNull();
@@ -96,7 +97,9 @@ it.each([null, {}, [{tag_name: "v1.0.0"}], [release("v1.0.0", [["client.apk", -1
 
 it("clears in-flight work after a timeout and recovers", async () => {
   const upstream = vi.spyOn(globalThis, "fetch").mockRejectedValue(new DOMException("timeout", "TimeoutError"));
-  expect((await request()).status).toBe(503);
+  const failed = await request();
+  expect(failed.status).toBe(503);
+  expect(await failed.json()).toEqual({error: "download count unavailable", code: "count_unavailable"});
   upstream.mockResolvedValue(Response.json([]));
   expect((await request()).status).toBe(200);
 });
