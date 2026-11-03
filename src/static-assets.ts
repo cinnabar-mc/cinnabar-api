@@ -1,6 +1,6 @@
 /** Canonical asset route; mirrored digests are served there without invoking the Worker. */
 export const STATIC_ASSET_PREFIX = "v1/cosmetics/assets/";
-/** Mirrored files carry extensions here, so Cloudflare derives each asset's Content-Type. */
+/** Backing files carry extensions here, so Cloudflare derives each asset's Content-Type. */
 export const STATIC_FILE_PREFIX = "cosmetic-files/";
 /** Workers static assets refuse larger files, so those stay on the Worker route. */
 export const STATIC_ASSET_MAX_BYTES = 25 * 1024 * 1024;
@@ -41,29 +41,41 @@ export function staticAssets(catalog: unknown): StaticAsset[] {
   return result;
 }
 
-/** Returns the mirrored file path below the static root. */
-export function staticFile(asset: StaticAsset): string {
-  return `${STATIC_FILE_PREFIX}${asset.sha256}.${asset.kind === "texture" ? "png" : "json"}`;
-}
+export interface StaticFile { asset: StaticAsset; path: string }
 
 /**
- * Builds `_headers` and `_redirects` for downloaded assets, returning only those that fit Cloudflare's rule limits.
- * One wildcard rule carries the most common license; each other asset needs its own rule.
+ * Places downloaded assets and builds their `_headers` and `_redirects`, keeping only what fits Cloudflare's rule limits.
+ * Backing files sit in one directory per license, so each directory needs one rule; canonical URLs share a wildcard rule
+ * for the most common license and need one rule per other asset.
  */
-export function staticRules(assets: readonly StaticAsset[]): { served: StaticAsset[]; headers: string; redirects: string } {
+export function staticRules(assets: readonly StaticAsset[]): { files: StaticFile[]; headers: string; redirects: string } {
   const candidates = assets.slice(0, MAX_STATIC_REDIRECTS);
   const counts = new Map<string, number>();
   for (const asset of candidates) counts.set(asset.license, (counts.get(asset.license) ?? 0) + 1);
   let common: string | undefined;
   for (const [license, count] of counts) if (common === undefined || count > counts.get(common)!) common = license;
-  const exceptions = candidates.filter((asset) => asset.license !== common).slice(0, MAX_HEADER_RULES - 1);
-  const served = candidates.filter((asset) => asset.license === common || exceptions.includes(asset));
-  const link = (license: string) => `  Link: <${license}>; rel="license"\n`;
-  let headers = `/${STATIC_ASSET_PREFIX}*\n  Cache-Control: ${IMMUTABLE}\n  X-Content-Type-Options: nosniff\n`;
-  if (common !== undefined) headers += link(common);
-  for (const asset of exceptions) headers += `/${STATIC_ASSET_PREFIX}${asset.sha256}\n  ! Link\n${link(asset.license)}`;
-  const redirects = served.map((asset) => `/${STATIC_ASSET_PREFIX}${asset.sha256} /${staticFile(asset)} 200\n`).join("");
-  return { served, headers, redirects };
+  const licenses = common === undefined ? [] : [common];
+  let rules = 1 + licenses.length;
+  const files: StaticFile[] = [];
+  for (const asset of candidates) {
+    let index = licenses.indexOf(asset.license);
+    if (asset.license !== common) {
+      const cost = index < 0 ? 2 : 1;
+      if (rules + cost > MAX_HEADER_RULES) continue;
+      rules += cost;
+      if (index < 0) index = licenses.push(asset.license) - 1;
+    }
+    files.push({ asset, path: `${STATIC_FILE_PREFIX}${index}/${asset.sha256}.${asset.kind === "texture" ? "png" : "json"}` });
+  }
+  const rule = (path: string, license?: string, detach = false) =>
+    `${path}\n${detach ? "  ! Link\n" : `  Cache-Control: ${IMMUTABLE}\n  X-Content-Type-Options: nosniff\n`}` +
+    (license === undefined ? "" : `  Link: <${license}>; rel="license"\n`);
+  let headers = rule(`/${STATIC_ASSET_PREFIX}*`, common);
+  headers += licenses.map((license, index) => rule(`/${STATIC_FILE_PREFIX}${index}/*`, license)).join("");
+  headers += files.filter(({ asset }) => asset.license !== common)
+    .map(({ asset }) => rule(`/${STATIC_ASSET_PREFIX}${asset.sha256}`, asset.license, true)).join("");
+  const redirects = files.map(({ asset, path }) => `/${STATIC_ASSET_PREFIX}${asset.sha256} /${path} 200\n`).join("");
+  return { files, headers, redirects };
 }
 
 /** True when the bytes are exactly the declared asset. */

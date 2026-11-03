@@ -2,8 +2,8 @@
 // Usage: node scripts/sync-static-assets.mjs [static-root]. Anything not mirrored stays on the Worker route.
 import { readFileSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { STATIC_ASSET_PREFIX, STATIC_FILE_PREFIX, staticAssets, staticFile, staticRules, verifiesAsset } from "../src/static-assets.ts";
+import { dirname, join } from "node:path";
+import { STATIC_ASSET_PREFIX, STATIC_FILE_PREFIX, staticAssets, staticRules, verifiesAsset } from "../src/static-assets.ts";
 
 // Well inside the deploy job's timeout, so a stalled origin delays the deploy instead of cancelling it.
 const BUDGET_MS = 5 * 60_000;
@@ -48,12 +48,13 @@ try {
   console.log(`::warning::Static cosmetic assets unavailable (${error.message}); the Worker serves them.`);
 }
 const rules = staticRules(downloaded.map(({ asset }) => asset));
-await mkdir(join(root, STATIC_FILE_PREFIX), { recursive: true });
-for (const { asset, bytes } of downloaded) {
-  if (rules.served.includes(asset)) await writeFile(join(root, staticFile(asset)), bytes);
+const bytesOf = new Map(downloaded.map(({ asset, bytes }) => [asset, bytes]));
+for (const { asset, path } of rules.files) {
+  await mkdir(dirname(join(root, path)), { recursive: true });
+  await writeFile(join(root, path), bytesOf.get(asset));
 }
 await writeFile(join(root, "_headers"), rules.headers);
 await writeFile(join(root, "_redirects"), rules.redirects);
-const unserved = skipped + downloaded.length - rules.served.length;
+const unserved = skipped + downloaded.length - rules.files.length;
 if (unserved) console.log(`::warning::${unserved} cosmetic assets stay on the Worker route (unverified, late or over rule limits).`);
-console.log(`Mirrored ${rules.served.length} cosmetic assets from ${origin}.`);
+console.log(`Mirrored ${rules.files.length} cosmetic assets from ${origin}.`);

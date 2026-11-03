@@ -1,7 +1,7 @@
 /// <reference types="vite/client" />
 import { describe, expect, it } from "vitest";
 import configText from "../wrangler.jsonc?raw";
-import { STATIC_ASSET_MAX_BYTES, STATIC_ASSET_PREFIX, staticAssets, staticFile, staticRules, verifiesAsset, type StaticAsset } from "../src/static-assets";
+import { STATIC_ASSET_MAX_BYTES, STATIC_ASSET_PREFIX, STATIC_FILE_PREFIX, staticAssets, staticRules, verifiesAsset, type StaticAsset } from "../src/static-assets";
 
 const LICENSE = "https://example.test/license";
 const sha = (fill: string) => fill.repeat(64);
@@ -37,32 +37,50 @@ describe("static cosmetic assets", () => {
   });
 
   it("serves textures as PNG and other assets as JSON", () => {
-    expect(staticFile({ ...mirrored(1), kind: "texture" })).toMatch(/\.png$/);
-    for (const kind of ["geometry", "animation", "clip"]) expect(staticFile({ ...mirrored(1), kind })).toMatch(/\.json$/);
+    const [texture, ...others] = staticRules(["texture", "geometry", "animation", "clip"].map((kind, index) => ({ ...mirrored(index), kind }))).files;
+    expect(texture!.path).toMatch(/\.png$/);
+    for (const file of others) expect(file.path).toMatch(/\.json$/);
   });
 
-  it("gives every mirrored asset its own license and leaves assets over the rule limits on the Worker", () => {
+  /** Returns the header lines Cloudflare applies to `path`: matching rules in order, with `! Link` detaching earlier links. */
+  function applied(headers: string, path: string): string[] {
+    const lines: string[] = [];
+    for (const rule of headers.trim().split(/\n(?=\/)/)) {
+      const [pattern, ...body] = rule.split("\n");
+      const matches = pattern!.endsWith("*") ? path.startsWith(pattern!.slice(0, -1)) : path === pattern;
+      if (!matches) continue;
+      for (const line of body.map((value) => value.trim())) {
+        if (line === "! Link") lines.splice(0, lines.length, ...lines.filter((value) => !value.startsWith("Link:")));
+        else lines.push(line);
+      }
+    }
+    return lines;
+  }
+
+  it("serves every public URL of a mirrored asset with its own license and leaves assets over the rule limits on the Worker", () => {
     const common = Array.from({ length: 2_100 }, (_, index) => mirrored(index));
     const others = Array.from({ length: 150 }, (_, index) => mirrored(10_000 + index, `https://other.test/${index}`));
-    const { served, headers, redirects } = staticRules([...others.slice(0, 3), ...common, ...others.slice(3)]);
-    const rules = headers.split(/\n(?=\/)/);
-    expect(rules[0]).toBe(`/${STATIC_ASSET_PREFIX}*\n  Cache-Control: public, max-age=31536000, immutable\n  X-Content-Type-Options: nosniff\n  Link: <${LICENSE}>; rel="license"`);
-    expect(rules.length).toBeLessThanOrEqual(100);
+    const { files, headers, redirects } = staticRules([...others.slice(0, 3), ...common, ...others.slice(3)]);
+    expect(headers.trim().split(/\n(?=\/)/).length).toBeLessThanOrEqual(100);
     const lines = new Set(redirects.trim().split("\n"));
-    expect(lines.size).toBe(served.length);
-    expect(served.length).toBeLessThanOrEqual(2_000);
-    const own = new Map(rules.slice(1).map((rule) => [rule.slice(0, rule.indexOf("\n")), rule]));
-    for (const asset of served) {
-      expect(lines.has(`/${STATIC_ASSET_PREFIX}${asset.sha256} /${staticFile(asset)} 200`)).toBe(true);
-      const rule = own.get(`/${STATIC_ASSET_PREFIX}${asset.sha256}`);
-      expect(rule ?? rules[0]).toContain(`Link: <${asset.license}>; rel="license"`);
-      if (rule) expect(rule).toContain("! Link");
+    expect(lines.size).toBe(files.length);
+    expect(files.length).toBeLessThanOrEqual(2_000);
+    for (const { asset, path } of files) {
+      expect(path.startsWith(STATIC_FILE_PREFIX)).toBe(true);
+      expect(lines.has(`/${STATIC_ASSET_PREFIX}${asset.sha256} /${path} 200`)).toBe(true);
+      for (const url of [`/${STATIC_ASSET_PREFIX}${asset.sha256}`, `/${path}`]) {
+        const values = applied(headers, url);
+        expect(values.filter((value) => value.startsWith("Link:"))).toEqual([`Link: <${asset.license}>; rel="license"`]);
+        expect(values).toContain("Cache-Control: public, max-age=31536000, immutable");
+        expect(values).toContain("X-Content-Type-Options: nosniff");
+      }
     }
-    expect(served.filter((asset) => asset.license !== LICENSE)).toHaveLength(3);
+    expect(files.filter(({ asset }) => asset.license !== LICENSE)).toHaveLength(3);
+    // Each further license costs a backing-directory rule and a canonical rule.
     const capped = staticRules([...others, ...common.slice(0, 10)]);
-    expect(capped.headers.split(/\n(?=\/)/)).toHaveLength(100);
-    expect(capped.served).toHaveLength(10 + 99);
-    expect(staticRules([])).toEqual({ served: [], headers: `/${STATIC_ASSET_PREFIX}*\n  Cache-Control: public, max-age=31536000, immutable\n  X-Content-Type-Options: nosniff\n`, redirects: "" });
+    expect(capped.headers.trim().split(/\n(?=\/)/)).toHaveLength(100);
+    expect(capped.files).toHaveLength(10 + 49);
+    expect(staticRules([])).toEqual({ files: [], headers: `/${STATIC_ASSET_PREFIX}*\n  Cache-Control: public, max-age=31536000, immutable\n  X-Content-Type-Options: nosniff\n`, redirects: "" });
   });
 
   it("verifies both size and digest", async () => {
