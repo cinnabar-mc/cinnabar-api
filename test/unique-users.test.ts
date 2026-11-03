@@ -1,6 +1,7 @@
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { exports } from "cloudflare:workers";
-import { afterEach, beforeAll, beforeEach, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { UniqueUsers } from "../src/unique-users";
 import type { Hub } from "../src/hub";
 import { clientKey, connect, hello, hub, installFakeIssuer, login, mintToken, sign, type Client } from "./helpers";
 
@@ -75,5 +76,27 @@ it("stores only salted digests, without account names or raw identifiers", async
     expect(Object.keys(rows[0]!)).toEqual(["digest"]);
     expect(rows[0]!.digest).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(JSON.stringify(rows)).not.toContain("2535412345678901");
+  });
+});
+
+it("reads the stored total without scanning digests, initializing it once from existing rows", async () => {
+  await runInDurableObject(hub(), (_: Hub, state) => {
+    const sql = state.storage.sql;
+    sql.exec("DROP TRIGGER IF EXISTS unique_users_added");
+    sql.exec("DROP TRIGGER IF EXISTS unique_users_removed");
+    sql.exec("DROP TABLE IF EXISTS unique_user_total");
+    sql.exec(`WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 499)
+      INSERT INTO unique_users (digest) SELECT 'digest-' || i FROM n`);
+    const users = new UniqueUsers(sql, "salt");
+    const exec = vi.spyOn(sql, "exec");
+    try {
+      expect(users.count()).toBe(500);
+      users.record("digest-0");
+      users.record("digest-new");
+      expect(new UniqueUsers(sql, "salt").count()).toBe(501);
+      exec.mockClear();
+      expect(users.count()).toBe(501);
+      expect(exec.mock.results.reduce((sum, result) => sum + (result.type === "return" ? result.value.rowsRead : 0), 0)).toBeLessThanOrEqual(1);
+    } finally { exec.mockRestore(); }
   });
 });
