@@ -76,4 +76,7 @@ jobs:
           : "${MOD_RELEASE_HOOK_SECRET:?Missing MOD_RELEASE_HOOK_SECRET}"
           printf '%s' "$MOD_RELEASE_HOOK_SECRET" | pnpm exec wrangler secret put MOD_RELEASE_HOOK_SECRET
       - if: steps.head.outputs.current == 'true'
+        name: Mirror cosmetic assets as static files
+        run: node scripts/sync-static-assets.mjs static
+      - if: steps.head.outputs.current == 'true'
         run: pnpm exec wrangler deploy

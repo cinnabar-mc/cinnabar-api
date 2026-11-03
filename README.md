@@ -33,7 +33,7 @@ Public GET responses use the Cloudflare Cache API with lifetimes declared beside
 | `/v1/users/count` | 60 seconds |
 | `/v1/presence/history` | 60 seconds per supported range |
 | `/v1/cosmetics/catalog` | 300 seconds, with `If-None-Match` revalidation on cache hits and misses |
-| `/v1/cosmetics/assets/:hash` | One year, immutable |
+| `/v1/cosmetics/assets/:hash` | One year, immutable; static files when mirrored |
 
 The cache is local to each Cloudflare location. Public routes ignore unrelated query parameters and
 reuse the same anonymous response when an Authorization header is present. Private routes, writes
@@ -222,7 +222,10 @@ Runtime assets and `cosmetics/catalog.json` live in the `COSMETIC_ASSETS` R2
 bucket. The private cosmetics repository publishes hash-addressed objects first,
 verifies their bytes, then promotes the catalog atomically. This Worker reads the
 catalog with a one-minute isolate cache and serves the existing same-origin
-`/v1/cosmetics/assets/:hash` URLs. The bundled metadata fallback preserves the
+`/v1/cosmetics/assets/:hash` URLs. Each deploy mirrors the live catalog's same-origin
+assets, verified against their digests, into Workers static assets, which Cloudflare serves
+without invoking the Worker; the bytes are not committed. Assets published after a deploy
+fall through to the Worker route until the next one. The bundled metadata fallback preserves the
 original free catalog when no valid R2 release is available. Authoring files and
 production asset bytes are not bundled in this public repository.
 
