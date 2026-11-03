@@ -224,8 +224,9 @@ verifies their bytes, then promotes the catalog atomically. This Worker reads th
 catalog with a one-minute isolate cache and serves the existing same-origin
 `/v1/cosmetics/assets/:hash` URLs. Each deploy mirrors the live catalog's same-origin
 assets, verified against their digests, into Workers static assets, which Cloudflare serves
-without invoking the Worker; the bytes are not committed. Assets published after a deploy
-fall through to the Worker route until the next one. The bundled metadata fallback preserves the
+without invoking the Worker; the bytes are not committed. Generated `_redirects` and `_headers`
+keep the Worker route's content type, license `Link` and caching. Assets published after a
+deploy, or beyond Cloudflare's rule limits, fall through to the Worker route. The bundled metadata fallback preserves the
 original free catalog when no valid R2 release is available. Authoring files and
 production asset bytes are not bundled in this public repository.
 

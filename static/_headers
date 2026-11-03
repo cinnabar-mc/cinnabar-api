@@ -1,3 +1,0 @@
-/v1/cosmetics/assets/*
-  Cache-Control: public, max-age=31536000, immutable
-  X-Content-Type-Options: nosniff

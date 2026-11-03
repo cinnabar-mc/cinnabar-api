@@ -7,5 +7,6 @@ worker-configuration.d.ts
 # Python cosmetic authoring tools.
 __pycache__/
 
-# Cosmetic asset bytes mirrored from the live catalog at deploy time.
-static/v1/
+# Cosmetic assets and their rules, mirrored from the live catalog at deploy time.
+static/*
+!static/.assetsignore
