@@ -1323,7 +1323,7 @@
         "api_revisions": {
           "type": "string",
           "maxLength": 1311,
-          "pattern": "^[0-9a-f]{40}(,[0-9a-f]{40}){0,31}$"
+          "pattern": "^[0-9a-f]{40}(,[0-9a-f]{40})*$"
         }
       }
     },
