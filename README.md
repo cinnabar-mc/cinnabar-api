@@ -9,11 +9,18 @@ messages against it.
 
 | Route | Purpose |
 | --- | --- |
+| `GET /v1/downloads/count` | Public `{"downloads":0}` total of installer and update-package downloads from GitHub client releases. Allows cross-origin reads. |
 | `GET /v1/health` | `{"ok":true,"api":"v1"}` |
 | `GET /v1/presence/count` | Public `{"online":0}` count of unique connected, authenticated accounts with visibility on. Allows cross-origin reads and caching for 30 seconds. No identifiers or retained offline presence. |
+| `GET /v1/users/count` | Public `{"unique":0}` total of verified accounts since tracking was deployed. Deduplicates reconnects and devices, includes visibility-off accounts, and persists after disconnects and restarts. Allows cross-origin reads and caching for 60 seconds; no historical backfill. |
 | `GET /v1/presence/players` | Private `{"names":[]}` list of verified names for those same online accounts. Requires a bearer token matching the `PRESENCE_READ_SECRET` Worker secret; never cached or exposed through CORS. |
 | `GET /v1/presence/history?range=24h` | Public anonymous player-count history. Ranges: `24h` (one minute), `7d` (ten minutes), `30d` (one hour). Allows cross-origin reads and caching for 60 seconds. |
 | `POST /v1/releases` | Release hook. `Authorization: Bearer <RELEASE_HOOK_SECRET>`, body `{"channel","version","build"}`; records and broadcasts only a newer (version, build) pair. Repeats and older records are no-ops. Omitted v1 builds mean zero. |
+| `POST /v1/mod/releases` | Requires a dedicated `MOD_RELEASE_HOOK_SECRET` bearer credential; the native release-hook credential is rejected. Publishes `{manifest, download_url}` for an immutable stable mod version. Identical retries return 204; changed metadata for that package/version returns 409. |
+| `PUT /v1/mod/assets/:sha256` | Dedicated mod-publisher bearer credential required. Verifies the component header, SHA-256 and 32 MiB limit before storing it under its content hash. Uploading alone does not publish it. |
+| `GET /v1/mod/assets/:sha256` | Anonymous immutable WASM download, available only after metadata publication. Never exposes the private source repository or an upload credential. |
+| `GET /v1/mod/download` | Anonymous first-install download of the newest published stable mod for the configured package and host repository. No hash or installed version required. Streams the verified WASM with its download filename; returns 404 if unavailable. Responses are not cached. Older hosts should use the compatibility-aware update route. |
+| `GET /v1/mod/update` | Requires full `host_revision` and comma-separated supported `api_revisions`, installed `current_version` and full `current_revision`; the official package and host repository are fixed server-side. Returns 200 with the newest newer compatible stable release or 204 with no body. Invalid or missing identities return 400. Responses are not cached. |
 | `GET /v1/connect` | WebSocket. The client authenticates with a Minecraft multiplayer token plus an ES384 proof of its key, then can toggle visibility, look up which XUIDs or UUIDs recently used Cinnabar, and receives release pushes. |
 
 Public GET responses use the Cloudflare Cache API with lifetimes declared beside each route:
@@ -21,10 +28,12 @@ Public GET responses use the Cloudflare Cache API with lifetimes declared beside
 | Route | Cache lifetime |
 | --- | --- |
 | `/v1/health` | 60 seconds |
+| `/v1/downloads/count` | 300 seconds |
 | `/v1/presence/count` | 30 seconds |
+| `/v1/users/count` | 60 seconds |
 | `/v1/presence/history` | 60 seconds per supported range |
 | `/v1/cosmetics/catalog` | 300 seconds, with `If-None-Match` revalidation on cache hits and misses |
-| `/v1/cosmetics/assets/:hash` | One year, immutable |
+| `/v1/cosmetics/assets/:hash` | One year, immutable; static files when mirrored |
 
 The cache is local to each Cloudflare location. Public routes ignore unrelated query parameters and
 reuse the same anonymous response when an Authorization header is present. Private routes, writes
@@ -156,6 +165,45 @@ Then set the `MARKETPLACE_ORIGIN`, `MICROSOFT_CLIENT_ID` and `OWNER_XUIDS` varia
 
 ## Privacy
 
+- Unique-user tracking retains one salted account digest per successfully authenticated and admitted
+  account, indefinitely, separately from online presence. It stores no display names, raw XUIDs,
+  activity timestamps or IP addresses. Visibility controls presence; it does not opt out of this
+  aggregate. Only the total is public. Existing sessions count on their next successful login;
+  accounts that have not authenticated since deployment cannot be inferred from past online samples.
+Mod release metadata is public and retained across deployments. The schema version 1
+manifest declares `package`, stable `version`, mod source `revision`,
+`host: {repository, revision, api_revision}`, and `artifact: {filename, size, sha256}`.
+The hook also supplies an HTTPS `download_url` without embedded credentials. The API
+does not fetch the publisher's URL or execute the artifact. The hook body is bounded
+to 16 KiB; manifests describe one stable mod API generation and at most a 32 MiB artifact.
+Only stable mod versions are currently supported; prereleases are rejected.
+
+Selection matches the server-configured host repository and the native build's supported
+mod API compatibility revisions, then numeric semantic version precedence. The native
+build's source commit is required but does not have to equal the mod's build pin.
+New native commits retaining support for the mod's API revision receive compatible
+updates without a build-pin change. Unsupported API revisions receive no update. The manifest records both
+the native commit used for the mod build and its stable API generation.
+
+The host lists supported API revisions. Unrelated releases keep the same list; new
+capabilities append a revision while retaining older entries; breaking changes remove
+revisions that are no longer supported. A mod using a new capability requires its new
+API revision, so older hosts keep their last compatible release.
+No Git ancestry or commit ordering is assumed. Selection never repeats the installed
+mod revision or downgrades the installed version. The native updater must verify the
+selected API revision is supported, identity, size and digest before atomic installation.
+
+Deploy this API support before configuring publishers to call the hook. A publisher
+must upload its release artifact before registering the matching metadata. Changing
+bytes or compatibility metadata requires a new package version. Keep downloads for
+previously published versions available. Configure publisher credentials through its
+secret store, using the same value as this Worker's `MOD_RELEASE_HOOK_SECRET`.
+The configured `MOD_RELEASE_REPOSITORY` and `MOD_RELEASE_PACKAGE`
+restrict that credential to its repository and package and immutable versioned GitHub
+asset URLs. Deployments install the dedicated secret from the protected production
+environment; missing secrets disable publication. The publishing repository should
+keep its matching credential in a release environment restricted to release refs.
+
 - The public online count includes each visible connected account once, even with several sockets.
   Visibility off excludes that socket; an account counts while any of its fresh open sockets is visible.
 - Lookups answer “uses Cinnabar,” rather than providing an exact online status. Visible accounts
@@ -273,7 +321,11 @@ Runtime assets and `cosmetics/catalog.json` live in the `COSMETIC_ASSETS` R2
 bucket. The private cosmetics repository publishes hash-addressed objects first,
 verifies their bytes, then promotes the catalog atomically. This Worker reads the
 catalog with a one-minute isolate cache and serves the existing same-origin
-`/v1/cosmetics/assets/:hash` URLs. The bundled metadata fallback preserves the
+`/v1/cosmetics/assets/:hash` URLs. Each deploy mirrors the live catalog's same-origin
+assets, verified against their digests, into Workers static assets, which Cloudflare serves
+without invoking the Worker; the bytes are not committed. Generated `_redirects` and `_headers`
+keep the Worker route's content type, license `Link` and caching. Assets published after a
+deploy, or beyond Cloudflare's rule limits, fall through to the Worker route. The bundled metadata fallback preserves the
 original free catalog when no valid R2 release is available. Authoring files and
 production asset bytes are not bundled in this public repository.
 
@@ -385,3 +437,31 @@ and the number of observations (`samples`). `to` identifies the published observ
 can lag while publication is unavailable. The current bucket can be incomplete. Missing buckets
 are omitted and must be shown as gaps, not zero. Averages and peaks cover observed minutes only;
 a minute sample is not a record of every join and departure.
+
+Mod release binaries use the `MOD_ASSETS` R2 binding and the isolated
+`mod-releases/` prefix. The binding currently shares the existing asset bucket;
+cosmetics keys and catalogue behavior are unchanged. Uploads require the dedicated
+publisher credential, validate the actual bytes, and remain unavailable to public
+GET requests until a release record commits. Metadata publication refuses absent
+or size-mismatched objects and replaces the archive URL with the canonical API asset
+URL. This permits anonymous native downloads while the source repository stays
+private. Keep the GitHub URL in the publication request as publisher-scope evidence.
+
+### Release download count
+
+The download aggregate counts APK, DMG, EXE, MSI and AppImage assets, including
+automatic update packages, on published `v`-numbered releases and the current
+`nightly` release in the client repository. It excludes update manifests, checksums,
+install scripts, debug archives and assets on unrelated releases. Repeat downloads
+count; this is not a count of users or successful installations. Replaced or deleted
+assets, including previous nightly packages, cannot be reconstructed.
+
+Requests share a fifteen-minute snapshot in the existing `API_CACHE` R2 bucket,
+plus a five-minute edge cache. A refresh reads all GitHub release pages before
+replacing the snapshot; invalid responses, timeouts and rate limits return 503
+without publishing a partial count. No GitHub credential is required.
+
+Unavailable download totals include a bounded `code`: `source_rate_limited` for
+GitHub 403/429, `source_unavailable` for other upstream HTTP failures, or
+`count_unavailable` for other failures. Upstream HTTP failures also include
+`source_status`. Responses never include upstream bodies or raw error details.

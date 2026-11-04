@@ -8,3 +8,6 @@ worker-configuration.d.ts
 __pycache__/
 .generated/
 .build/
+# Cosmetic assets and their rules, mirrored from the live catalog at deploy time.
+static/*
+!static/.assetsignore

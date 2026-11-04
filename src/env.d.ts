@@ -2,6 +2,10 @@
 declare namespace Cloudflare {
   interface Env {
     MARKETPLACE_SCANNER_TOKEN?: string; // isolated scanner: claim/read/complete only, never an admin or signing key
+    MOD_RELEASE_HOOK_SECRET?: string;
+    MOD_RELEASE_REPOSITORY?: string;
+    MOD_RELEASE_PACKAGE?: string;
+    MOD_HOST_REPOSITORY?: string;
     PRESENCE_READ_SECRET?: string;
     RELEASE_HOOK_SECRET?: string; // bearer token for POST /v1/releases; set with `wrangler secret put`
     MICROSOFT_CLIENT_SECRET?: string; // optional; the Entra app may be a public client using PKCE alone
@@ -14,6 +18,10 @@ declare namespace Cloudflare {
 }
 interface Env {
   MARKETPLACE_SCANNER_TOKEN?: string;
+  MOD_RELEASE_HOOK_SECRET?: string;
+  MOD_RELEASE_REPOSITORY?: string;
+  MOD_RELEASE_PACKAGE?: string;
+  MOD_HOST_REPOSITORY?: string;
   PRESENCE_READ_SECRET?: string;
   RELEASE_HOOK_SECRET?: string;
   MICROSOFT_CLIENT_SECRET?: string;

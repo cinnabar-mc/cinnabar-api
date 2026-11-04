@@ -23,7 +23,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm source:fetch
-      - run: node --test scripts/marketplace-signing.test.mjs
+      - run: node --test scripts/marketplace-signing.test.mjs scripts/marketplace-contract.test.mjs
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -81,5 +81,15 @@ jobs:
         run: |
           : "${PRESENCE_READ_SECRET:?Missing PRESENCE_READ_SECRET}"
           printf '%s' "$PRESENCE_READ_SECRET" | pnpm exec wrangler secret put PRESENCE_READ_SECRET
+      - if: steps.head.outputs.current == 'true'
+        name: Configure protected mod publication
+        env:
+          MOD_RELEASE_HOOK_SECRET: ${{ secrets.MOD_RELEASE_HOOK_SECRET }}
+        run: |
+          : "${MOD_RELEASE_HOOK_SECRET:?Missing MOD_RELEASE_HOOK_SECRET}"
+          printf '%s' "$MOD_RELEASE_HOOK_SECRET" | pnpm exec wrangler secret put MOD_RELEASE_HOOK_SECRET
+      - if: steps.head.outputs.current == 'true'
+        name: Mirror cosmetic assets as static files
+        run: node scripts/sync-static-assets.mjs static
       - if: steps.head.outputs.current == 'true'
         run: pnpm exec wrangler deploy

@@ -1,5 +1,7 @@
+import { UniqueUsers } from "./unique-users";
 import { catalog, admitLoadout } from "./cosmetics";
 import { loadCatalog, type Catalog } from "./catalog-store";
+import { ModReleases, type ModRelease, type ModUpdateQuery } from "./mod-releases";
 import { DurableObject } from "cloudflare:workers";
 import { MarketplaceStore, handle, type MarketCall, type MarketResult } from "./marketplace/store";
 import { signText } from "./marketplace/signing";
@@ -81,6 +83,7 @@ const releaseKey = (channel: Channel) => `release:${channel}`;
  * authenticated, so lookups and broadcasts go through in-memory indexes rebuilt from attachments on each wake.
  */
 export class Hub extends DurableObject<Env> {
+  private readonly mods: ModReleases;
   private readonly history: PresenceHistory;
   private readonly sessions = new Map<WebSocket, Attachment>();
   private readonly byXuid = new Map<string, Set<WebSocket>>();
@@ -92,6 +95,7 @@ export class Hub extends DurableObject<Env> {
   private readonly pendingByIp = new Map<string, number>();
   private readonly ipBySocket = new Map<WebSocket, string>();
   private readonly ipSalt: string;
+  private readonly uniqueUsers: UniqueUsers;
   private alarmDeadline = Infinity;
   /**
    * Per-account lookup buckets. Socket attachments carry them across hibernation; a SQL row is written only when
@@ -109,6 +113,7 @@ export class Hub extends DurableObject<Env> {
     this.history = new PresenceHistory(ctx.storage.sql, env.API_CACHE, env.METRICS);
     this.market = new MarketplaceStore(ctx.storage.sql,
       new Set((env.OWNER_XUIDS ?? "").split(",").map((xuid) => xuid.trim()).filter((xuid) => /^[0-9]{1,20}$/.test(xuid))));
+    this.mods = new ModReleases(ctx.storage.sql);
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS lookup_budgets (
       xuid TEXT PRIMARY KEY, tokens REAL NOT NULL, updated_at INTEGER NOT NULL
     )`);
@@ -118,6 +123,7 @@ export class Hub extends DurableObject<Env> {
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS hub_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     ctx.storage.sql.exec("INSERT OR IGNORE INTO hub_config (key, value) VALUES ('ip_salt', ?)", crypto.randomUUID());
     this.ipSalt = ctx.storage.sql.exec<{ value: string }>("SELECT value FROM hub_config WHERE key = 'ip_salt'").one().value;
+    this.uniqueUsers = new UniqueUsers(ctx.storage.sql, this.ipSalt);
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     for (const ws of ctx.getWebSockets()) {
       this.sockets.add(ws);
@@ -136,6 +142,11 @@ export class Hub extends DurableObject<Env> {
   /** Counts unique visible accounts with a fresh authenticated socket, excluding retained presence. */
   onlineCount(): number {
     return this.onlineAccounts().length;
+  }
+
+  /** Returns the total verified accounts observed since unique-user tracking was deployed. */
+  uniqueUserCount(): number {
+    return this.uniqueUsers.count();
   }
 
   /** Returns only verified names for the authenticated administrative directory. */
@@ -216,6 +227,24 @@ export class Hub extends DurableObject<Env> {
     }
     return record;
   }
+
+  /** Publishes all release metadata and compatibility indexes atomically. */
+  publishModRelease(release: ModRelease): boolean {
+    return this.ctx.storage.transactionSync(() => this.mods.publish(release));
+  }
+
+  /** Resolves only a newer mod compatible with the installed native commit. */
+  modUpdate(query: ModUpdateQuery): ModRelease | null {
+    return this.mods.update({ ...query, package: this.env.MOD_RELEASE_PACKAGE ?? "", host_repository: this.env.MOD_HOST_REPOSITORY ?? "" });
+  }
+
+  /** Resolves the newest official stable mod for a first installation. */
+  latestModRelease(): ModRelease | null {
+    return this.mods.latest(this.env.MOD_RELEASE_PACKAGE ?? "", this.env.MOD_HOST_REPOSITORY ?? "");
+  }
+
+  /** Returns the expected byte count only for an artifact belonging to a published release. */
+  modAssetSize(hash: string): number | null { return this.mods.assetSize(hash); }
 
   async latestRelease(channel: Channel): Promise<ReleaseRecord | null> {
     return (await this.ctx.storage.get<ReleaseRecord>(releaseKey(channel))) ?? null;
@@ -407,6 +436,7 @@ export class Hub extends DurableObject<Env> {
     if (!valid) return this.reject(ws);
     const { xuid, displayName, channel, visible } = pending;
     const uuid = await identityUuid(xuid);
+    const userDigest = await this.uniqueUsers.digest(xuid);
     await this.scheduleAlarm(Date.now() + SESSION_IDLE_TIMEOUT_MS);
     // Read before indexing so a concurrent recordRelease reaches this socket exactly once, via one path or the other.
     const latest = await this.latestRelease(channel);
@@ -430,6 +460,7 @@ export class Hub extends DurableObject<Env> {
       .filter((session): session is Ready => session?.stage === "ready")
       .map((session) => session.loadout).filter((value): value is LoadoutState => value !== undefined)
       .sort((a, b) => b.revision - a.revision)[0];
+    this.uniqueUsers.record(userDigest);
     this.save(ws, { stage: "ready", xuid, displayName, uuid, channel, visible, loadout, lastSeen: now });
     this.claimLoginRewards(xuid, now, ws);
     const modLibrary = this.market.library(xuid);
