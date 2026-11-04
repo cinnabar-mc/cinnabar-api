@@ -13,8 +13,8 @@ export const ROLES = Object.keys(ROLE_RANK) as Role[];
  * Every capability the client marks sensitive sits on Acts or Network.
  */
 const groups = [
-  ["environment", "hud", "settings", "render", "world_draw", "render_material", "render_post", "render_depth", "fullbright"],
-  ["terrain", "player_state", "entities", "items", "recipes", "screen"],
+  ["environment", "hud", "settings", "render", "world_draw", "render_material", "render_post", "render_depth", "fullbright", "audio"],
+  ["terrain", "player_state", "entities", "items", "recipes", "screen", "clock"],
   ["players", "entity_observe", "entity_highlight", "block_highlights", "render_through_walls"],
   ["camera", "controls", "keys", "item_use", "movement", "interaction", "inventory", "commands"],
 ];

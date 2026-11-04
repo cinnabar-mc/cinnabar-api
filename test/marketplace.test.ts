@@ -148,6 +148,8 @@ describe("marketplace policy", () => {
 
   it("files mods by their furthest capability and gates approvals by reach", () => {
     expect(reachOf({ hud: true })).toBe(0);
+    expect(reachOf({ audio: true })).toBe(0);
+    expect(reachOf({ clock: true })).toBe(1);
     expect(reachOf({ hud: true, entities: true })).toBe(1);
     expect(reachOf({ commands: ["tp"] })).toBe(3);
     expect(reachOf({ commands: [] })).toBe(0);

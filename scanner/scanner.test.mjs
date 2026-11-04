@@ -42,7 +42,10 @@ test('checks canonical WIT interface versions rather than rewritten JavaScript s
     ['cinnabar:extension/hud', 'block'],
     ['cinnabar:extension/touch@0.1.0', 'pass'],
     ['cinnabar:extension/touch@9.0.0', 'block'],
-    ['cinnabar:world-draw/assets@0.1.0', 'pass'],
+    ['cinnabar:extension/clock@0.1.0', 'pass'],
+    ['cinnabar:extension/clock@9.0.0', 'block'],
+    ['cinnabar:world-draw/assets@0.2.0', 'pass'],
+    ['cinnabar:world-draw/assets@0.1.0', 'block'],
     ['cinnabar:world-draw/assets@9.0.0', 'block'],
   ]) {
     const bytes = await parse(GOOD_WAT.replace('(component', `(component (import "${name}" (instance))`));
