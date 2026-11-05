@@ -596,28 +596,25 @@ export class Hub extends DurableObject<Env> {
     for (const ws of this.byXuid.get(xuid) ?? []) if (this.sessions.get(ws)?.stage === "ready") send(ws, { type: "mod_library", mods });
   }
 
-  /** Copy verified artifacts to distribution, sign, then recheck live database gates before exposing anything. */
+  /** Confirm stored artifacts, sign, then recheck live database gates before exposing anything. */
   private async publishMod(id: number): Promise<boolean> {
-    this.market.promotionAttempt(id, Date.now());
+    this.market.publicationAttempt(id, Date.now());
     const key = this.env.MARKETPLACE_SIGNING_KEY;
     const candidate = key && this.market.publicationReady(id, Date.now());
     if (!candidate || !key) return false;
     try {
       for (const objectKey of [`mods/${candidate.sha256}`, ...candidate.media.map(m => `media/${m.sha256}`)]) {
-        const object = await this.env.MOD_QUARANTINE.get(objectKey)
-          ?? (candidate.legacy ? await this.env.MOD_FILES.get(objectKey) : null);
-        if (!object) return false;
-        await this.env.MOD_FILES.put(objectKey, object.body, { httpMetadata: object.httpMetadata });
+        if (!await this.env.MOD_FILES.head(objectKey)) return false;
       }
       const signature = await signText(key, candidate.statement);
       return this.market.publish(id, candidate.statement, signature, Date.now());
     } catch {
-      // Pending promotions survive in SQLite. Cron retries; unsigned bytes never become public.
+      // Pending publications survive in SQLite. Cron retries; unsigned bytes never become public.
       return false;
     }
   }
 
-  /** Cron recovery for committed decisions interrupted during R2 promotion or signing. */
+  /** Cron recovery for committed decisions interrupted by missing files or signing failures. */
   async recoverModPublications(): Promise<void> {
     for (const id of this.market.pendingPublications()) await this.publishMod(id);
   }

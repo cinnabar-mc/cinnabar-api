@@ -268,9 +268,9 @@ marketplaceRoutes.post("/submissions", async (c) => {
   } catch (error) { return c.json({ error: error instanceof Error ? error.message : "Invalid image." }, 422); }
   const hash = await sha256(bytes);
   for (let i = 0; i < media.length; i++) {
-    await c.env.MOD_QUARANTINE.put(`media/${media[i]!.sha256}`, imageBytes[i]!, { httpMetadata: { contentType: media[i]!.type } });
+    await c.env.MOD_FILES.put(`media/${media[i]!.sha256}`, imageBytes[i]!, { httpMetadata: { contentType: media[i]!.type } });
   }
-  await c.env.MOD_QUARANTINE.put(`mods/${hash}`, bytes, { httpMetadata: { contentType: "application/wasm" } });
+  await c.env.MOD_FILES.put(`mods/${hash}`, bytes, { httpMetadata: { contentType: "application/wasm" } });
   return reply(c, await call(c, { op: "submit", body: listing, file: { sha256: hash, bytes: bytes.byteLength, grants, media }, ...who }));
 });
 
@@ -290,7 +290,7 @@ marketplaceRoutes.get("/staff/versions/:id/file", async (c) => {
   const version = versionId === null ? null : await call(c, { op: "version", id: versionId, ...(await caller(c)) });
   if (!version || version.status !== 200) return reply(c, version ?? { status: 404, body: { error: "No such version." } });
   const objectKey = `mods/${(version.body as { sha256: string }).sha256}`;
-  const object = await c.env.MOD_QUARANTINE.get(objectKey) ?? await c.env.MOD_FILES.get(objectKey);
+  const object = await c.env.MOD_FILES.get(objectKey);
   if (!object) return c.notFound();
   return c.body(object.body, 200, { "Content-Type": "application/wasm", "Cache-Control": "private, no-store",
     "Content-Disposition": "attachment", "X-Content-Type-Options": "nosniff" });
@@ -304,7 +304,7 @@ marketplaceRoutes.get("/me/mods/:id/media/:sha256", async c => {
   const result = await call(c, { op: "private-media", id: target, sha256: hash, ...(await caller(c)) });
   if (result.status !== 200) return reply(c, result);
   const { key, type } = result.body as { key: string; type: string };
-  const object = await c.env.MOD_QUARANTINE.get(key);
+  const object = await c.env.MOD_FILES.get(key);
   return object ? c.body(object.body, 200, { "Content-Type": type, "Cache-Control": "private, no-store",
     "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; sandbox" }) : c.notFound();
 });
@@ -336,9 +336,8 @@ marketplaceRoutes.post("/internal/marketplace/claim", async c => reply(c, await 
 marketplaceRoutes.get("/internal/marketplace/jobs/:job/files/:sha256", async c => {
   const result = await call(c, { op: "scan-file", job: c.req.param("job"), lease: c.req.header("X-Scan-Lease") ?? "", sha256: c.req.param("sha256") });
   if (result.status !== 200) return reply(c, result);
-  const { key, type, legacy } = result.body as { key: string; type: string; legacy: boolean };
-  const object = await c.env.MOD_QUARANTINE.get(key)
-    ?? (legacy ? await c.env.MOD_FILES.get(key) : null);
+  const { key, type } = result.body as { key: string; type: string };
+  const object = await c.env.MOD_FILES.get(key);
   return object ? c.body(object.body, 200, { "Content-Type": type, "Cache-Control": "no-store" }) : c.notFound();
 });
 marketplaceRoutes.post("/internal/marketplace/jobs/:job/complete", async c => {

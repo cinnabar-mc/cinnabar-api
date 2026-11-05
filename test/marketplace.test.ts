@@ -371,7 +371,7 @@ describe("submission, review and delivery", () => {
   });
 });
 
-describe("quarantine and publication pipeline", () => {
+describe("upload and publication pipeline", () => {
   let creatorId = 2535400000006200n;
   /** Create an explicitly established project with one human-approved baseline. */
   async function established(slug: string, version = "1.0.0") {
@@ -529,15 +529,23 @@ describe("quarantine and publication pipeline", () => {
     expect((await api("/submissions", { method: "POST", body: "invalid body", headers: { Cookie: creator.cookie } })).status).toBe(403);
   });
 
-  it("keeps bytes quarantined and refuses approval until a current scan completes", async () => {
+  it("stores uploads in the file bucket and requires a current scan before approval", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
     const creator = await signIn("2535400000006102", "PendingUploader");
     const v = await (await submit(creator, "pending-mod", "1.0.0", { hud: true }, {}, false)).json() as any;
     expect(v.scan.state).toBe("queued");
-    expect(await env.MOD_QUARANTINE.head(`mods/${v.sha256}`)).not.toBeNull();
-    expect(await env.MOD_FILES.head(`mods/${v.sha256}`)).toBeNull();
+    expect(await env.MOD_FILES.head(`mods/${v.sha256}`)).not.toBeNull();
+    expect((await api(`/mods/assets/${v.sha256}`)).status).toBe(404);
+    const staffFile = await owner.get(`/staff/versions/${v.id}/file`);
+    expect(staffFile.status).toBe(200);
+    const bytes = await staffFile.arrayBuffer();
     expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(409);
     const job = await claim();
+    const scanFile = await api(`/internal/marketplace/jobs/${job.id}/files/${v.sha256}`, {
+      headers: { Authorization: "Bearer test-scanner-token", "X-Scan-Lease": job.lease },
+    });
+    expect(scanFile.status).toBe(200);
+    expect(await scanFile.arrayBuffer()).toEqual(bytes);
     expect((await api(`/internal/marketplace/jobs/${job.id}/files/${v.sha256}`, {
       headers: { Authorization: "Bearer test-scanner-token", "X-Scan-Lease": "wrong" },
     })).status).toBe(404);
@@ -638,17 +646,17 @@ describe("quarantine and publication pipeline", () => {
     expect((await claim()).id).not.toBe(first.id);
   });
 
-  it("recovers an interrupted promotion without exposing an unsigned release", async () => {
+  it("recovers publication after a stored file is restored without exposing an unsigned release", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
     const creator = await signIn("2535400000006105", "RecoveryCreator");
     const v = await (await submit(creator, "recovery-mod", "1.0.0", { hud: true })).json() as any;
     const key = `mods/${v.sha256}`;
-    const bytes = await (await env.MOD_QUARANTINE.get(key))!.arrayBuffer();
-    await env.MOD_QUARANTINE.delete(key);
+    const bytes = await (await env.MOD_FILES.get(key))!.arrayBuffer();
+    await env.MOD_FILES.delete(key);
     expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(503);
     expect((await api("/mods/recovery-mod")).status).toBe(404);
     expect((await creator.post("/mods/recovery-mod/send")).status).toBe(404);
-    await env.MOD_QUARANTINE.put(key, bytes);
+    await env.MOD_FILES.put(key, bytes);
     await hub().recoverModPublications();
     expect((await api("/mods/recovery-mod")).status).toBe(200);
   });
@@ -678,7 +686,7 @@ describe("quarantine and publication pipeline", () => {
     expect(await (await api("/mods/race-mod")).json()).toMatchObject({ version: "1.0.0" });
   });
 
-  it("quarantines image bytes, binds their hashes to the scan and publishes only after approval", async () => {
+  it("stores images with components, binds their hashes to scans and publishes after approval", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
     const creator = await signIn("2535400000006106", "ImageCreator");
     const form = new FormData();
@@ -696,6 +704,7 @@ describe("quarantine and publication pipeline", () => {
     expect(v).toMatchObject({ category: "Interface", license: "MIT", notes: "Initial screenshot release", scan: { review_ready: false } });
     expect(v.gallery[0]).toMatchObject({ caption: "HUD screenshot", alt: "Coordinates above the hotbar" });
     const mediaHash = v.gallery[0].sha256;
+    expect(await env.MOD_FILES.head(`media/${mediaHash}`)).not.toBeNull();
     expect((await api(`/mods/media/${mediaHash}`)).status).toBe(404);
     const privatePath = `/me/mods/${v.id}/media/${mediaHash}`;
     expect((await creator.get(privatePath)).status).toBe(200);
@@ -731,14 +740,15 @@ describe("quarantine and publication pipeline", () => {
     expect(await (await api("/mods/expiry-mod")).json()).toMatchObject({ version: "1.0.0" });
   });
 
-  it("upgrades pre-pipeline releases into quarantine and retains access across rescans", async () => {
+  it("upgrades pre-pipeline releases without moving stored files and retains access across rescans", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
     const creator = await signIn("2535400000006107", "LegacyCreator");
     const v = await (await submit(creator, "legacy-mod", "0.9.7", { hud: true }, {}, false)).json() as any;
     const key = `mods/${v.sha256}`;
-    const bytes = await (await env.MOD_QUARANTINE.get(key))!.arrayBuffer();
-    await env.MOD_FILES.put(key, bytes); await env.MOD_QUARANTINE.delete(key);
+    const bytes = await (await env.MOD_FILES.get(key))!.arrayBuffer();
     await runInDurableObject(hub(), (_: Hub, state) => {
+      // Older stores retain this unused column; upgrades must work without rebuilding the table.
+      state.storage.sql.exec("ALTER TABLE mod_pipeline ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0");
       state.storage.sql.exec("DELETE FROM mod_pipeline WHERE version_id = ?", Number(v.id));
       state.storage.sql.exec("UPDATE mod_versions SET status = 'approved', signature = 'old-signature' WHERE id = ?", Number(v.id));
       state.storage.sql.exec("DELETE FROM market_schema WHERE version = 1");

@@ -112,7 +112,7 @@ Acts and Network listings must link their GitHub source.
 
 **Files and trust.**
 - Components (at most 16 MiB) and up to four raster images (1 MiB each) enter private
-  `MOD_QUARANTINE` storage under server-computed SHA-256 keys. An authenticated,
+  `MOD_FILES` storage under server-computed SHA-256 keys. An authenticated,
   byte-bounded multipart request creates an immutable metadata snapshot and durable scan job.
 - A separate scanner validates full component structure/types/core bytecode, host imports
   and image decoding without executing uploaded code. Workers AI assists staff with bounded,
@@ -146,7 +146,6 @@ Before enabling it in production:
 
 ```sh
 pnpm exec wrangler r2 bucket create cinnabar-mods
-pnpm exec wrangler r2 bucket create cinnabar-mods-quarantine
 pnpm exec wrangler secret put MARKETPLACE_SIGNING_KEY   # base64 PKCS#8 Ed25519 private key
 pnpm exec wrangler secret put MARKETPLACE_SCANNER_TOKEN # separate random scanner credential
 pnpm exec wrangler secret put MICROSOFT_CLIENT_SECRET   # only for a confidential Entra app
@@ -158,7 +157,7 @@ Then set the `MARKETPLACE_ORIGIN`, `MICROSOFT_CLIENT_ID` and `OWNER_XUIDS` varia
 - Sign-in answers 503 until the origin and client ID are set.
 - The session cookie only reaches the API when the website shares its registrable domain (for example
   `cinnabar.gg`), so the site must leave `*.workers.dev` before sign-in works there.
-- Keep both R2 buckets private with no public domains. Run the separate scanner with its
+- Keep the marketplace R2 bucket private with no public domains. Run the separate scanner with its
   limited credential and a Workers AI token; it never receives the signing key. Provisioning,
   scanner deployment and website HTTP enablement are separate from merging the API code.
   See [deployment and recovery](docs/marketplace.md#deployment-and-recovery).

@@ -23,12 +23,19 @@ bytes. Maximums are 16 MiB per component, four 1 MiB images, and 20 MiB + 256 Ki
 for the whole request, enforced on streamed bytes independent of Content-Length.
 Raster types are PNG, JPEG and WebP. SVG and active content are refused.
 
-All bytes enter `MOD_QUARANTINE`, under `mods/<sha256>` or `media/<sha256>`. Both
-R2 buckets must have public access disabled. Pending metadata never edits a public
-listing. Release bytes, grants, listing text and media references cannot be edited
+All bytes enter `MOD_FILES` directly, under `mods/<sha256>` or `media/<sha256>`.
+The R2 bucket must have public access disabled. Publication signs the release and
+changes API download authorization; it does not copy artifacts between buckets.
+Pending metadata never edits a public listing. Release bytes, grants, listing
+text and media references cannot be edited
 in place; submit another version. An upload refused after R2 writes can leave
 unreferenced objects; include orphan reconciliation in storage operations. Do not
-expire referenced quarantine objects automatically: interrupted promotions need them.
+expire referenced objects automatically: pending and published releases need them.
+
+Before upgrading an installation that used `cinnabar-mods-quarantine`, pause upload
+and scanner writers and copy its referenced objects into `cinnabar-mods`, preserving
+keys, bytes and content types. Verify component and image access before resuming.
+The code change removes the old binding; it does not delete the old bucket or data.
 
 `GET /v1/me/mods` and staff version views include:
 
@@ -42,7 +49,7 @@ Public component/media URLs are `/v1/mods/assets/<sha256>` and
 `/v1/mods/media/<sha256>`. Authorization is checked on each request. Only signed,
 approved, unpulled releases with an active creator and visible listing qualify.
 Responses use `no-store` and `nosniff`; private files never use a public cache path.
-Staff fetch quarantined components through `/v1/staff/versions/<id>/file`.
+Staff fetch submitted components through `/v1/staff/versions/<id>/file`.
 Clients fetch the exact signed statement and signature from
 `GET /v1/mods/<slug>/releases/<version>/<sha256>`, including an older approved library selection.
 Pulled, hidden, unsigned or suspended-creator releases are unavailable. Revocations
@@ -136,17 +143,17 @@ restoration requires deliberate administrative review. Concurrent updates that
 change the baseline fall back to human review. Metadata/image changes also need
 human review at launch.
 
-Publication copies immutable files to `MOD_FILES`, signs a statement binding the
+Publication confirms the files exist and signs a statement binding the
 hash, grants, snapshot, media, client revision, scan job, policy and publication
 mode, then rechecks all live gates after I/O before atomically marking approved.
-Unsigned or interrupted releases stay private. Cron retries committed promotion
-decisions; a missing key or failed copy returns 503 and leaves a recoverable decision.
+Unsigned or interrupted releases stay private. Cron retries committed publication
+decisions; a missing key or file returns 503 and leaves a recoverable decision.
 Public listing, download and send-to-game paths all require an actual signature.
 
 ## Deployment and recovery
 
 The API deploys only from `main` through its existing `production` environment.
-Create both private R2 buckets before merging. Configure `MARKETPLACE_ORIGIN`,
+Create the private `MOD_FILES` R2 bucket before merging. Configure `MARKETPLACE_ORIGIN`,
 `MICROSOFT_CLIENT_ID`, `OWNER_XUIDS`, the Microsoft app callback and Worker secrets
 `MARKETPLACE_SIGNING_KEY`, optional `MICROSOFT_CLIENT_SECRET`, and
 `MARKETPLACE_SCANNER_TOKEN`. Never place credentials in this repository.
@@ -181,11 +188,11 @@ For local fixture development use `pnpm source:fetch`, `pnpm scanner:build`, the
 `pnpm scanner:start` with equivalent environment variables.
 
 Monitor fixed `scan_completed` / `scan_retry_pending` scanner events, staff queue
-scan states, expired claims and pending promotions. Reconfigure/restart a failed
+scan states, expired claims and pending publications. Reconfigure/restart a failed
 scanner, then rescan held releases. If signing/storage fails, restore the resource;
-cron retries eligible promotions. Revoke creator trust during incidents, pull
+cron retries eligible publications. Revoke creator trust during incidents, pull
 affected releases, and rotate compromised credentials. Keep an audited retention
-and orphan cleanup process for quarantined artifacts and stored reports.
+and orphan cleanup process for stored artifacts and reports.
 
 Production enablement still requires real-domain OAuth and staging end-to-end
 checks, scanner infrastructure/secrets, website live-mode wiring, and client

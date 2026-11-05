@@ -71,7 +71,6 @@ type PipelineRow = {
   job_id: string; state: "queued" | "running" | "complete" | "failed";
   attempts: number; lease: string | null; lease_until: number | null;
   report: string | null; completed_at: number | null; publish_mode: "manual" | "automatic" | null; promotion_attempt_at: number;
-  legacy: number;
 };
 
 const ok = (body: unknown, extra: Partial<MarketResult> = {}): MarketResult => ({ status: 200, body, ...extra });
@@ -111,7 +110,7 @@ export class MarketplaceStore {
       `CREATE TABLE IF NOT EXISTS mod_pipeline (version_id INTEGER PRIMARY KEY, metadata TEXT NOT NULL,
         media TEXT NOT NULL DEFAULT '[]', baseline INTEGER, job_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL DEFAULT 'queued',
         attempts INTEGER NOT NULL DEFAULT 0, lease TEXT, lease_until INTEGER, report TEXT, completed_at INTEGER, publish_mode TEXT,
-        promotion_attempt_at INTEGER NOT NULL DEFAULT 0, legacy INTEGER NOT NULL DEFAULT 0)`,
+        promotion_attempt_at INTEGER NOT NULL DEFAULT 0)`,
       `CREATE TABLE IF NOT EXISTS market_schema (version INTEGER PRIMARY KEY)`,
       `CREATE TABLE IF NOT EXISTS mod_trust (slug TEXT PRIMARY KEY, creator TEXT NOT NULL, granted_by TEXT NOT NULL,
         expires_at INTEGER NOT NULL, reason TEXT NOT NULL)`,
@@ -121,9 +120,9 @@ export class MarketplaceStore {
     ]) sql.exec(statement);
     // Upgrade a pre-pipeline draft once, holding formerly approved releases for a fresh scan and review.
     if (!sql.exec("SELECT 1 FROM market_schema WHERE version = 1").toArray().length) {
-      sql.exec(`INSERT OR IGNORE INTO mod_pipeline (version_id, metadata, job_id, legacy)
+      sql.exec(`INSERT OR IGNORE INTO mod_pipeline (version_id, metadata, job_id)
         SELECT v.id, json_object('slug', l.slug, 'name', l.name, 'summary', l.summary, 'description', l.description,
-          'source', l.source, 'version', v.version), 'migration-' || v.id, 1
+          'source', l.source, 'version', v.version), 'migration-' || v.id
         FROM mod_versions v JOIN mod_listings l ON l.slug = v.slug`);
       sql.exec(`DELETE FROM mod_approvals WHERE version_id IN (SELECT v.id FROM mod_versions v JOIN mod_pipeline p ON p.version_id = v.id
         WHERE p.job_id = 'migration-' || v.id AND p.state = 'queued' AND v.status = 'approved')`);
@@ -320,7 +319,7 @@ export class MarketplaceStore {
     return ok({ ...view, history, release: live.signature ? { statement: this.statement(live.id), signature: live.signature } : null });
   }
 
-  /** Public files require an actually signed, visible release. Quarantine has a separate staff-only route. */
+  /** Stored files require an actually signed, visible release before public downloads are allowed. */
   assetAllowed(sha256: string, caller: Caller, now: number): boolean {
     return this.versions(`v.sha256 = ? AND v.status = 'approved' AND v.signature IS NOT NULL AND v.statement IS NOT NULL AND v.pulled = 0
       AND l.hidden = 0 AND EXISTS (SELECT 1 FROM mod_pipeline p WHERE p.version_id = v.id AND p.state = 'complete')`, sha256)
@@ -538,7 +537,7 @@ export class MarketplaceStore {
     const v = p && this.versions("v.id = ?", p.version_id)[0];
     const media = p && this.media(p.version_id).find(m => m.sha256 === sha256);
     if (!v || (v.sha256 !== sha256 && !media)) return fail(404, "No claimed file.");
-    return ok({ key: `${media ? "media" : "mods"}/${sha256}`, type: media?.type ?? "application/wasm", legacy: !!p!.legacy });
+    return ok({ key: `${media ? "media" : "mods"}/${sha256}`, type: media?.type ?? "application/wasm" });
   }
 
   /** Deduplicate completion and reject stale leases, wrong hashes, malformed reports and outdated policy. */
@@ -590,7 +589,7 @@ export class MarketplaceStore {
   }
 
   /** Return publication material only while current scan, account and decision gates still hold. */
-  publicationReady(id: number, now: number): { sha256: string; media: MediaFile[]; statement: string; legacy: boolean } | null {
+  publicationReady(id: number, now: number): { sha256: string; media: MediaFile[]; statement: string } | null {
     const v = this.versions("v.id = ?", id)[0];
     const p = this.pipeline(id);
     if (!v || !p || v.status !== "submitted" || v.pulled || this.account(v.creator)?.suspended || this.listing(v.slug)?.hidden
@@ -604,7 +603,7 @@ export class MarketplaceStore {
       }).map(a => ({ admin: atLeast(this.account(a.xuid), "admin") }));
       if (!approvalsComplete(v.reach as Reach, approvals)) return null;
     } else return null;
-    return { sha256: v.sha256, media: this.media(id), statement: this.statement(id), legacy: !!p.legacy };
+    return { sha256: v.sha256, media: this.media(id), statement: this.statement(id) };
   }
 
   /** Retry jobs with a new identity, invalidating old scanner leases and all earlier approvals. */
@@ -841,14 +840,14 @@ export class MarketplaceStore {
       .map((e) => ({ ...e, actor_name: this.name(e.actor) })));
   }
 
-  /** Recover interrupted promotions using the same gate used by immediate publication. */
+  /** Recover interrupted publications using the same gate used by immediate publication. */
   pendingPublications(): number[] {
     return this.sql.exec<{ id: number }>(`SELECT v.id FROM mod_versions v JOIN mod_pipeline p ON p.version_id = v.id
       WHERE v.status = 'submitted' AND p.publish_mode IS NOT NULL ORDER BY p.promotion_attempt_at, v.id LIMIT 10`).toArray().map(v => v.id);
   }
 
   /** Failed or no-longer-eligible candidates move behind other recoverable releases. */
-  promotionAttempt(id: number, now: number): void {
+  publicationAttempt(id: number, now: number): void {
     this.sql.exec("UPDATE mod_pipeline SET promotion_attempt_at = ? WHERE version_id = ?", now, id);
   }
 }
