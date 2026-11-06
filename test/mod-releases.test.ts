@@ -124,6 +124,50 @@ describe("revision-aware mod releases", () => {
     expect(response.headers.get("Cache-Control")).toBe("no-store");
   });
 
+  it("offers first installs only versions a published host build supports", async () => {
+    const announce = (channel: string, version: string, build: number, mod_api_revisions?: string[]) =>
+      exports.default.fetch("https://api.test/v1/releases", {
+        method: "POST",
+        headers: { Authorization: "Bearer test-hook-secret", "Content-Type": "application/json" },
+        body: JSON.stringify({ channel, version, build, mod_api_revisions }),
+      });
+    const newestInstall = () => runInDurableObject(hub(), (instance) => instance.latestModRelease()?.manifest.version);
+    expect((await publish(release("1.0.0"))).status).toBe(204);
+    expect((await publish(release("2.0.0", HOST_B, "2".repeat(40)))).status).toBe(204);
+
+    // Before any build reports its revisions, nothing is excluded.
+    expect(await newestInstall()).toBe("2.0.0");
+    expect((await announce("nightly", "1.0.0", 1)).status).toBe(204);
+    expect(await newestInstall()).toBe("2.0.0");
+
+    // The newest version waits for a host build, and stays recorded and available to its hosts.
+    expect((await announce("nightly", "1.0.0", 2, [HOST_A])).status).toBe(204);
+    expect(await newestInstall()).toBe("1.0.0");
+    const hostB = await update({ host_revision: HOST_B, api_revisions: HOST_B });
+    expect((await hostB.json() as ModRelease).manifest.version).toBe("2.0.0");
+    const download = await exports.default.fetch("https://api.test/v1/mod/download");
+    expect(download.status).toBe(200);
+    await download.arrayBuffer();
+
+    // A notice without revisions changes nothing; any channel's build makes a version available.
+    expect((await announce("nightly", "1.0.0", 3)).status).toBe(204);
+    expect(await newestInstall()).toBe("1.0.0");
+    expect((await announce("stable", "1.0.0", 1, [HOST_B])).status).toBe(204);
+    expect(await newestInstall()).toBe("2.0.0");
+
+    // Each channel's newest notice replaces its revisions, even a re-run of an older build.
+    expect((await announce("stable", "1.0.0", 1, [HOST_A])).status).toBe(204);
+    expect(await newestInstall()).toBe("1.0.0");
+
+    // With no supported version, the download is unavailable rather than one that cannot load.
+    expect((await announce("stable", "1.0.0", 1, ["c".repeat(40)])).status).toBe(204);
+    expect((await announce("nightly", "1.0.0", 2, ["c".repeat(40)])).status).toBe(204);
+    expect(await newestInstall()).toBeUndefined();
+    expect((await exports.default.fetch("https://api.test/v1/mod/download")).status).toBe(404);
+
+    expect((await announce("nightly", "1.0.0", 4, ["not-a-revision"])).status).toBe(400);
+  });
+
   it("rejects corrupt, non-component and oversized uploads before publication", async () => {
     const url = `https://api.test/v1/mod/assets/${HASH}`;
     const headers = { Authorization: "Bearer test-mod-hook-secret" };

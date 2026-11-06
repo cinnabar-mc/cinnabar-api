@@ -96,6 +96,7 @@ export interface ReleaseHookRequest {
   channel: Channel;
   version: string;
   build?: number;
+  mod_api_revisions?: string[];
 }
 
 export type ServerMessage =

@@ -173,7 +173,7 @@ app.post("/v1/releases", async (c) => {
     return c.body(null, 400);
   }
   if (!isReleaseHookRequest(body)) return c.body(null, 400);
-  await hubFor(c.env).recordRelease(body.channel, body.version, body.build);
+  await hubFor(c.env).recordRelease(body.channel, body.version, body.build, body.mod_api_revisions);
   return c.body(null, 204);
 });
 

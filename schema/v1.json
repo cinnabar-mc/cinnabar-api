@@ -112,6 +112,14 @@
         },
         "build": {
           "$ref": "#/$defs/Build"
+        },
+        "mod_api_revisions": {
+          "description": "Mod API revisions this published build supports.",
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/GitRevision"
+          }
         }
       }
     },

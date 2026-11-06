@@ -15,7 +15,7 @@ messages against it.
 | `GET /v1/users/count` | Public `{"unique":0}` total of verified accounts since tracking was deployed. Deduplicates reconnects and devices, includes visibility-off accounts, and persists after disconnects and restarts. Allows cross-origin reads and caching for 60 seconds; no historical backfill. |
 | `GET /v1/presence/players` | Private `{"names":[]}` list of verified names for those same online accounts. Requires a bearer token matching the `PRESENCE_READ_SECRET` Worker secret; never cached or exposed through CORS. |
 | `GET /v1/presence/history?range=24h` | Public anonymous player-count history. Ranges: `24h` (one minute), `7d` (ten minutes), `30d` (one hour). Allows cross-origin reads and caching for 60 seconds. |
-| `POST /v1/releases` | Release hook. `Authorization: Bearer <RELEASE_HOOK_SECRET>`, body `{"channel","version","build"}`; records and broadcasts only a newer (version, build) pair. Repeats and older records are no-ops. Omitted v1 builds mean zero. |
+| `POST /v1/releases` | Release hook. `Authorization: Bearer <RELEASE_HOOK_SECRET>`, body `{"channel","version","build","mod_api_revisions"}`; records and broadcasts only a newer (version, build) pair. Repeats and older records are no-ops. Omitted v1 builds mean zero. `mod_api_revisions`, when present, always replaces that channel's supported revisions. |
 | `POST /v1/mod/releases` | Requires a dedicated `MOD_RELEASE_HOOK_SECRET` bearer credential; the native release-hook credential is rejected. Publishes `{manifest, download_url}` for an immutable stable mod version. Identical retries return 204; changed metadata for that package/version returns 409. |
 | `PUT /v1/mod/assets/:sha256` | Dedicated mod-publisher bearer credential required. Verifies the component header, SHA-256 and 32 MiB limit before storing it under its content hash. Uploading alone does not publish it. |
 | `GET /v1/mod/assets/:sha256` | Anonymous immutable WASM download, available only after metadata publication. Never exposes the private source repository or an upload credential. |
@@ -108,7 +108,9 @@ selected API revision is supported, identity, size and digest before atomic inst
 Deploy this API support before configuring publishers to call the hook. A publisher
 must upload its release artifact before registering the matching metadata. Changing
 bytes or compatibility metadata requires a new package version. Keep downloads for
-previously published versions available. Configure publisher credentials through its
+previously published versions available. `GET /v1/mod/download` serves the newest version a
+published host build supports, from the `mod_api_revisions` each build reports in its release
+notice. A version needing a newer host waits for that build, without any publisher action. Configure publisher credentials through its
 secret store, using the same value as this Worker's `MOD_RELEASE_HOOK_SECRET`.
 The configured `MOD_RELEASE_REPOSITORY` and `MOD_RELEASE_PACKAGE`
 restrict that credential to its repository and package and immutable versioned GitHub
