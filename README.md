@@ -190,10 +190,12 @@ CI deploys every push to `main` after the tests pass. The private cosmetics repo
 own assets and catalog. The job runs in the `production` environment, whose `CLOUDFLARE_API_TOKEN` secret only
 `main` can read. CI also copies the repository's `PRESENCE_READ_SECRET` Actions secret
 into the Worker before deployment; configure the same value in the administrative consumer.
+It likewise copies the `production` environment's `RELEASE_HOOK_SECRET`; keep the same value in the
+`cinnabar-mc/cinnabar` `release` environment's `CINNABAR_API_RELEASE_HOOK_SECRET`.
 A manual deploy runs the Worker deployment after configuring secrets:
 
 ```sh
-pnpm exec wrangler secret put RELEASE_HOOK_SECRET   # once
+pnpm exec wrangler secret put RELEASE_HOOK_SECRET   # same value as the native release publisher
 pnpm exec wrangler secret put PRESENCE_READ_SECRET  # same value as the consumer
 pnpm exec wrangler deploy
 ```

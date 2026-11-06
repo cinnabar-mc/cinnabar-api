@@ -76,6 +76,13 @@ jobs:
           : "${MOD_RELEASE_HOOK_SECRET:?Missing MOD_RELEASE_HOOK_SECRET}"
           printf '%s' "$MOD_RELEASE_HOOK_SECRET" | pnpm exec wrangler secret put MOD_RELEASE_HOOK_SECRET
       - if: steps.head.outputs.current == 'true'
+        name: Configure the native release hook
+        env:
+          RELEASE_HOOK_SECRET: ${{ secrets.RELEASE_HOOK_SECRET }}
+        run: |
+          : "${RELEASE_HOOK_SECRET:?Missing RELEASE_HOOK_SECRET}"
+          printf '%s' "$RELEASE_HOOK_SECRET" | pnpm exec wrangler secret put RELEASE_HOOK_SECRET
+      - if: steps.head.outputs.current == 'true'
         name: Mirror cosmetic assets as static files
         run: node scripts/sync-static-assets.mjs static
       - if: steps.head.outputs.current == 'true'
