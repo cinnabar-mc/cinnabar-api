@@ -206,13 +206,8 @@ export class Hub extends DurableObject<Env> {
     return encodeBase64Url(new Uint8Array(digest));
   }
 
-  /**
-   * Stores and broadcasts only a newer (version, build) identity; omitted v1 builds mean zero.
-   * Supported mod API revisions apply even to an older identity: a re-run of an older nightly
-   * still replaces that channel's downloads.
-   */
-  async recordRelease(channel: Channel, version: string, build = 0, modApiRevisions?: string[]): Promise<ReleaseRecord> {
-    if (modApiRevisions) this.ctx.storage.transactionSync(() => this.mods.setReleasedApis(channel, modApiRevisions));
+  /** Stores and broadcasts only a newer (version, build) identity; omitted v1 builds mean zero. */
+  async recordRelease(channel: Channel, version: string, build = 0): Promise<ReleaseRecord> {
     const { record, newer } = await this.ctx.storage.transaction(async (txn) => {
       const previous = await txn.get<ReleaseRecord>(releaseKey(channel));
       if (previous && compareReleases(version, build, previous.version, previous.build) <= 0) {
@@ -226,6 +221,11 @@ export class Hub extends DurableObject<Env> {
       for (const ws of this.byChannel.get(channel) ?? []) send(ws, { type: "release", ...record });
     }
     return record;
+  }
+
+  /** Replaces the mod API revisions supported by the host build published on this channel. */
+  recordReleasedModApis(channel: Channel, revisions: string[]): void {
+    this.ctx.storage.transactionSync(() => this.mods.setReleasedApis(channel, revisions));
   }
 
   /** Publishes all release metadata and compatibility indexes atomically. */

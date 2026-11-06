@@ -112,9 +112,21 @@
         },
         "build": {
           "$ref": "#/$defs/Build"
+        }
+      }
+    },
+    "ModHostRevisionsRequest": {
+      "description": "POST /v1/mod/host-revisions body: the mod API revisions the build now published on a channel supports.",
+      "type": "object",
+      "required": [
+        "channel",
+        "mod_api_revisions"
+      ],
+      "properties": {
+        "channel": {
+          "$ref": "#/$defs/Channel"
         },
         "mod_api_revisions": {
-          "description": "Mod API revisions this published build supports.",
           "type": "array",
           "maxItems": 32,
           "items": {

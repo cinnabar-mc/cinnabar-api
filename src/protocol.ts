@@ -96,7 +96,11 @@ export interface ReleaseHookRequest {
   channel: Channel;
   version: string;
   build?: number;
-  mod_api_revisions?: string[];
+}
+
+export interface ModHostRevisionsRequest {
+  channel: Channel;
+  mod_api_revisions: string[];
 }
 
 export type ServerMessage =
@@ -133,6 +137,7 @@ const clientValidators = Object.fromEntries(
   Object.entries(defNames).map(([type, def]) => [type, validatorFor(def)]),
 ) as Record<keyof ClientMessages, Validator>;
 const hookValidator = validatorFor("ReleaseHookRequest");
+const hostRevisionsValidator = validatorFor("ModHostRevisionsRequest");
 const channelValidator = validatorFor("Channel");
 
 /** Result of decoding one inbound text frame. */
@@ -166,6 +171,11 @@ export function decodeClientMessage(text: string): Decoded {
 
 export function isReleaseHookRequest(value: unknown): value is ReleaseHookRequest {
   return value !== undefined && hookValidator.validate(value).valid;
+}
+
+/** Checks a report of the mod API revisions a published host build supports. */
+export function isModHostRevisionsRequest(value: unknown): value is ModHostRevisionsRequest {
+  return value !== undefined && hostRevisionsValidator.validate(value).valid;
 }
 
 export function isChannel(value: unknown): value is Channel {
