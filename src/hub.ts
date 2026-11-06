@@ -223,6 +223,11 @@ export class Hub extends DurableObject<Env> {
     return record;
   }
 
+  /** Replaces the mod API revisions supported by the host build published on this channel. */
+  recordReleasedModApis(channel: Channel, revisions: string[]): void {
+    this.ctx.storage.transactionSync(() => this.mods.setReleasedApis(channel, revisions));
+  }
+
   /** Publishes all release metadata and compatibility indexes atomically. */
   publishModRelease(release: ModRelease): boolean {
     return this.ctx.storage.transactionSync(() => this.mods.publish(release));

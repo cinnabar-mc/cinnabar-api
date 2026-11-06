@@ -115,6 +115,26 @@
         }
       }
     },
+    "ModHostRevisionsRequest": {
+      "description": "POST /v1/mod/host-revisions body: the mod API revisions the build now published on a channel supports.",
+      "type": "object",
+      "required": [
+        "channel",
+        "mod_api_revisions"
+      ],
+      "properties": {
+        "channel": {
+          "$ref": "#/$defs/Channel"
+        },
+        "mod_api_revisions": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/GitRevision"
+          }
+        }
+      }
+    },
     "ReleaseRecord": {
       "description": "Latest accepted release identity for a channel.",
       "type": "object",

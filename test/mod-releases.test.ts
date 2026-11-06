@@ -124,6 +124,63 @@ describe("revision-aware mod releases", () => {
     expect(response.headers.get("Cache-Control")).toBe("no-store");
   });
 
+  it("offers first installs only versions a published host build supports", async () => {
+    const report = (channel: string, mod_api_revisions: unknown, secret = "test-hook-secret") =>
+      exports.default.fetch("https://api.test/v1/mod/host-revisions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${secret}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ channel, mod_api_revisions }),
+      });
+    const newestInstall = () => runInDurableObject(hub(), (instance) => instance.latestModRelease()?.manifest.version);
+    expect((await publish(release("1.0.0"))).status).toBe(204);
+    expect((await publish(release("2.0.0", HOST_B, "2".repeat(40)))).status).toBe(204);
+
+    // Before any build reports its revisions, nothing is excluded.
+    expect(await newestInstall()).toBe("2.0.0");
+
+    // The newest version waits for a host build, and stays available to hosts reporting it.
+    expect((await report("nightly", [HOST_A])).status).toBe(204);
+    expect(await newestInstall()).toBe("1.0.0");
+    const hostB = await update({ host_revision: HOST_B, api_revisions: HOST_B });
+    expect((await hostB.json() as ModRelease).manifest.version).toBe("2.0.0");
+    const download = await exports.default.fetch("https://api.test/v1/mod/download");
+    expect(download.status).toBe(200);
+    await download.arrayBuffer();
+
+    // Any channel's build makes a version available, and each report replaces its channel's list.
+    expect((await report("stable", [HOST_B])).status).toBe(204);
+    expect(await newestInstall()).toBe("2.0.0");
+    expect((await report("stable", [HOST_A, HOST_A])).status).toBe(204);
+    expect(await newestInstall()).toBe("1.0.0");
+
+    // Reports survive a restart.
+    await evictDurableObject(hub());
+    expect(await newestInstall()).toBe("1.0.0");
+
+    // An empty report excludes everything rather than restoring the unfiltered start.
+    expect((await report("stable", [])).status).toBe(204);
+    expect((await report("nightly", [])).status).toBe(204);
+    expect(await newestInstall()).toBeUndefined();
+    expect((await exports.default.fetch("https://api.test/v1/mod/download")).status).toBe(404);
+  });
+
+  it("accepts a report of every supported revision and rejects invalid ones", async () => {
+    const report = (channel: unknown, mod_api_revisions: unknown, secret = "test-hook-secret") =>
+      exports.default.fetch("https://api.test/v1/mod/host-revisions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${secret}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ channel, mod_api_revisions }),
+      });
+    expect((await report("nightly", Array(32).fill(HOST_A))).status).toBe(204);
+    expect((await report("nightly", Array(33).fill(HOST_A))).status).toBe(400);
+    expect((await report("nightly", ["not-a-revision"])).status).toBe(400);
+    expect((await report("nightly", undefined)).status).toBe(400);
+    expect((await report("unknown", [HOST_A])).status).toBe(400);
+    expect((await report("nightly", [HOST_A], "wrong")).status).toBe(401);
+    // Publishers of mods hold a separate credential, which cannot report hosts.
+    expect((await report("nightly", [HOST_A], "test-mod-hook-secret")).status).toBe(401);
+  });
+
   it("rejects corrupt, non-component and oversized uploads before publication", async () => {
     const url = `https://api.test/v1/mod/assets/${HASH}`;
     const headers = { Authorization: "Bearer test-mod-hook-secret" };

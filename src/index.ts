@@ -6,13 +6,15 @@ import { downloadCount, DownloadSourceError } from "./download-count";
 import { count } from "./metrics";
 import { isModRelease, isModUpdateQuery, publisherAllows } from "./mod-releases";
 import { modAssetKey, uploadModAsset, downloadModAsset } from "./mod-assets";
-import { isReleaseHookRequest } from "./protocol";
+import { isModHostRevisionsRequest, isReleaseHookRequest } from "./protocol";
 import { hubFor } from "./routing";
 import { DEFAULT_HISTORY_RANGE, HISTORY_RANGES, loadHistory, snapshotHistory, type HistoryRange } from "./history-snapshot";
 
 export { Hub } from "./hub";
 
 const MAX_HOOK_BODY_BYTES = 1024;
+// Fits the schema's 32 revisions of 40 characters, quoted and comma-separated, with some spacing.
+const MAX_HOST_REVISIONS_BODY_BYTES = 2048;
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -160,18 +162,17 @@ app.get("/v1/mod/update", async (c) => {
   return release ? c.json(release) : c.body(null, 204);
 });
 
+app.post("/v1/mod/host-revisions", async (c) => {
+  if (!(await bearerMatches(c.req.header("Authorization"), c.env.RELEASE_HOOK_SECRET))) return c.body(null, 401);
+  const body = await readBoundedJson(c.req.raw, MAX_HOST_REVISIONS_BODY_BYTES);
+  if (!isModHostRevisionsRequest(body)) return c.body(null, 400);
+  await hubFor(c.env).recordReleasedModApis(body.channel, body.mod_api_revisions);
+  return c.body(null, 204);
+});
+
 app.post("/v1/releases", async (c) => {
   if (!(await bearerMatches(c.req.header("Authorization"), c.env.RELEASE_HOOK_SECRET))) return c.body(null, 401);
-  const declared = Number(c.req.header("Content-Length") ?? 0);
-  if (!(declared <= MAX_HOOK_BODY_BYTES)) return c.body(null, 400);
-  const text = await readBounded(c.req.raw.body, MAX_HOOK_BODY_BYTES);
-  if (text === null) return c.body(null, 400);
-  let body: unknown;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    return c.body(null, 400);
-  }
+  const body = await readBoundedJson(c.req.raw, MAX_HOOK_BODY_BYTES);
   if (!isReleaseHookRequest(body)) return c.body(null, 400);
   await hubFor(c.env).recordRelease(body.channel, body.version, body.build);
   return c.body(null, 204);
@@ -181,6 +182,18 @@ app.get("/v1/connect", (c) => {
   if (c.req.header("Upgrade")?.toLowerCase() !== "websocket") return c.body(null, 426, { Upgrade: "websocket" });
   return hubFor(c.env).fetch(c.req.raw);
 });
+
+/** Parses a JSON body of at most `max` bytes, or returns undefined if it is larger or malformed. */
+async function readBoundedJson(request: Request, max: number): Promise<unknown> {
+  if (!(Number(request.headers.get("Content-Length") ?? 0) <= max)) return undefined;
+  const text = await readBounded(request.body, max);
+  if (text === null) return undefined;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
 
 /** Reads the body as UTF-8, or returns null (cancelling the stream) once it passes `max` bytes. */
 async function readBounded(stream: ReadableStream<Uint8Array> | null, max: number): Promise<string | null> {

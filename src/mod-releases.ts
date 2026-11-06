@@ -86,6 +86,11 @@ export class ModReleases {
       PRIMARY KEY (package, repository, revision, version)
     )`);
     sql.exec("CREATE TABLE IF NOT EXISTS mod_release_assets (sha256 TEXT PRIMARY KEY, size INTEGER NOT NULL)");
+    sql.exec(`CREATE TABLE IF NOT EXISTS released_mod_apis (
+      channel TEXT NOT NULL, revision TEXT NOT NULL,
+      PRIMARY KEY (channel, revision)
+    )`);
+    sql.exec("CREATE TABLE IF NOT EXISTS released_mod_api_channels (channel TEXT PRIMARY KEY)");
   }
 
   /** Stores an immutable version, accepts retries, and rejects changed metadata for that version. */
@@ -123,8 +128,25 @@ export class ModReleases {
     return best;
   }
 
-  /** Selects the highest published stable version for a first installation. */
+  /** Replaces the mod API revisions that the host build currently on this channel supports. */
+  setReleasedApis(channel: string, revisions: readonly string[]): void {
+    this.sql.exec("INSERT OR IGNORE INTO released_mod_api_channels (channel) VALUES (?)", channel);
+    this.sql.exec("DELETE FROM released_mod_apis WHERE channel = ?", channel);
+    for (const revision of new Set(revisions)) {
+      this.sql.exec("INSERT INTO released_mod_apis (channel, revision) VALUES (?, ?)", channel, revision);
+    }
+  }
+
+  /**
+   * Selects the highest stable version for a first installation that a published host build can
+   * load. A catalogue release may need a host that is not out yet, and only updates, which name
+   * their host's revisions, can match it. Until any build has reported its revisions, none is
+   * excluded, so that the download survives deployment; after that, an empty report excludes all.
+   */
   latest(packageName: string, hostRepository: string): ModRelease | null {
+    const reported = this.sql.exec("SELECT 1 FROM released_mod_api_channels LIMIT 1").toArray().length > 0;
+    const released = new Set(this.sql.exec<{ revision: string }>("SELECT revision FROM released_mod_apis").toArray()
+      .map((row) => row.revision));
     const rows = this.sql.exec<{ release: string }>(
       "SELECT release FROM mod_releases WHERE package = ?", packageName,
     );
@@ -132,6 +154,7 @@ export class ModReleases {
     for (const row of rows) {
       const candidate = JSON.parse(row.release) as ModRelease;
       if (candidate.manifest.host.repository !== hostRepository) continue;
+      if (reported && !released.has(candidate.manifest.host.api_revision)) continue;
       if (!best || compareVersions(candidate.manifest.version, best.manifest.version) > 0) best = candidate;
     }
     return best;
