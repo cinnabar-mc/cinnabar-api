@@ -17,6 +17,8 @@
     "MOD_RELEASE_PACKAGE": "cinnabar-client-mod",
     "MOD_DOWNLOAD_BASE_URL": "https://api.cinnabar.gg",
     "MOD_HOST_REPOSITORY": "https://github.com/cinnabar-mc/cinnabar.git",
+    // Comma-separated mod versions that updates and first installs must no longer offer.
+    "MOD_WITHDRAWN_VERSIONS": "0.2.16",
     "COSMETICS_REPOSITORY_ID": "1426158837",
     "COSMETICS_ADMIN_WORKFLOW": "cinnabar-mc/cinnabar-cosmetics/.github/workflows/entitlements.yml@refs/heads/main",
     // The authorization service's OIDC issuer for Minecraft multiplayer tokens.

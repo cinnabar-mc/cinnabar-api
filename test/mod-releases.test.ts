@@ -124,6 +124,19 @@ describe("revision-aware mod releases", () => {
     expect(response.headers.get("Cache-Control")).toBe("no-store");
   });
 
+  it("stops offering a withdrawn version to updates and first installs", async () => {
+    expect((await publish(release("1.0.0"))).status).toBe(204);
+    expect((await publish(release("9.9.9", HOST_A, "2".repeat(40)))).status).toBe(204);
+    const offered = await update();
+    expect(offered.status).toBe(200);
+    expect((await offered.json() as ModRelease).manifest.version).toBe("1.0.0");
+    const latest = await runInDurableObject(hub(), (instance) => instance.latestModRelease());
+    expect(latest?.manifest.version).toBe("1.0.0");
+    expect((await update({ current_version: "1.0.0", current_revision: "1".repeat(40) })).status).toBe(204);
+    expect((await publish(release("10.0.0", HOST_A, "3".repeat(40)))).status).toBe(204);
+    expect((await (await update()).json() as ModRelease).manifest.version).toBe("10.0.0");
+  });
+
   it("rejects corrupt, non-component and oversized uploads before publication", async () => {
     const url = `https://api.test/v1/mod/assets/${HASH}`;
     const headers = { Authorization: "Bearer test-mod-hook-secret" };

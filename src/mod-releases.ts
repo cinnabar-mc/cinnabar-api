@@ -74,6 +74,11 @@ function canonicalRelease(release: ModRelease): ModRelease {
   };
 }
 
+/** Reads the configured comma-separated versions that update and first-install selection must skip. */
+export function withdrawnVersions(value: string | undefined): ReadonlySet<string> {
+  return new Set((value ?? "").split(",").map((version) => version.trim()).filter(Boolean));
+}
+
 /** Retains immutable releases and indexes the stable mod API revisions each one supports. */
 export class ModReleases {
   constructor(private readonly sql: SqlStorage) {
@@ -105,8 +110,8 @@ export class ModReleases {
     return true;
   }
 
-  /** Selects the highest newer stable version supporting this API generation, without a fallback. */
-  update(query: ModUpdateQuery & { package: string; host_repository: string }): ModRelease | null {
+  /** Selects the highest newer stable version supporting this API generation that is not withdrawn, without a fallback. */
+  update(query: ModUpdateQuery & { package: string; host_repository: string; withdrawn: ReadonlySet<string> }): ModRelease | null {
     const revisions = query.api_revisions.split(",");
     const placeholders = revisions.map(() => "?").join(",");
     const rows = this.sql.exec<{ release: string }>(`SELECT r.release FROM mod_releases r
@@ -117,21 +122,22 @@ export class ModReleases {
     for (const row of rows) {
       const candidate = JSON.parse(row.release) as ModRelease;
       const m = candidate.manifest;
+      if (query.withdrawn.has(m.version)) continue;
       if (m.revision === query.current_revision || compareVersions(m.version, query.current_version) <= 0) continue;
       if (!best || compareVersions(m.version, best.manifest.version) > 0) best = candidate;
     }
     return best;
   }
 
-  /** Selects the highest published stable version for a first installation. */
-  latest(packageName: string, hostRepository: string): ModRelease | null {
+  /** Selects the highest published stable version that is not withdrawn for a first installation. */
+  latest(packageName: string, hostRepository: string, withdrawn: ReadonlySet<string>): ModRelease | null {
     const rows = this.sql.exec<{ release: string }>(
       "SELECT release FROM mod_releases WHERE package = ?", packageName,
     );
     let best: ModRelease | null = null;
     for (const row of rows) {
       const candidate = JSON.parse(row.release) as ModRelease;
-      if (candidate.manifest.host.repository !== hostRepository) continue;
+      if (candidate.manifest.host.repository !== hostRepository || withdrawn.has(candidate.manifest.version)) continue;
       if (!best || compareVersions(candidate.manifest.version, best.manifest.version) > 0) best = candidate;
     }
     return best;

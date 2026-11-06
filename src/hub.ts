@@ -1,7 +1,7 @@
 import { UniqueUsers } from "./unique-users";
 import { catalog, admitLoadout } from "./cosmetics";
 import { loadCatalog, type Catalog } from "./catalog-store";
-import { ModReleases, type ModRelease, type ModUpdateQuery } from "./mod-releases";
+import { ModReleases, withdrawnVersions, type ModRelease, type ModUpdateQuery } from "./mod-releases";
 import { DurableObject } from "cloudflare:workers";
 import { PresenceHistory } from "./presence-history";
 import { LoginRewards, type LoginReward } from "./login-rewards";
@@ -230,12 +230,15 @@ export class Hub extends DurableObject<Env> {
 
   /** Resolves only a newer mod compatible with the installed native commit. */
   modUpdate(query: ModUpdateQuery): ModRelease | null {
-    return this.mods.update({ ...query, package: this.env.MOD_RELEASE_PACKAGE ?? "", host_repository: this.env.MOD_HOST_REPOSITORY ?? "" });
+    return this.mods.update({
+      ...query, package: this.env.MOD_RELEASE_PACKAGE ?? "", host_repository: this.env.MOD_HOST_REPOSITORY ?? "",
+      withdrawn: withdrawnVersions(this.env.MOD_WITHDRAWN_VERSIONS),
+    });
   }
 
   /** Resolves the newest official stable mod for a first installation. */
   latestModRelease(): ModRelease | null {
-    return this.mods.latest(this.env.MOD_RELEASE_PACKAGE ?? "", this.env.MOD_HOST_REPOSITORY ?? "");
+    return this.mods.latest(this.env.MOD_RELEASE_PACKAGE ?? "", this.env.MOD_HOST_REPOSITORY ?? "", withdrawnVersions(this.env.MOD_WITHDRAWN_VERSIONS));
   }
 
   /** Returns the expected byte count only for an artifact belonging to a published release. */

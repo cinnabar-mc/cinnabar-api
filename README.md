@@ -108,7 +108,9 @@ selected API revision is supported, identity, size and digest before atomic inst
 Deploy this API support before configuring publishers to call the hook. A publisher
 must upload its release artifact before registering the matching metadata. Changing
 bytes or compatibility metadata requires a new package version. Keep downloads for
-previously published versions available. Configure publisher credentials through its
+previously published versions available. To stop offering a broken version, add it to
+the `MOD_WITHDRAWN_VERSIONS` variable: updates and first-install downloads skip it, while
+its record and hash-addressed download remain. Configure publisher credentials through its
 secret store, using the same value as this Worker's `MOD_RELEASE_HOOK_SECRET`.
 The configured `MOD_RELEASE_REPOSITORY` and `MOD_RELEASE_PACKAGE`
 restrict that credential to its repository and package and immutable versioned GitHub
