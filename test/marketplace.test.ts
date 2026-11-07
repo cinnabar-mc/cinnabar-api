@@ -97,6 +97,17 @@ function next(client: Client, label: string): Promise<Record<string, unknown>> {
   return Promise.race([client.next(), new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`no ${label}`)), 1500))]);
 }
 
+/** Whether `signature` (unpadded base64url) is the test signer's Ed25519 signature of `text`. */
+async function verifies(text: string, signature: string): Promise<boolean> {
+  const key = await crypto.subtle.importKey("spki", Uint8Array.from(atob(PUBLIC_KEY), (c) => c.charCodeAt(0)), "Ed25519", false, ["verify"]);
+  const bytes = Uint8Array.from(atob(signature.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+  return crypto.subtle.verify("Ed25519", key, bytes, new TextEncoder().encode(text));
+}
+
+/** Posts a multipart submission as `browser`. */
+const upload = (browser: Browser, form: FormData) =>
+  api("/submissions", { method: "POST", body: form, headers: { Cookie: browser.cookie, Origin: SITE, "X-Cinnabar-CSRF": browser.csrf } });
+
 /** Builds a component carrying only the given top-level custom sections. */
 function component(sections: [string, string][], layer = [0x0d, 0, 1, 0]): Uint8Array {
   const bytes = [0, 0x61, 0x73, 0x6d, ...layer];
@@ -113,7 +124,7 @@ async function submit(browser: Browser, slug: string, version: string, grants: o
   const form = new FormData();
   form.set("listing", JSON.stringify({ slug, name: slug, summary: `A test mod called ${slug}.`, version, ...extra }));
   form.set("file", new File([component([["version", version], ["cinnabar:grants", JSON.stringify(grants)]])], `${slug}.wasm`));
-  const result = await api("/submissions", { method: "POST", body: form, headers: { Cookie: browser.cookie, Origin: SITE, "X-Cinnabar-CSRF": browser.csrf } });
+  const result = await upload(browser, form);
   if (result.status === 200 && scan) await scanOne();
   return result;
 }
@@ -122,6 +133,10 @@ async function submit(browser: Browser, slug: string, version: string, grants: o
 const scanner = (path: string, body?: unknown, lease?: string) => api(`/internal/marketplace/${path}`, {
   method: "POST", headers: { Authorization: "Bearer test-scanner-token", "Content-Type": "application/json", ...(lease ? { "X-Scan-Lease": lease } : {}) },
   body: body === undefined ? undefined : JSON.stringify(body),
+});
+/** Fetches a claimed job's file with the scanner credential and `lease`. */
+const scanFile = (job: any, sha256: string, lease: string = job.lease) => api(`/internal/marketplace/jobs/${job.id}/files/${sha256}`, {
+  headers: { Authorization: "Bearer test-scanner-token", "X-Scan-Lease": lease },
 });
 async function claim(): Promise<any> { return ((await (await scanner("claim")).json()) as any).job; }
 function report(job: any, extra: object = {}) {
@@ -262,9 +277,7 @@ describe("submission, review and delivery", () => {
     };
     expect(listing.reviewed_by).toBe("PixelWarden");
     expect(listing.capabilities).toEqual(["hud", "player_state"]);
-    const key = await crypto.subtle.importKey("spki", Uint8Array.from(atob(PUBLIC_KEY), (c) => c.charCodeAt(0)), { name: "Ed25519" }, false, ["verify"]);
-    const signature = Uint8Array.from(atob(listing.release.signature.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
-    expect(await crypto.subtle.verify({ name: "Ed25519" }, key, signature, new TextEncoder().encode(listing.release.statement))).toBe(true);
+    expect(await verifies(listing.release.statement, listing.release.signature)).toBe(true);
     expect(JSON.parse(listing.release.statement)).toMatchObject({ slug: "compass", version: "0.1.0", sha256: version.sha256 });
     const file = await api(`/mods/assets/${version.sha256}`);
     expect(file.status).toBe(200);
@@ -399,8 +412,7 @@ describe("upload and publication pipeline", () => {
     for (const path of ["/mods/historical-signature", `/mods/historical-signature/releases/${original.version}/${original.sha256}`]) {
       expect(await (await api(path)).json()).toMatchObject({ release: { statement: historical, signature } });
     }
-    const key = await crypto.subtle.importKey("spki", Uint8Array.from(atob(PUBLIC_KEY), c => c.charCodeAt(0)), "Ed25519", false, ["verify"]);
-    expect(await crypto.subtle.verify("Ed25519", key, Uint8Array.from(atob(signature.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0)), new TextEncoder().encode(historical))).toBe(true);
+    expect(await verifies(historical, signature)).toBe(true);
   });
 
   it("holds legacy signatures without original statement bytes for fresh scanning and review", async () => {
@@ -516,9 +528,7 @@ describe("upload and publication pipeline", () => {
     const body = JSON.parse(text) as { issued_at: number; expires_at: number };
     expect(body.issued_at).toBeLessThanOrEqual(Date.now());
     expect(body.expires_at - body.issued_at).toBe(15 * 60_000);
-    const key = await crypto.subtle.importKey("spki", Uint8Array.from(atob(PUBLIC_KEY), c => c.charCodeAt(0)), { name: "Ed25519" }, false, ["verify"]);
-    const signature = Uint8Array.from(atob(response.headers.get("X-Cinnabar-Signature")!.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
-    expect(await crypto.subtle.verify("Ed25519", key, signature, new TextEncoder().encode(text))).toBe(true);
+    expect(await verifies(text, response.headers.get("X-Cinnabar-Signature")!)).toBe(true);
   });
 
   it("authenticates uploads before reading bodies and gives scanner tokens no staff privileges", async () => {
@@ -541,14 +551,10 @@ describe("upload and publication pipeline", () => {
     const bytes = await staffFile.arrayBuffer();
     expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(409);
     const job = await claim();
-    const scanFile = await api(`/internal/marketplace/jobs/${job.id}/files/${v.sha256}`, {
-      headers: { Authorization: "Bearer test-scanner-token", "X-Scan-Lease": job.lease },
-    });
-    expect(scanFile.status).toBe(200);
-    expect(await scanFile.arrayBuffer()).toEqual(bytes);
-    expect((await api(`/internal/marketplace/jobs/${job.id}/files/${v.sha256}`, {
-      headers: { Authorization: "Bearer test-scanner-token", "X-Scan-Lease": "wrong" },
-    })).status).toBe(404);
+    const file = await scanFile(job, v.sha256);
+    expect(file.status).toBe(200);
+    expect(await file.arrayBuffer()).toEqual(bytes);
+    expect((await scanFile(job, v.sha256, "wrong")).status).toBe(404);
     const bad = report(job, { sha256: "0".repeat(64) });
     expect((await scanner(`jobs/${job.id}/complete`, bad, job.lease)).status).toBe(422);
     expect((await scanner(`jobs/${job.id}/complete`, report(job, { policy: "old-policy" }), job.lease)).status).toBe(422);
@@ -697,8 +703,7 @@ describe("upload and publication pipeline", () => {
     const png = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aOioAAAAASUVORK5CYII="), c => c.charCodeAt(0));
     form.append("images", new File([png], "Screenshot.png", { type: "image/png" }));
     form.set("image_metadata", JSON.stringify([{ caption: "HUD screenshot", alt: "Coordinates above the hotbar" }]));
-    const result = await api("/submissions", { method: "POST", body: form,
-      headers: { Cookie: creator.cookie, Origin: SITE, "X-Cinnabar-CSRF": creator.csrf } });
+    const result = await upload(creator, form);
     expect(result.status).toBe(200);
     const v = await result.json() as any;
     expect(v).toMatchObject({ category: "Interface", license: "MIT", notes: "Initial screenshot release", scan: { review_ready: false } });
@@ -758,9 +763,7 @@ describe("upload and publication pipeline", () => {
     const rescan = await owner.post(`/staff/versions/${v.id}/rescan`);
     expect(rescan.status).toBe(200);
     const job = await claim();
-    const file = await api(`/internal/marketplace/jobs/${job.id}/files/${v.sha256}`, {
-      headers: { Authorization: "Bearer test-scanner-token", "X-Scan-Lease": job.lease },
-    });
+    const file = await scanFile(job, v.sha256);
     expect(file.status).toBe(200); expect(await file.arrayBuffer()).toEqual(bytes);
     expect((await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).status).toBe(200);
     expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(200);
@@ -775,9 +778,7 @@ describe("upload and publication pipeline", () => {
       form.set("file", new File([component([])], "fixture.wasm"));
       form.append("images", new File([new Uint8Array([137,80,78,71,13,10,26,10,0,0,0,0])], "fixture.png"));
       form.set("image_metadata", JSON.stringify(metadata));
-      const result = await api("/submissions", { method: "POST", body: form,
-        headers: { Cookie: creator.cookie, Origin: SITE, "X-Cinnabar-CSRF": creator.csrf } });
-      expect(result.status).toBe(422);
+      expect((await upload(creator, form)).status).toBe(422);
     }
     expect(await (await creator.get("/me/mods")).json()).toEqual([]);
   });
