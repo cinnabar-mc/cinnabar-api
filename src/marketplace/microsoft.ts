@@ -1,13 +1,13 @@
 import { encodeBase64Url } from "../identity";
 
-export const AUTHORIZE_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize";
+const AUTHORIZE_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize";
 export const TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
 export const XBOX_USER_URL = "https://user.auth.xboxlive.com/user/authenticate";
 export const XSTS_URL = "https://xsts.auth.xboxlive.com/xsts/authorize";
 const SCOPE = "XboxLive.signin";
 
 /** Why a sign-in failed, as a stable code the website can explain. */
-export type SignInError = "cancelled" | "no_xbox_profile" | "child_account" | "xbox_unavailable" | "failed";
+type SignInError = "cancelled" | "no_xbox_profile" | "child_account" | "xbox_unavailable" | "failed";
 
 export class SignInFailure extends Error {
   constructor(readonly code: SignInError) {
@@ -20,9 +20,9 @@ export function randomToken(bytes = 32): string {
   return encodeBase64Url(crypto.getRandomValues(new Uint8Array(bytes)));
 }
 
-/** The PKCE S256 challenge for a verifier. */
-export async function pkceChallenge(verifier: string): Promise<string> {
-  return encodeBase64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))));
+/** Unpadded base64url SHA-256 of UTF-8 text: a PKCE S256 challenge, and the stored form of a session cookie. */
+export async function sha256Base64Url(text: string): Promise<string> {
+  return encodeBase64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text))));
 }
 
 /** The Microsoft consent URL for personal accounts, asking only for Xbox Live sign-in. */

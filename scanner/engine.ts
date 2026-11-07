@@ -7,6 +7,8 @@ import { readComponent } from "../src/marketplace/component";
 import { grantDiff, type Grants, type ListingFields } from "../src/marketplace/policy";
 import { CLIENT_REVISION, PROMPT_VERSION, SCAN_POLICY, VALIDATOR } from "../src/marketplace/scanning";
 
+const IMAGE_FORMATS: Record<string, string> = { png: "image/png", jpeg: "image/jpeg", webp: "image/webp" };
+
 export interface ScanJob {
   id: string; lease: string; sha256: string; bytes: number; policy: string; grants: Grants;
   listing: ListingFields; media: { sha256: string; type: string; bytes: number; caption: string }[];
@@ -53,15 +55,14 @@ export async function analyze(job: ScanJob, bytes: Uint8Array, media: Uint8Array
   for (let i = 0; i < media.length; i++) {
     const image = sharp(media[i], { failOn: "warning", limitInputPixels: 16_777_216, animated: true });
     const metadata = await image.metadata();
-    const formats: Record<string, string> = { png: "image/png", jpeg: "image/jpeg", webp: "image/webp" };
-    if (!metadata.format || formats[metadata.format] !== job.media[i]?.type || (metadata.pages ?? 1) !== 1
+    if (!metadata.format || IMAGE_FORMATS[metadata.format] !== job.media[i]?.type || (metadata.pages ?? 1) !== 1
       || !metadata.width || !metadata.height || metadata.width > 4096 || metadata.height > 4096) throw new Error("Invalid image format, dimensions or animation.");
     await image.raw().toBuffer(); // Force a full decode, including corrupt/truncated pixel data.
   }
   // Treat printable strings and all metadata as hostile evidence, never as scanner instructions.
   const strings = new TextDecoder().decode(bytes).match(/[\x20-\x7e]{8,256}/g)?.slice(0, 64).join("\n").slice(0, 8192) ?? "";
   return { deterministic: findings.length ? "block" : "pass", imports: component.imports, exports: component.exports,
-    findings: findings.slice(0, 32), evidence: { sha256: job.sha256, policy: SCAN_POLICY, client_revision: contract.revision,
+    findings: findings.slice(0, 32), evidence: { sha256: job.sha256, policy: SCAN_POLICY, client_revision: CLIENT_REVISION,
       grants: job.grants, diff: grantDiff(job.previous?.grants ?? {}, job.grants), imports: component.imports,
       exports: component.exports, listing: job.listing, declarations, strings,
       limitations: "Static component validation, host-import policy and image decode. No runtime or source-code audit. AI cannot prove safety." } };

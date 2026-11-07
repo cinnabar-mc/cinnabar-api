@@ -1,17 +1,19 @@
+import type { ModLibraryEntry } from "../protocol";
 import {
-  ROLES, approvalRule, approvalsComplete, atLeast, canApprove, canReview, canSetRole, grantDiff, reachOf,
-  requestedCapabilities, validateListing, type Actor, type Grants, type Reach, type ReviewState, type Role,
+  ROLES, approvalRule, approvalsComplete, atLeast, canApprove, canReview, canSetRole, fieldsOf, grantDiff, reachOf,
+  requestedCapabilities, trimmed, validateListing, type Actor, type Grants, type ListingFields, type Reach, type ReviewState,
+  type Role,
 } from "./policy";
 import { CLIENT_REVISION, MAX_SCAN_ATTEMPTS, SCAN_LEASE_MS, SCAN_MAX_AGE_MS, SCAN_POLICY, parseScanReport, scanReady, type ScanReport } from "./scanning";
 
 export const PLAYER_SESSION_MS = 30 * 24 * 3_600_000;
-export const STAFF_SESSION_MS = 12 * 3_600_000;
+const STAFF_SESSION_MS = 12 * 3_600_000;
 /** Role changes need a sign-in this recent. */
-export const ROLE_CHANGE_SIGN_IN_MS = 10 * 60_000;
-export const OAUTH_STATE_MS = 10 * 60_000;
-export const MAX_PENDING_SUBMISSIONS = 5;
-export const MAX_REPORTS_PER_DAY = 10;
-export const MAX_LIBRARY = 100;
+const ROLE_CHANGE_SIGN_IN_MS = 10 * 60_000;
+const OAUTH_STATE_MS = 10 * 60_000;
+const MAX_PENDING_SUBMISSIONS = 5;
+const MAX_REPORTS_PER_DAY = 10;
+const MAX_LIBRARY = 100;
 const REPORT_REASONS = ["broken", "advantage", "malicious", "stolen", "other"];
 
 /** An HTTP-shaped answer, plus accounts whose live clients should receive their library again. */
@@ -66,6 +68,8 @@ type ListingRow = {
 };
 
 export interface MediaFile { sha256: string; bytes: number; type: "image/png" | "image/jpeg" | "image/webp"; caption: string; alt?: string }
+/** A submitted component already stored under its SHA-256, with the grants read from its bytes and its images. */
+export interface SubmittedFile { sha256: string; bytes: number; grants: Grants | null; media: MediaFile[] }
 type PipelineRow = {
   version_id: number; metadata: string; media: string; baseline: number | null;
   job_id: string; state: "queued" | "running" | "complete" | "failed";
@@ -76,6 +80,12 @@ type PipelineRow = {
 const ok = (body: unknown, extra: Partial<MarketResult> = {}): MarketResult => ({ status: 200, body, ...extra });
 const fail = (status: number, error: string, fields?: Record<string, string>): MarketResult =>
   ({ status, body: fields ? { error, fields } : { error } });
+const reportOf = (p: PipelineRow): ScanReport | null => p.report ? JSON.parse(p.report) as ScanReport : null;
+/** A version's listing snapshot; snapshots migrated from before category, license and notes read them as "". */
+const snapshotOf = (p: PipelineRow): ListingFields => ({ category: "", license: "", notes: "", ...JSON.parse(p.metadata) });
+/** SQL for a version clients may fetch: approved, actually signed, unpulled and with a complete scan. */
+const PUBLISHED = `v.status = 'approved' AND v.signature IS NOT NULL AND v.statement IS NOT NULL AND v.pulled = 0
+  AND EXISTS (SELECT 1 FROM mod_pipeline p WHERE p.version_id = v.id AND p.state = 'complete')`;
 
 /**
  * The marketplace's durable state in the Hub's SQLite: accounts and roles, web sessions, listings, versions,
@@ -118,36 +128,35 @@ export class MarketplaceStore {
       `CREATE TABLE IF NOT EXISTS mod_upload_attempts (creator TEXT NOT NULL, at INTEGER NOT NULL)`,
       `CREATE INDEX IF NOT EXISTS mod_upload_creator ON mod_upload_attempts (creator, at)`,
     ]) sql.exec(statement);
+    /** Runs `statements` once, recording `version` in market_schema. */
+    const migrate = (version: number, ...statements: string[]) => {
+      if (sql.exec("SELECT 1 FROM market_schema WHERE version = ?", version).toArray().length) return;
+      for (const statement of statements) sql.exec(statement);
+      sql.exec("INSERT INTO market_schema (version) VALUES (?)", version);
+    };
     // Upgrade a pre-pipeline draft once, holding formerly approved releases for a fresh scan and review.
-    if (!sql.exec("SELECT 1 FROM market_schema WHERE version = 1").toArray().length) {
-      sql.exec(`INSERT OR IGNORE INTO mod_pipeline (version_id, metadata, job_id)
+    migrate(1,
+      `INSERT OR IGNORE INTO mod_pipeline (version_id, metadata, job_id)
         SELECT v.id, json_object('slug', l.slug, 'name', l.name, 'summary', l.summary, 'description', l.description,
           'source', l.source, 'version', v.version), 'migration-' || v.id
-        FROM mod_versions v JOIN mod_listings l ON l.slug = v.slug`);
-      sql.exec(`DELETE FROM mod_approvals WHERE version_id IN (SELECT v.id FROM mod_versions v JOIN mod_pipeline p ON p.version_id = v.id
-        WHERE p.job_id = 'migration-' || v.id AND p.state = 'queued' AND v.status = 'approved')`);
-      sql.exec(`UPDATE mod_versions SET status = 'submitted', signature = NULL WHERE status = 'approved'
+        FROM mod_versions v JOIN mod_listings l ON l.slug = v.slug`,
+      `DELETE FROM mod_approvals WHERE version_id IN (SELECT v.id FROM mod_versions v JOIN mod_pipeline p ON p.version_id = v.id
+        WHERE p.job_id = 'migration-' || v.id AND p.state = 'queued' AND v.status = 'approved')`,
+      `UPDATE mod_versions SET status = 'submitted', signature = NULL WHERE status = 'approved'
         AND id IN (SELECT version_id FROM mod_pipeline WHERE job_id = 'migration-' || version_id AND state = 'queued')`);
-      sql.exec("INSERT INTO market_schema (version) VALUES (1)");
-    }
     // Old signatures cannot authenticate a newly reconstructed statement after a contract change.
     if (!sql.exec<{ name: string }>("PRAGMA table_info(mod_versions)").toArray().some(column => column.name === "statement")) {
       sql.exec("ALTER TABLE mod_versions ADD COLUMN statement TEXT");
     }
-    if (!sql.exec("SELECT 1 FROM market_schema WHERE version = 2").toArray().length) {
-      sql.exec(`DELETE FROM mod_approvals WHERE version_id IN
-        (SELECT id FROM mod_versions WHERE signature IS NOT NULL AND statement IS NULL)`);
-      sql.exec(`UPDATE mod_pipeline SET state = 'queued', attempts = 0, lease = NULL, lease_until = NULL,
+    migrate(2,
+      `DELETE FROM mod_approvals WHERE version_id IN
+        (SELECT id FROM mod_versions WHERE signature IS NOT NULL AND statement IS NULL)`,
+      `UPDATE mod_pipeline SET state = 'queued', attempts = 0, lease = NULL, lease_until = NULL,
         report = NULL, completed_at = NULL, publish_mode = NULL WHERE version_id IN
-        (SELECT id FROM mod_versions WHERE signature IS NOT NULL AND statement IS NULL)`);
-      sql.exec("UPDATE mod_versions SET status = 'submitted', signature = NULL WHERE signature IS NOT NULL AND statement IS NULL");
-      sql.exec("INSERT INTO market_schema (version) VALUES (2)");
-    }
+        (SELECT id FROM mod_versions WHERE signature IS NOT NULL AND statement IS NULL)`,
+      "UPDATE mod_versions SET status = 'submitted', signature = NULL WHERE signature IS NOT NULL AND statement IS NULL");
     // Preserve send identities across removals and restarts, including libraries created before the clock existed.
-    if (!sql.exec("SELECT 1 FROM market_schema WHERE version = 3").toArray().length) {
-      sql.exec("INSERT OR IGNORE INTO mod_library_clock (xuid, sent_at) SELECT xuid, MAX(sent_at) FROM mod_library GROUP BY xuid");
-      sql.exec("INSERT INTO market_schema (version) VALUES (3)");
-    }
+    migrate(3, "INSERT OR IGNORE INTO mod_library_clock (xuid, sent_at) SELECT xuid, MAX(sent_at) FROM mod_library GROUP BY xuid");
   }
 
   // --- Sign-in -------------------------------------------------------------------------------------------
@@ -189,6 +198,13 @@ export class MarketplaceStore {
     if (!row) return null;
     const role: Role = this.owners.has(row.xuid) ? "owner" : ROLES.includes(row.role as Role) ? row.role as Role : "player";
     return { xuid: row.xuid, gamertag: row.gamertag, role, suspended: !!row.suspended };
+  }
+
+  /** The account currently holding `gamertag`, case-insensitively, or null when nobody with it has signed in. */
+  private accountNamed(gamertag: string): Account | null {
+    const xuid = this.sql.exec<{ xuid: string }>("SELECT xuid FROM market_accounts WHERE gamertag = ? COLLATE NOCASE", gamertag)
+      .toArray()[0]?.xuid;
+    return xuid ? this.account(xuid) : null;
   }
 
   /** Resolves a live session; staff sessions expire after twelve hours, player sessions after thirty days. */
@@ -243,8 +259,7 @@ export class MarketplaceStore {
   }
 
   /** The library entries a player's client should hold, including pulled versions with staff's reason. */
-  library(xuid: string): { slug: string; version: string; sha256: string; bytes: number; grants: Grants; sent_at: string;
-    pulled: boolean; pull_reason?: string }[] {
+  library(xuid: string): ModLibraryEntry[] {
     return this.sql.exec<VersionRow & { sent_at: number }>(`SELECT v.*, l.sent_at FROM mod_library l
       JOIN mod_versions v ON v.id = l.version_id WHERE l.xuid = ? ORDER BY l.sent_at`, xuid).toArray()
       .map((v) => ({ slug: v.slug, version: v.version, sha256: v.sha256, bytes: v.bytes, grants: JSON.parse(v.grants) as Grants,
@@ -256,6 +271,10 @@ export class MarketplaceStore {
       WHERE ${where}`, ...args).toArray();
   }
 
+  private versionRow(id: number): VersionRow | undefined {
+    return this.versions("v.id = ?", id)[0];
+  }
+
   private approvals(versionId: number): { xuid: string; admin: boolean; at: number; gamertag: string }[] {
     return this.sql.exec<{ xuid: string; admin: number; at: number }>(
       "SELECT xuid, admin, at FROM mod_approvals WHERE version_id = ? ORDER BY at", versionId).toArray()
@@ -263,31 +282,33 @@ export class MarketplaceStore {
   }
 
   private liveVersion(slug: string): VersionRow | undefined {
-    return this.versions(`v.slug = ? AND v.status = 'approved' AND v.signature IS NOT NULL AND v.statement IS NOT NULL AND v.pulled = 0
-      AND EXISTS (SELECT 1 FROM mod_pipeline p WHERE p.version_id = v.id AND p.state = 'complete')
-      ORDER BY v.decided_at DESC, v.id DESC LIMIT 1`, slug)[0];
+    return this.versions(`v.slug = ? AND ${PUBLISHED} ORDER BY v.decided_at DESC, v.id DESC LIMIT 1`, slug)[0];
+  }
+
+  /** The live version of a listing that is visible with an active creator. */
+  private publicVersion(listing: ListingRow | undefined): VersionRow | undefined {
+    return listing && !listing.hidden && !this.account(listing.creator)?.suspended ? this.liveVersion(listing.slug) : undefined;
   }
 
   private listing(slug: string): ListingRow | undefined {
     return this.sql.exec<ListingRow>("SELECT * FROM mod_listings WHERE slug = ?", slug).toArray()[0];
   }
 
-  /** A listing as the public catalogue shows it, or null when nothing about it is public. */
-  private publicListing(listing: ListingRow) {
-    const live = this.liveVersion(listing.slug);
-    if (!live || listing.hidden || this.account(listing.creator)?.suspended) return null;
-    const metadata = JSON.parse(this.pipeline(live.id)!.metadata) as ListingRow & { category?: string; license?: string };
+  /** A listing as the public catalogue shows it, given its public live version. */
+  private publicListing(listing: ListingRow, live: VersionRow) {
     const p = this.pipeline(live.id)!;
-    const report = p.report ? JSON.parse(p.report) as ScanReport : null;
+    const metadata = snapshotOf(p);
+    const report = reportOf(p);
+    const grants = JSON.parse(live.grants) as Grants;
     return {
       slug: listing.slug, name: metadata.name, summary: metadata.summary, description: metadata.description,
       source: metadata.source, gallery: this.media(live.id), creator: listing.creator, creator_name: this.name(listing.creator),
-      category: metadata.category ?? "", license: metadata.license ?? "", grants: JSON.parse(live.grants) as Grants,
+      category: metadata.category, license: metadata.license, grants,
       version: live.version, version_id: String(live.id), reach: live.reach,
       status: "approved",
-      capabilities: requestedCapabilities(JSON.parse(live.grants)), sha256: live.sha256, bytes: live.bytes,
+      capabilities: requestedCapabilities(grants), sha256: live.sha256, bytes: live.bytes,
       updated_at: live.decided_at, reviewed_by: this.approvals(live.id).map((a) => a.gamertag).join(", "),
-      publication: this.pipeline(live.id)?.publish_mode,
+      publication: p.publish_mode,
       // Public summaries omit private scanner findings and source evidence.
       scan: { state: p.state, completed_at: p.completed_at, report: report ? {
         deterministic: report.deterministic, policy: report.policy, validator: report.validator,
@@ -300,35 +321,33 @@ export class MarketplaceStore {
 
   /** Every public listing, lowest reach first, most recently approved first within a reach. */
   mods(): MarketResult {
-    const all = this.sql.exec<ListingRow>("SELECT * FROM mod_listings").toArray()
-      .map((listing) => this.publicListing(listing)).filter((m) => m !== null);
+    const all = this.sql.exec<ListingRow>("SELECT * FROM mod_listings").toArray().flatMap((listing) => {
+      const live = this.publicVersion(listing);
+      return live ? [this.publicListing(listing, live)] : [];
+    });
     return ok(all.sort((a, b) => a.reach - b.reach || (b.updated_at ?? 0) - (a.updated_at ?? 0)));
   }
 
   mod(slug: string): MarketResult {
     const listing = this.listing(slug);
-    const view = listing && this.publicListing(listing);
-    if (!view) return fail(404, "No public mod with that name.");
-    const history = this.versions("v.slug = ? AND v.status = 'approved' ORDER BY v.decided_at DESC", slug).map((v) => ({
-      version: v.version, at: v.decided_at, pulled: !!v.pulled, reach: v.reach,
-      reviewers: this.approvals(v.id).map((a) => a.gamertag),
-      publication: this.pipeline(v.id)?.publish_mode,
-      notes: (JSON.parse(this.pipeline(v.id)!.metadata) as { notes?: string }).notes ?? "",
-    }));
-    const live = this.liveVersion(slug)!;
-    return ok({ ...view, history, release: live.signature ? { statement: this.statement(live.id), signature: live.signature } : null });
+    const live = this.publicVersion(listing);
+    if (!listing || !live) return fail(404, "No public mod with that name.");
+    const history = this.versions("v.slug = ? AND v.status = 'approved' ORDER BY v.decided_at DESC", slug).map((v) => {
+      const p = this.pipeline(v.id)!;
+      return { version: v.version, at: v.decided_at, pulled: !!v.pulled, reach: v.reach,
+        reviewers: this.approvals(v.id).map((a) => a.gamertag), publication: p.publish_mode, notes: snapshotOf(p).notes };
+    });
+    return ok({ ...this.publicListing(listing, live), history, release: { statement: live.statement, signature: live.signature } });
   }
 
   /** Stored files require an actually signed, visible release before public downloads are allowed. */
-  assetAllowed(sha256: string, caller: Caller, now: number): boolean {
-    return this.versions(`v.sha256 = ? AND v.status = 'approved' AND v.signature IS NOT NULL AND v.statement IS NOT NULL AND v.pulled = 0
-      AND l.hidden = 0 AND EXISTS (SELECT 1 FROM mod_pipeline p WHERE p.version_id = v.id AND p.state = 'complete')`, sha256)
-      .some(v => !this.account(v.creator)?.suspended);
+  assetAllowed(sha256: string): boolean {
+    return this.versions(`v.sha256 = ? AND ${PUBLISHED} AND l.hidden = 0`, sha256).some(v => !this.account(v.creator)?.suspended);
   }
 
   /** The canonical statement signed for an approved version. */
   statement(versionId: number): string {
-    const v = this.versions("v.id = ?", versionId)[0]!;
+    const v = this.versionRow(versionId)!;
     if (v.statement !== null) return v.statement;
     const approvers = this.approvals(v.id).map((a) => a.xuid);
     const p = this.pipeline(v.id)!;
@@ -340,16 +359,16 @@ export class MarketplaceStore {
   /** Returns exact signed metadata for a still-public digest, including an older library selection. */
   release(slug: string, version: string, sha256: string): MarketResult {
     const listing = this.listing(slug);
-    const v = this.versions("v.slug = ? AND v.version = ? AND v.sha256 = ? AND v.status = 'approved' AND v.signature IS NOT NULL AND v.statement IS NOT NULL AND v.pulled = 0", slug, version, sha256)[0];
-    if (!listing || listing.hidden || this.account(listing.creator)?.suspended || !v || this.pipeline(v.id)?.state !== "complete") return fail(404, "No such release.");
-    return ok({ release: { statement: this.statement(v.id), signature: v.signature } });
+    const v = this.versions(`v.slug = ? AND v.version = ? AND v.sha256 = ? AND ${PUBLISHED}`, slug, version, sha256)[0];
+    if (!listing || listing.hidden || this.account(listing.creator)?.suspended || !v) return fail(404, "No such release.");
+    return ok({ release: { statement: v.statement, signature: v.signature } });
   }
 
   /** Atomically exposes a signed release after rechecking every gate following external I/O. */
   publish(versionId: number, statement: string, signature: string, now: number): boolean {
-    if (!this.publicationReady(versionId, now) || this.statement(versionId) !== statement) return false;
+    if (this.publicationReady(versionId, now)?.statement !== statement) return false;
     this.sql.exec("UPDATE mod_versions SET status = 'approved', statement = ?, signature = ? WHERE id = ?", statement, signature, versionId);
-    const v = this.versions("v.id = ?", versionId)[0]!;
+    const v = this.versionRow(versionId)!;
     this.log("system", "published", `${v.slug} ${v.version}`, this.pipeline(versionId)!.publish_mode!, now);
     return true;
   }
@@ -369,8 +388,7 @@ export class MarketplaceStore {
     const session = this.writer(caller, now);
     if ("status" in session) return session;
     if (session.account.suspended) return fail(403, "Your account is suspended.");
-    const listing = this.listing(slug);
-    const live = listing && !listing.hidden && !this.account(listing.creator)?.suspended ? this.liveVersion(slug) : undefined;
+    const live = this.publicVersion(this.listing(slug));
     if (!live) return fail(404, "No public mod with that name.");
     const xuid = session.account.xuid;
     const count = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM mod_library WHERE xuid = ? AND slug != ?", xuid, slug).one().n;
@@ -387,7 +405,7 @@ export class MarketplaceStore {
   removeSelection(caller: Caller, slug: string, input: unknown, now: number): MarketResult {
     const session = this.writer(caller, now);
     if ("status" in session) return session;
-    const body = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
+    const body = fieldsOf(input);
     const at = typeof body.sent_at === "string" && body.sent_at.length <= 32 ? Date.parse(body.sent_at) : NaN;
     if (typeof body.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(body.sha256) || !Number.isSafeInteger(at)
       || new Date(at).toISOString() !== body.sent_at) return fail(422, "Choose a library selection with its hash and send timestamp.");
@@ -409,12 +427,11 @@ export class MarketplaceStore {
   report(caller: Caller, slug: string, input: unknown, now: number): MarketResult {
     const session = this.writer(caller, now);
     if ("status" in session) return session;
-    const listing = this.listing(slug);
-    const live = listing && this.liveVersion(slug);
+    const live = this.liveVersion(slug);
     if (!live) return fail(404, "No public mod with that name.");
-    const body = (typeof input === "object" && input !== null ? input : {}) as Record<string, unknown>;
+    const body = fieldsOf(input);
     if (typeof body.reason !== "string" || !REPORT_REASONS.includes(body.reason)) return fail(400, "Choose a reason.");
-    const details = typeof body.details === "string" ? body.details.trim() : "";
+    const details = trimmed(body.details);
     if (details.length < 10) return fail(400, "Describe what happened in a sentence or two.");
     const xuid = session.account.xuid;
     const recent = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM mod_reports WHERE reporter = ? AND at > ?",
@@ -433,6 +450,12 @@ export class MarketplaceStore {
 
   /** Checks a submission before its file is stored, so a refused listing costs no upload. */
   precheck(caller: Caller, listingInput: unknown, now: number): MarketResult {
+    const admitted = this.admit(caller, listingInput, now);
+    return "status" in admitted ? admitted : ok({});
+  }
+
+  /** The submitting account, or the refusal for a suspended, over-budget or conflicting submission. */
+  private admit(caller: Caller, listingInput: unknown, now: number): { account: Account } | MarketResult {
     const session = this.writer(caller, now);
     if ("status" in session) return session;
     if (session.account.suspended) return fail(403, "Your account is suspended.");
@@ -448,14 +471,13 @@ export class MarketplaceStore {
     if (this.sql.exec("SELECT 1 FROM mod_versions WHERE slug = ? AND version = ?", fields.slug, fields.version).toArray().length) {
       return fail(409, "That version exists.", { version: "Bump the version to submit again." });
     }
-    return ok({});
+    return session;
   }
 
   /** Records a submitted version whose file is already stored under its SHA-256. */
-  submit(caller: Caller, listingInput: unknown, file: { sha256: string; bytes: number; grants: Grants | null; media?: MediaFile[] }, now: number): MarketResult {
-    const checked = this.precheck(caller, listingInput, now);
-    if (checked.status !== 200) return checked;
-    const session = this.writer(caller, now) as { account: Account };
+  submit(caller: Caller, listingInput: unknown, file: SubmittedFile, now: number): MarketResult {
+    const session = this.admit(caller, listingInput, now);
+    if ("status" in session) return session;
     const grants = file.grants ?? {};
     const reach = reachOf(grants);
     const { fields, errors } = validateListing(listingInput, reach);
@@ -469,8 +491,8 @@ export class MarketplaceStore {
       fields.slug, fields.version, file.sha256, file.bytes, JSON.stringify(grants), reach, now).one().id;
     const baseline = this.liveVersion(fields.slug)?.id ?? null;
     this.sql.exec(`INSERT INTO mod_pipeline (version_id, metadata, media, baseline, job_id) VALUES (?, ?, ?, ?, ?)`,
-      id, JSON.stringify(fields), JSON.stringify(file.media ?? []), baseline, crypto.randomUUID());
-    return ok(this.versionView(this.versions("v.id = ?", id)[0]!));
+      id, JSON.stringify(fields), JSON.stringify(file.media), baseline, crypto.randomUUID());
+    return ok(this.versionView(this.versionRow(id)!));
   }
 
   /** Authenticate before consuming any upload bytes. */
@@ -491,6 +513,11 @@ export class MarketplaceStore {
     return this.sql.exec<PipelineRow>("SELECT * FROM mod_pipeline WHERE version_id = ?", id).toArray()[0];
   }
 
+  /** Whether a version's scan completed under the current policy and is still recent enough to act on. */
+  private scanPassed(p: PipelineRow, now: number): boolean {
+    return p.state === "complete" && scanReady(reportOf(p), p.completed_at, now);
+  }
+
   /** Media descriptors belong to the immutable version, not mutable listing metadata. */
   media(id: number): MediaFile[] { return JSON.parse(this.pipeline(id)?.media ?? "[]") as MediaFile[]; }
 
@@ -498,7 +525,7 @@ export class MarketplaceStore {
   privateMedia(caller: Caller, id: number, sha256: string, now: number): MarketResult {
     const session = this.session(caller, now);
     if (!session || session.account.suspended) return fail(404, "No such image.");
-    const v = this.versions("v.id = ?", id)[0];
+    const v = this.versionRow(id);
     const media = this.media(id).find(item => item.sha256 === sha256);
     if (!v || !media || (v.creator !== session.account.xuid && !atLeast(session.account, "moderator"))) return fail(404, "No such image.");
     return ok({ key: `media/${media.sha256}`, type: media.type });
@@ -506,9 +533,8 @@ export class MarketplaceStore {
 
   /** Check public media authorization without revealing another version's private files. */
   mediaAllowed(sha256: string): boolean {
-    return this.versions("v.status = 'approved' AND v.signature IS NOT NULL AND v.statement IS NOT NULL AND v.pulled = 0 AND l.hidden = 0")
-      .some(v => !this.account(v.creator)?.suspended && this.pipeline(v.id)?.state === "complete"
-        && this.media(v.id).some(m => m.sha256 === sha256));
+    return this.versions(`${PUBLISHED} AND l.hidden = 0`)
+      .some(v => !this.account(v.creator)?.suspended && this.media(v.id).some(m => m.sha256 === sha256));
   }
 
   /** SQL jobs are a transactional outbox: creation commits with the version, independent of scanner availability. */
@@ -522,8 +548,8 @@ export class MarketplaceStore {
     const lease = crypto.randomUUID();
     this.sql.exec("UPDATE mod_pipeline SET state = 'running', lease = ?, lease_until = ?, attempts = attempts + 1 WHERE version_id = ?",
       lease, now + SCAN_LEASE_MS, p.version_id);
-    const v = this.versions("v.id = ?", p.version_id)[0]!;
-    const previous = p.baseline === null ? null : this.versions("v.id = ?", p.baseline)[0];
+    const v = this.versionRow(p.version_id)!;
+    const previous = p.baseline === null ? undefined : this.versionRow(p.baseline);
     return ok({ job: { id: p.job_id, lease, version_id: v.id, sha256: v.sha256, bytes: v.bytes, policy: SCAN_POLICY,
       listing: JSON.parse(p.metadata), grants: JSON.parse(v.grants), media: this.media(v.id),
       previous: previous ? { sha256: previous.sha256, grants: JSON.parse(previous.grants),
@@ -534,7 +560,7 @@ export class MarketplaceStore {
   scanFile(job: string, lease: string, sha256: string, now: number): MarketResult {
     const p = this.sql.exec<PipelineRow>("SELECT * FROM mod_pipeline WHERE job_id = ? AND lease = ? AND state = 'running' AND lease_until > ?",
       job, lease, now).toArray()[0];
-    const v = p && this.versions("v.id = ?", p.version_id)[0];
+    const v = p && this.versionRow(p.version_id);
     const media = p && this.media(p.version_id).find(m => m.sha256 === sha256);
     if (!v || (v.sha256 !== sha256 && !media)) return fail(404, "No claimed file.");
     return ok({ key: `${media ? "media" : "mods"}/${sha256}`, type: media?.type ?? "application/wasm" });
@@ -544,7 +570,7 @@ export class MarketplaceStore {
   completeScan(job: string, lease: string, input: unknown, now: number): MarketResult {
     const p = this.sql.exec<PipelineRow>("SELECT * FROM mod_pipeline WHERE job_id = ?", job).toArray()[0];
     if (!p || p.lease !== lease) return fail(409, "Stale scan claim.");
-    const v = this.versions("v.id = ?", p.version_id)[0]!;
+    const v = this.versionRow(p.version_id)!;
     const report = parseScanReport(input, v.sha256, this.media(v.id).map(m => m.sha256));
     if (!report) return fail(422, "Invalid scan attestation.");
     if (p.state === "complete" || p.state === "failed") {
@@ -565,52 +591,47 @@ export class MarketplaceStore {
   /** Evaluate live trust and the exact prior release again, including after signing or storage I/O. */
   private automaticAllowed(v: VersionRow, now: number): boolean {
     const p = this.pipeline(v.id)!;
-    const listing = this.listing(v.slug)!;
     const creator = this.account(v.creator);
-    const report = p.report ? JSON.parse(p.report) as ScanReport : null;
-    if (v.status !== "submitted" || v.pulled || v.reach >= 3 || listing.hidden || !creator || creator.suspended
-      || p.state !== "complete" || !scanReady(report, p.completed_at, now) || report!.ai.verdict !== "clear") return false;
+    if (v.status !== "submitted" || v.pulled || v.reach >= 3 || this.listing(v.slug)!.hidden || !creator || creator.suspended
+      || !this.scanPassed(p, now) || reportOf(p)!.ai.verdict !== "clear") return false;
     const trusted = this.sql.exec("SELECT 1 FROM mod_trust WHERE slug = ? AND creator = ? AND expires_at > ?",
       v.slug, v.creator, now).toArray().length > 0;
     const baseline = this.liveVersion(v.slug);
-    if (!trusted || !baseline || baseline.id !== p.baseline || baseline.pulled) return false;
+    if (!trusted || !baseline || baseline.id !== p.baseline) return false;
     if (this.sql.exec("SELECT 1 FROM mod_reports WHERE slug = ? AND status = 'open'", v.slug).toArray().length) return false;
-    const prior = this.pipeline(baseline.id);
-    const priorReport = prior?.report ? JSON.parse(prior.report) as ScanReport : null;
+    const prior = this.pipeline(baseline.id)!;
+    const priorReport = reportOf(prior);
     if (!priorReport || priorReport.policy !== SCAN_POLICY || priorReport.client_revision !== CLIENT_REVISION || priorReport.deterministic !== "pass") return false;
     if (grantDiff(JSON.parse(baseline.grants), JSON.parse(v.grants)).expanded) return false;
     // New host interfaces are authority changes even if the declaration did not change.
-    if (report!.imports.some(name => !priorReport.imports.includes(name))) return false;
-    // Listing/source/media edits get a human content review at launch.
-    const before = JSON.parse(prior!.metadata) as Record<string, unknown>;
+    if (reportOf(p)!.imports.some(name => !priorReport.imports.includes(name))) return false;
+    // Listing/source/media edits get a human content review at launch. Raw snapshots, so a migrated one differs.
+    const before = JSON.parse(prior.metadata) as Record<string, unknown>;
     const after = JSON.parse(p.metadata) as Record<string, unknown>;
-    if (["name", "summary", "description", "source", "category", "license"].some(key => before[key] !== after[key]) || prior!.media !== p.media) return false;
-    return true;
+    return !["name", "summary", "description", "source", "category", "license"].some(key => before[key] !== after[key])
+      && prior.media === p.media;
   }
 
   /** Return publication material only while current scan, account and decision gates still hold. */
   publicationReady(id: number, now: number): { sha256: string; media: MediaFile[]; statement: string } | null {
-    const v = this.versions("v.id = ?", id)[0];
+    const v = this.versionRow(id);
     const p = this.pipeline(id);
     if (!v || !p || v.status !== "submitted" || v.pulled || this.account(v.creator)?.suspended || this.listing(v.slug)?.hidden
-      || p.state !== "complete" || !scanReady(p.report ? JSON.parse(p.report) as ScanReport : null, p.completed_at, now)) return null;
-    if (p.publish_mode === "automatic") {
-      if (!this.automaticAllowed(v, now)) return null;
-    } else if (p.publish_mode === "manual") {
-      const approvals = this.approvals(id).filter(a => {
+      || !this.scanPassed(p, now)) return null;
+    // Manual approvals count only from staff who are still active and aren't the creator.
+    const decided = p.publish_mode === "automatic" ? this.automaticAllowed(v, now)
+      : p.publish_mode === "manual" && approvalsComplete(v.reach as Reach, this.approvals(id).flatMap(a => {
         const actor = this.account(a.xuid);
-        return actor && !actor.suspended && atLeast(actor, "moderator") && actor.xuid !== v.creator;
-      }).map(a => ({ admin: atLeast(this.account(a.xuid), "admin") }));
-      if (!approvalsComplete(v.reach as Reach, approvals)) return null;
-    } else return null;
-    return { sha256: v.sha256, media: this.media(id), statement: this.statement(id) };
+        return actor && !actor.suspended && atLeast(actor, "moderator") && actor.xuid !== v.creator ? [{ admin: atLeast(actor, "admin") }] : [];
+      }));
+    return decided ? { sha256: v.sha256, media: this.media(id), statement: this.statement(id) } : null;
   }
 
   /** Retry jobs with a new identity, invalidating old scanner leases and all earlier approvals. */
   rescan(caller: Caller, id: number, now: number): MarketResult {
     const staff = this.staff(caller, now, true);
     if ("status" in staff) return staff;
-    const v = this.versions("v.id = ?", id)[0];
+    const v = this.versionRow(id);
     if (!v || v.status !== "submitted") return fail(409, "Only pending releases can be rescanned.");
     this.sql.exec(`UPDATE mod_pipeline SET job_id = ?, state = 'queued', attempts = 0, lease = NULL,
       lease_until = NULL, report = NULL, completed_at = NULL, publish_mode = NULL WHERE version_id = ?`, crypto.randomUUID(), id);
@@ -628,14 +649,13 @@ export class MarketplaceStore {
     const listing = this.listing(slug);
     if (!listing) return fail(404, "No such mod.");
     if (listing.creator === session.account.xuid) return fail(403, "You can't establish your own trust.");
-    const body = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
-    const reason = typeof body.reason === "string" ? body.reason.trim().slice(0, 500) : "";
+    const body = fieldsOf(input);
+    const reason = trimmed(body.reason).slice(0, 500);
     if (!reason || typeof body.trusted !== "boolean") return fail(422, "Supply trusted and an audit reason.");
     if (body.trusted) {
-      const baseline = this.liveVersion(slug);
       const humanApproved = this.sql.exec(`SELECT 1 FROM mod_versions v JOIN mod_pipeline p ON p.version_id = v.id
         WHERE v.slug = ? AND v.status = 'approved' AND p.publish_mode = 'manual' AND v.pulled = 0 LIMIT 1`, slug).toArray().length;
-      if (!baseline || !humanApproved || listing.hidden || this.account(listing.creator)?.suspended) {
+      if (!this.publicVersion(listing) || !humanApproved) {
         return fail(409, "A visible human-approved release and active creator are required.");
       }
       this.sql.exec(`INSERT INTO mod_trust (slug, creator, granted_by, expires_at, reason) VALUES (?, ?, ?, ?, ?)
@@ -651,21 +671,20 @@ export class MarketplaceStore {
   private versionView(v: VersionRow) {
     const listing = this.listing(v.slug)!;
     const p = this.pipeline(v.id)!;
-    const metadata = JSON.parse(p.metadata) as ListingRow & { category?: string; license?: string; notes?: string };
-    const report = p.report ? JSON.parse(p.report) as ScanReport : null;
+    const metadata = snapshotOf(p);
     const trust = this.sql.exec<{ expires_at: number }>("SELECT expires_at FROM mod_trust WHERE slug = ? AND creator = ?", v.slug, v.creator).toArray()[0];
-    const previous = p.baseline === null ? undefined : this.versions("v.id = ?", p.baseline)[0];
+    const previous = p.baseline === null ? undefined : this.versionRow(p.baseline);
     const grants = JSON.parse(v.grants) as Grants;
     return {
       id: String(v.id), slug: v.slug, version: v.version, grants, reach: v.reach, status: v.status, note: v.note,
       creator: v.creator, creator_name: this.name(v.creator), sha256: v.sha256, bytes: v.bytes,
       submitted_at: v.submitted_at, decided_at: v.decided_at, pulled: !!v.pulled, pull_reason: v.pull_reason,
       name: metadata.name, summary: metadata.summary, description: metadata.description, source: metadata.source, hidden: !!listing.hidden,
-      category: metadata.category ?? "", license: metadata.license ?? "", notes: metadata.notes ?? "",
+      category: metadata.category, license: metadata.license, notes: metadata.notes,
       trust: { trusted: !!trust && trust.expires_at > Date.now(), expires_at: trust?.expires_at ?? null },
       gallery: this.media(v.id), scan: { state: p.state, attempts: p.attempts, job: p.job_id,
         completed_at: p.completed_at, expires_at: p.completed_at === null ? null : p.completed_at + SCAN_MAX_AGE_MS,
-        review_ready: p.state === "complete" && scanReady(report, p.completed_at, Date.now()), report }, publication: p.publish_mode,
+        review_ready: this.scanPassed(p, Date.now()), report: reportOf(p) }, publication: p.publish_mode,
       capabilities: requestedCapabilities(grants), rule: approvalRule(v.reach as Reach), approvals: this.approvals(v.id),
       previous: previous ? { version: previous.version, sha256: previous.sha256, grants: JSON.parse(previous.grants) as Grants,
         diff: grantDiff(JSON.parse(previous.grants), grants) } : null,
@@ -681,7 +700,7 @@ export class MarketplaceStore {
   version(caller: Caller, id: number, now: number): MarketResult {
     const staff = this.staff(caller, now, false);
     if ("status" in staff) return staff;
-    const v = this.versions("v.id = ?", id)[0];
+    const v = this.versionRow(id);
     return v ? ok(this.versionView(v)) : fail(404, "No such version.");
   }
 
@@ -689,10 +708,10 @@ export class MarketplaceStore {
   decide(caller: Caller, id: number, input: unknown, now: number): MarketResult {
     const staff = this.staff(caller, now, true);
     if ("status" in staff) return staff;
-    const v = this.versions("v.id = ?", id)[0];
+    const v = this.versionRow(id);
     if (!v) return fail(404, "No such version.");
-    const body = (typeof input === "object" && input !== null ? input : {}) as Record<string, unknown>;
-    const note = typeof body.note === "string" ? body.note.trim().slice(0, 1000) : "";
+    const body = fieldsOf(input);
+    const note = trimmed(body.note).slice(0, 1000);
     const state: ReviewState = { creator: v.creator, status: v.status, reach: v.reach as Reach,
       approvals: this.approvals(v.id).map((a) => ({ xuid: a.xuid, admin: a.admin })) };
     const target = `${v.slug} ${v.version}`;
@@ -700,20 +719,19 @@ export class MarketplaceStore {
       const allowed = canApprove(staff, state);
       if (!allowed.ok) return fail(403, allowed.reason);
       const p = this.pipeline(v.id)!;
-      const report = p.report ? JSON.parse(p.report) as ScanReport : null;
-      if (p.state !== "complete" || !scanReady(report, p.completed_at, now)) return fail(409, "A current, complete scan must pass before approval. Rescan failed or expired jobs.");
-      if (report!.ai.verdict === "flag" && !note) return fail(422, "Explain how the flagged findings were resolved before approving.");
+      if (!this.scanPassed(p, now)) return fail(409, "A current, complete scan must pass before approval. Rescan failed or expired jobs.");
+      if (reportOf(p)!.ai.verdict === "flag" && !note) return fail(422, "Explain how the flagged findings were resolved before approving.");
       if (this.account(v.creator)?.suspended || this.listing(v.slug)?.hidden) return fail(409, "Restore the creator and listing before approving.");
-      this.sql.exec("INSERT INTO mod_approvals (version_id, xuid, admin, at) VALUES (?, ?, ?, ?)", v.id, staff.xuid,
-        atLeast(staff, "admin") ? 1 : 0, now);
-      const approvals = [...state.approvals, { xuid: staff.xuid, admin: atLeast(staff, "admin") }];
+      const admin = atLeast(staff, "admin");
+      this.sql.exec("INSERT INTO mod_approvals (version_id, xuid, admin, at) VALUES (?, ?, ?, ?)", v.id, staff.xuid, admin ? 1 : 0, now);
+      const approvals = [...state.approvals, { xuid: staff.xuid, admin }];
       const done = approvalsComplete(state.reach, approvals);
       if (done) {
         this.sql.exec("UPDATE mod_versions SET decided_at = ?, note = ? WHERE id = ?", now, note, v.id);
         this.sql.exec("UPDATE mod_pipeline SET publish_mode = 'manual' WHERE version_id = ?", v.id);
       }
       this.log(staff.xuid, done ? "approved" : `approved (${approvals.length} of ${approvalRule(state.reach).count})`, target, note, now);
-      return ok(this.versionView(this.versions("v.id = ?", v.id)[0]!), done ? { approved: v.id } : {});
+      return ok(this.versionView(this.versionRow(v.id)!), done ? { approved: v.id } : {});
     }
     if (body.decision !== "reject" && body.decision !== "changes") return fail(400, "Unknown decision.");
     const allowed = canReview(staff, state);
@@ -722,7 +740,7 @@ export class MarketplaceStore {
     const status = body.decision === "reject" ? "rejected" : "changes";
     this.sql.exec("UPDATE mod_versions SET status = ?, decided_at = ?, note = ? WHERE id = ?", status, now, note, v.id);
     this.log(staff.xuid, status === "rejected" ? "rejected" : "requested changes", target, note, now);
-    return ok(this.versionView(this.versions("v.id = ?", v.id)[0]!));
+    return ok(this.versionView(this.versionRow(v.id)!));
   }
 
   /** Withdraws a published version; every player holding it is told the reason. */
@@ -730,23 +748,23 @@ export class MarketplaceStore {
     const staff = this.staff(caller, now, true);
     if ("status" in staff) return staff;
     if (!atLeast(staff, "admin")) return fail(403, "Only admins can pull a published version.");
-    const v = this.versions("v.id = ?", id)[0];
+    const v = this.versionRow(id);
     if (!v || v.status !== "approved" || v.pulled) return fail(404, "Only published versions can be pulled.");
-    const reason = typeof (input as { reason?: unknown })?.reason === "string" ? ((input as { reason: string }).reason).trim() : "";
+    const reason = trimmed(fieldsOf(input).reason);
     if (!reason) return fail(400, "Say why it's being pulled.");
     this.sql.exec("UPDATE mod_versions SET pulled = 1, pull_reason = ? WHERE id = ?", reason.slice(0, 500), v.id);
     this.sql.exec("DELETE FROM mod_trust WHERE slug = ?", v.slug);
     this.log(staff.xuid, "pulled", `${v.slug} ${v.version}`, reason, now);
     const holders = this.sql.exec<{ xuid: string }>("SELECT xuid FROM mod_library WHERE version_id = ?", v.id).toArray().map((r) => r.xuid);
-    return ok(this.versionView(this.versions("v.id = ?", v.id)[0]!), { notify: holders });
+    return ok(this.versionView(this.versionRow(v.id)!), { notify: holders });
   }
 
   hide(caller: Caller, slug: string, input: unknown, now: number): MarketResult {
     const staff = this.staff(caller, now, true);
     if ("status" in staff) return staff;
     if (!this.listing(slug)) return fail(404, "No such mod.");
-    const body = (typeof input === "object" && input !== null ? input : {}) as Record<string, unknown>;
-    const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+    const body = fieldsOf(input);
+    const reason = trimmed(body.reason);
     if (!reason) return fail(400, "Note why, for the audit log.");
     const hidden = body.hidden === true;
     this.sql.exec("UPDATE mod_listings SET hidden = ? WHERE slug = ?", hidden ? 1 : 0, slug);
@@ -773,7 +791,7 @@ export class MarketplaceStore {
     if ("status" in staff) return staff;
     const report = this.sql.exec<{ slug: string; version: string }>("SELECT slug, version FROM mod_reports WHERE id = ?", id).toArray()[0];
     if (!report) return fail(404, "No such report.");
-    const note = typeof (input as { note?: unknown })?.note === "string" ? ((input as { note: string }).note).trim() : "";
+    const note = trimmed(fieldsOf(input).note);
     if (!note) return fail(400, "Write what you found.");
     this.sql.exec("UPDATE mod_reports SET status = 'resolved', resolution = ?, resolved_by = ? WHERE id = ?", note.slice(0, 1000), staff.xuid, id);
     this.log(staff.xuid, "resolved report", `${report.slug} ${report.version}`, note, now);
@@ -794,17 +812,15 @@ export class MarketplaceStore {
   setRole(caller: Caller, input: unknown, now: number): MarketResult {
     const session = this.writer(caller, now);
     if ("status" in session) return session;
-    const body = (typeof input === "object" && input !== null ? input : {}) as Record<string, unknown>;
-    const gamertag = typeof body.gamertag === "string" ? body.gamertag.trim() : "";
-    const xuid = this.sql.exec<{ xuid: string }>("SELECT xuid FROM market_accounts WHERE gamertag = ? COLLATE NOCASE", gamertag).toArray()[0]?.xuid;
-    const target = xuid ? this.account(xuid) : null;
+    const body = fieldsOf(input);
+    const target = this.accountNamed(trimmed(body.gamertag));
     if (!target) return fail(404, "No Cinnabar account with that gamertag has signed in yet.");
     const role = body.role as Role;
     if (!ROLES.includes(role)) return fail(400, "Choose a role.");
     const allowed = canSetRole(session.account, target, role);
     if (!allowed.ok) return fail(403, allowed.reason);
     if (session.created_at + ROLE_CHANGE_SIGN_IN_MS <= now) return fail(401, "For safety, sign out and sign in again before changing roles.");
-    const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+    const reason = trimmed(body.reason);
     if (!reason) return fail(400, "Note why, for the audit log.");
     this.sql.exec("UPDATE market_accounts SET role = ? WHERE xuid = ?", role, target.xuid);
     if (role === "player") this.sql.exec("DELETE FROM web_sessions WHERE xuid = ?", target.xuid);
@@ -817,13 +833,11 @@ export class MarketplaceStore {
     const staff = this.staff(caller, now, true);
     if ("status" in staff) return staff;
     if (!atLeast(staff, "admin")) return fail(403, "Only admins can suspend accounts.");
-    const body = (typeof input === "object" && input !== null ? input : {}) as Record<string, unknown>;
-    const xuid = this.sql.exec<{ xuid: string }>("SELECT xuid FROM market_accounts WHERE gamertag = ? COLLATE NOCASE",
-      typeof body.gamertag === "string" ? body.gamertag.trim() : "").toArray()[0]?.xuid;
-    const target = xuid ? this.account(xuid) : null;
+    const body = fieldsOf(input);
+    const target = this.accountNamed(trimmed(body.gamertag));
     if (!target) return fail(404, "No Cinnabar account with that gamertag has signed in yet.");
     if (target.xuid === staff.xuid || atLeast(target, "admin") && !atLeast(staff, "owner")) return fail(403, "You can't suspend this account.");
-    const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+    const reason = trimmed(body.reason);
     if (!reason) return fail(400, "Note why, for the audit log.");
     const suspended = body.suspended === true;
     this.sql.exec("UPDATE market_accounts SET suspended = ? WHERE xuid = ?", suspended ? 1 : 0, target.xuid);
@@ -858,7 +872,7 @@ export type MarketCall = Caller & (
   | { op: "me" } | { op: "mods" } | { op: "mod"; slug: string } | { op: "mine" } | { op: "queue" } | { op: "reports" }
   | { op: "people" } | { op: "audit" } | { op: "signout" }
   | { op: "send"; slug: string } | { op: "remove"; slug: string; body: unknown } | { op: "report"; slug: string; body: unknown }
-  | { op: "upload-auth" } | { op: "precheck"; body: unknown } | { op: "submit"; body: unknown; file: { sha256: string; bytes: number; grants: Grants | null; media?: MediaFile[] } }
+  | { op: "upload-auth" } | { op: "precheck"; body: unknown } | { op: "submit"; body: unknown; file: SubmittedFile }
   | { op: "version"; id: number } | { op: "decide"; id: number; body: unknown } | { op: "pull"; id: number; body: unknown }
   | { op: "hide"; slug: string; body: unknown } | { op: "resolve"; id: number; body: unknown }
   | { op: "role"; body: unknown } | { op: "suspend"; body: unknown } | { op: "asset"; sha256: string }
@@ -895,7 +909,7 @@ export function handle(store: MarketplaceStore, call: MarketCall, now: number): 
     case "resolve": return store.resolve(call, call.id, call.body, now);
     case "role": return store.setRole(call, call.body, now);
     case "suspend": return store.suspend(call, call.body, now);
-    case "asset": return ok({ allowed: store.assetAllowed(call.sha256, call, now) });
+    case "asset": return ok({ allowed: store.assetAllowed(call.sha256) });
     case "media": return ok({ allowed: store.mediaAllowed(call.sha256) });
     case "private-media": return store.privateMedia(call, call.id, call.sha256, now);
     case "trust": return store.setTrust(call, call.slug, call.body, now);

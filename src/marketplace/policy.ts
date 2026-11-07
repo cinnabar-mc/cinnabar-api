@@ -1,7 +1,6 @@
 import contract from "../../.generated/contract.json";
 
-/** Reach levels, from least to most of a player's game a mod can touch. */
-export const RUNGS = ["looks", "reads", "watches", "acts", "network"] as const;
+/** Reach levels, from least to most of a player's game a mod can touch: looks, reads, watches, acts and network. */
 export type Reach = 0 | 1 | 2 | 3 | 4;
 
 export type Role = "player" | "moderator" | "admin" | "owner";
@@ -19,7 +18,7 @@ const groups = [
   ["camera", "controls", "keys", "item_use", "movement", "interaction", "inventory", "commands"],
 ];
 // Presentation groups only; unknown/new client permissions default to the highest review gate.
-export const CAPABILITY_RUNG: Readonly<Record<string, Reach>> = Object.fromEntries(contract.capabilities.map(cap => {
+const CAPABILITY_RUNG: Readonly<Record<string, Reach>> = Object.fromEntries(contract.capabilities.map(cap => {
   const group = groups.findIndex(names => names.includes(cap.name));
   return [cap.name, (group < 0 || (cap.sensitive && group < 3) ? 4 : group) as Reach];
 }));
@@ -42,6 +41,16 @@ export interface ReviewState {
 }
 
 export type Verdict = { ok: true } | { ok: false; reason: string };
+
+/** A JSON request body as a field map; anything other than an object reads as having no fields. */
+export function fieldsOf(input: unknown): Record<string, unknown> {
+  return (typeof input === "object" && input !== null ? input : {}) as Record<string, unknown>;
+}
+
+/** A string field trimmed, or "" when the value isn't a string. */
+export function trimmed(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
 
 /** Lists requested capability names, throwing on unknown names or malformed values. */
 export function requestedCapabilities(grants: unknown): string[] {
@@ -136,8 +145,8 @@ export interface ListingFields {
 
 /** Normalises and validates listing fields, returning per-field messages for anything wrong. */
 export function validateListing(input: unknown, reach: Reach): { fields: ListingFields; errors: Record<string, string> } {
-  const raw = (typeof input === "object" && input !== null ? input : {}) as Record<string, unknown>;
-  const text = (key: string) => (typeof raw[key] === "string" ? (raw[key] as string).trim() : "");
+  const raw = fieldsOf(input);
+  const text = (key: string) => trimmed(raw[key]);
   const fields: ListingFields = {
     slug: text("slug"), name: text("name"), summary: text("summary"), description: text("description"),
     version: text("version"), source: text("source").replace(/\/$/, ""),

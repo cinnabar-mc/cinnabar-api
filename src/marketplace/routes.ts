@@ -1,16 +1,19 @@
 import { Hono, type Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
-import { encodeBase64Url } from "../identity";
 import { hubFor } from "../routing";
 import { MAX_COMPONENT_BYTES, readComponent } from "./component";
-import { SignInFailure, authorizeUrl, pkceChallenge, randomToken, xboxIdentity } from "./microsoft";
+import type { Grants } from "./policy";
+import { SignInFailure, authorizeUrl, randomToken, sha256Base64Url, xboxIdentity } from "./microsoft";
 import { PLAYER_SESSION_MS, type Caller, type MarketCall, type MarketResult, type MediaFile } from "./store";
-import { BodyLimitError, MAX_IMAGES, MAX_IMAGE_BYTES, MAX_UPLOAD_BYTES, imageType, readLimited, sha256 } from "./uploads";
+import { BodyLimitError, MAX_IMAGES, MAX_UPLOAD_BYTES, imageType, readLimited, sha256 } from "./uploads";
 
 const SESSION_COOKIE = "cinnabar_session";
 const OAUTH_COOKIE = "cinnabar_oauth";
 const CSRF_HEADER = "X-Cinnabar-CSRF";
 const MAX_JSON_BYTES = 64 * 1024;
+const SHA256 = /^[0-9a-f]{64}$/;
+/** Keeps stored images inert even if a browser is tricked into rendering one as a document. */
+const IMAGE_CSP = "default-src 'none'; sandbox";
 
 type Ctx = Context<{ Bindings: Env }>;
 
@@ -23,14 +26,10 @@ function siteOrigin(env: Env): string | null {
   }
 }
 
-async function sessionHash(token: string): Promise<string> {
-  return encodeBase64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token))));
-}
-
 /** The caller's session hash and CSRF header, read from the request. */
 async function caller(c: Ctx): Promise<Caller> {
   const token = getCookie(c, SESSION_COOKIE, "host");
-  return { session: token ? await sessionHash(token) : undefined, csrf: c.req.header(CSRF_HEADER) };
+  return { session: token ? await sha256Base64Url(token) : undefined, csrf: c.req.header(CSRF_HEADER) };
 }
 
 async function call(c: Ctx, request: MarketCall): Promise<MarketResult> {
@@ -40,6 +39,29 @@ async function call(c: Ctx, request: MarketCall): Promise<MarketResult> {
 function reply(c: Ctx, result: MarketResult, cache = "no-store"): Response {
   c.header("Cache-Control", cache);
   return c.json(result.body as object, result.status as 200);
+}
+
+/** Answers with the store's result for `request` made as the signed-in caller. */
+async function forward(c: Ctx, request: MarketCall): Promise<Response> {
+  return reply(c, await call(c, { ...request, ...(await caller(c)) }));
+}
+
+/** Like `forward`, adding the bounded JSON body; an oversized or malformed body is a 400 carrying `invalid`. */
+async function forwardJson(c: Ctx, invalid: string, request: (body: unknown) => MarketCall): Promise<Response> {
+  const body = await readJson(c);
+  if (body === null) return c.json({ error: invalid }, 400);
+  return forward(c, request(body));
+}
+
+/** Whether the store lets anyone download the public file `request` names. */
+async function publicFile(c: Ctx, request: MarketCall): Promise<boolean> {
+  return ((await call(c, request)).body as { allowed: boolean }).allowed;
+}
+
+/** Streams a stored object with `headers`, or Hono's 404 when it's missing. */
+async function stream(c: Ctx, key: string, headers: Record<string, string>): Promise<Response> {
+  const object = await c.env.MOD_FILES.get(key);
+  return object ? c.body(object.body, 200, headers) : c.notFound();
 }
 
 /** Parses a small JSON body, or returns null when it's oversized or not JSON. */
@@ -54,6 +76,7 @@ async function readJson(c: Ctx): Promise<unknown | null> {
 }
 
 const id = (value: string): number | null => (/^[0-9]{1,12}$/.test(value) ? Number(value) : null);
+const callbackUrl = (c: Ctx) => new URL("/v1/auth/microsoft/callback", c.req.url).toString();
 
 /** Marketplace and web sign-in routes, mounted under `/v1`. */
 export const marketplaceRoutes = new Hono<{ Bindings: Env }>();
@@ -104,8 +127,7 @@ marketplaceRoutes.get("/auth/microsoft/start", async (c) => {
   // Binds the pending sign-in to this browser, so a link can't sign someone into another person's account.
   setCookie(c, OAUTH_COOKIE, state, { prefix: "host", httpOnly: true, sameSite: "Lax", maxAge: 600 });
   c.header("Cache-Control", "no-store");
-  const redirectUri = new URL("/v1/auth/microsoft/callback", c.req.url).toString();
-  return c.redirect(authorizeUrl(c.env.MICROSOFT_CLIENT_ID, redirectUri, state, await pkceChallenge(verifier)), 302);
+  return c.redirect(authorizeUrl(c.env.MICROSOFT_CLIENT_ID, callbackUrl(c), state, await sha256Base64Url(verifier)), 302);
 });
 
 marketplaceRoutes.get("/auth/microsoft/callback", async (c) => {
@@ -130,13 +152,13 @@ marketplaceRoutes.get("/auth/microsoft/callback", async (c) => {
   try {
     identity = await xboxIdentity({
       clientId: c.env.MICROSOFT_CLIENT_ID, clientSecret: c.env.MICROSOFT_CLIENT_SECRET,
-      redirectUri: new URL("/v1/auth/microsoft/callback", c.req.url).toString(), code, verifier,
+      redirectUri: callbackUrl(c), code, verifier,
     });
   } catch (error) {
     return back(error instanceof SignInFailure ? error.code : "failed");
   }
   const token = randomToken();
-  await call(c, { op: "signin", ...identity, newSession: await sessionHash(token), newCsrf: randomToken(24) });
+  await call(c, { op: "signin", ...identity, newSession: await sha256Base64Url(token), newCsrf: randomToken(24) });
   setCookie(c, SESSION_COOKIE, token, { prefix: "host", httpOnly: true, sameSite: "Lax", maxAge: PLAYER_SESSION_MS / 1000 });
   return back();
 });
@@ -147,8 +169,8 @@ marketplaceRoutes.post("/auth/signout", async (c) => {
   return reply(c, result);
 });
 
-marketplaceRoutes.get("/me", async (c) => reply(c, await call(c, { op: "me", ...(await caller(c)) })));
-marketplaceRoutes.get("/me/mods", async (c) => reply(c, await call(c, { op: "mine", ...(await caller(c)) })));
+marketplaceRoutes.get("/me", (c) => forward(c, { op: "me" }));
+marketplaceRoutes.get("/me/mods", (c) => forward(c, { op: "mine" }));
 marketplaceRoutes.get("/mods", async (c) => reply(c, await call(c, { op: "mods" }), "public, max-age=30"));
 
 marketplaceRoutes.get("/mods/revocations", async (c) => {
@@ -158,48 +180,31 @@ marketplaceRoutes.get("/mods/revocations", async (c) => {
   return c.body(body, 200, { "Content-Type": "application/json" });
 });
 
-/** Streams a stored component when the store allows it for this caller. */
-async function asset(c: Ctx, sha256: string, cache: string): Promise<Response> {
-  if (!/^[0-9a-f]{64}$/.test(sha256)) return c.json({ error: "Not found." }, 404);
-  const allowed = await call(c, { op: "asset", sha256, ...(await caller(c)) });
-  if (!(allowed.body as { allowed: boolean }).allowed) return c.json({ error: "Not found." }, 404);
-  const object = await c.env.MOD_FILES.get(`mods/${sha256}`);
+marketplaceRoutes.get("/mods/assets/:sha256", async (c) => {
+  const hash = c.req.param("sha256");
+  const object = SHA256.test(hash) && await publicFile(c, { op: "asset", sha256: hash }) ? await c.env.MOD_FILES.get(`mods/${hash}`) : null;
   if (!object) return c.json({ error: "Not found." }, 404);
-  return c.body(object.body, 200, { "Content-Type": "application/wasm", "Cache-Control": cache, ETag: `"${sha256}"`,
+  return c.body(object.body, 200, { "Content-Type": "application/wasm", "Cache-Control": "no-store", ETag: `"${hash}"`,
     "X-Content-Type-Options": "nosniff", "Content-Disposition": "attachment" });
-}
-
-marketplaceRoutes.get("/mods/assets/:sha256", (c) => asset(c, c.req.param("sha256"), "no-store"));
+});
 marketplaceRoutes.get("/mods/media/:sha256", async c => {
   const hash = c.req.param("sha256");
-  if (!/^[0-9a-f]{64}$/.test(hash)) return c.notFound();
-  const allowed = await call(c, { op: "media", sha256: hash });
-  if (!(allowed.body as { allowed: boolean }).allowed) return c.notFound();
-  const object = await c.env.MOD_FILES.get(`media/${hash}`);
+  const object = SHA256.test(hash) && await publicFile(c, { op: "media", sha256: hash }) ? await c.env.MOD_FILES.get(`media/${hash}`) : null;
   if (!object) return c.notFound();
   return c.body(object.body, 200, { "Content-Type": object.httpMetadata?.contentType ?? "application/octet-stream",
-    "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; sandbox" });
+    "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": IMAGE_CSP });
 });
 marketplaceRoutes.get("/mods/:slug", async (c) => reply(c, await call(c, { op: "mod", slug: c.req.param("slug") }), "public, max-age=30"));
 marketplaceRoutes.get("/mods/:slug/releases/:version/:sha256", async c => {
   const hash = c.req.param("sha256");
-  return /^[0-9a-f]{64}$/.test(hash) ? reply(c, await call(c, { op: "release", slug: c.req.param("slug"), version: c.req.param("version"), sha256: hash })) : c.notFound();
+  return SHA256.test(hash) ? reply(c, await call(c, { op: "release", slug: c.req.param("slug"), version: c.req.param("version"), sha256: hash })) : c.notFound();
 });
 
-marketplaceRoutes.post("/mods/:slug/send", async (c) =>
-  reply(c, await call(c, { op: "send", slug: c.req.param("slug"), ...(await caller(c)) })));
-
-marketplaceRoutes.post("/mods/:slug/remove", async (c) => {
-  const body = await readJson(c);
-  if (body === null) return c.json({ error: "Send the library selection as JSON." }, 400);
-  return reply(c, await call(c, { op: "remove", slug: c.req.param("slug"), body, ...(await caller(c)) }));
-});
-
-marketplaceRoutes.post("/mods/:slug/reports", async (c) => {
-  const body = await readJson(c);
-  if (body === null) return c.json({ error: "Send the report as JSON." }, 400);
-  return reply(c, await call(c, { op: "report", slug: c.req.param("slug"), body, ...(await caller(c)) }));
-});
+marketplaceRoutes.post("/mods/:slug/send", (c) => forward(c, { op: "send", slug: c.req.param("slug") }));
+marketplaceRoutes.post("/mods/:slug/remove", (c) =>
+  forwardJson(c, "Send the library selection as JSON.", (body) => ({ op: "remove", slug: c.req.param("slug"), body })));
+marketplaceRoutes.post("/mods/:slug/reports", (c) =>
+  forwardJson(c, "Send the report as JSON.", (body) => ({ op: "report", slug: c.req.param("slug"), body })));
 
 /** A multipart upload: `listing` (JSON listing fields) and `file` (the `.wasm` component). */
 marketplaceRoutes.post("/submissions", async (c) => {
@@ -227,26 +232,25 @@ marketplaceRoutes.post("/submissions", async (c) => {
   if (!(file instanceof File)) return c.json({ error: "Choose your mod's .wasm file.", fields: { file: "Choose a file." } }, 422);
   if (file.size > MAX_COMPONENT_BYTES) return c.json({ error: "The file is over 16 MiB." }, 413);
   const bytes = new Uint8Array(await file.arrayBuffer());
-  let grants;
+  let grants: Grants | null;
   try {
     const declarations = readComponent(bytes);
-    grants = declarations.grants;
     if (declarations.version && declarations.version !== (listing as { version?: string }).version) {
       throw new Error("The component version must match the release version.");
     }
+    grants = declarations.grants;
   } catch (error) {
     const message = error instanceof Error ? error.message : "This file can't be read.";
     return c.json({ error: message, fields: { file: message } }, 422);
   }
-  const media: MediaFile[] = [];
   const images = form.getAll("images");
   if (images.length > MAX_IMAGES) return c.json({ error: "Upload at most four images." }, 422);
+  const metadata = form.getAll("image_metadata");
   let imageMetadata: { caption: string; alt: string }[] = [];
-  if (form.has("image_metadata")) {
+  if (metadata.length) {
     try {
-      if (form.getAll("image_metadata").length !== 1 || typeof form.get("image_metadata") !== "string"
-        || String(form.get("image_metadata")).length > 8192) throw new Error();
-      const raw: unknown = JSON.parse(String(form.get("image_metadata")));
+      if (metadata.length !== 1 || typeof metadata[0] !== "string" || metadata[0].length > 8192) throw new Error();
+      const raw: unknown = JSON.parse(metadata[0]);
       if (!Array.isArray(raw) || raw.length !== images.length) throw new Error();
       imageMetadata = raw.map(item => {
         if (!item || typeof item.caption !== "string" || item.caption.length > 160 || typeof item.alt !== "string" || item.alt.length > 300) throw new Error();
@@ -254,70 +258,59 @@ marketplaceRoutes.post("/submissions", async (c) => {
       });
     } catch { return c.json({ error: "Supply one caption and alt text per image, within their limits.", fields: { images: "Invalid image metadata." } }, 422); }
   }
-  const imageBytes: Uint8Array[] = [];
+  const media: { file: MediaFile; data: Uint8Array }[] = [];
   try {
-    for (const image of images) {
+    for (const [i, image] of images.entries()) {
       if (!(image instanceof File)) throw new Error("Choose an image file.");
-      if (image.size > MAX_IMAGE_BYTES) throw new Error("Each image must be at most 1 MiB.");
       const data = new Uint8Array(await image.arrayBuffer());
       const type = imageType(data);
-      const details = imageMetadata[media.length];
-      media.push({ sha256: await sha256(data), bytes: data.length, type, caption: details?.caption ?? image.name.slice(0, 160), alt: details?.alt ?? "" });
-      imageBytes.push(data);
+      const details = imageMetadata[i];
+      media.push({ data, file: { sha256: await sha256(data), bytes: data.length, type,
+        caption: details?.caption ?? image.name.slice(0, 160), alt: details?.alt ?? "" } });
     }
   } catch (error) { return c.json({ error: error instanceof Error ? error.message : "Invalid image." }, 422); }
   const hash = await sha256(bytes);
-  for (let i = 0; i < media.length; i++) {
-    await c.env.MOD_FILES.put(`media/${media[i]!.sha256}`, imageBytes[i]!, { httpMetadata: { contentType: media[i]!.type } });
-  }
+  for (const { file, data } of media) await c.env.MOD_FILES.put(`media/${file.sha256}`, data, { httpMetadata: { contentType: file.type } });
   await c.env.MOD_FILES.put(`mods/${hash}`, bytes, { httpMetadata: { contentType: "application/wasm" } });
-  return reply(c, await call(c, { op: "submit", body: listing, file: { sha256: hash, bytes: bytes.byteLength, grants, media }, ...who }));
+  return reply(c, await call(c, { op: "submit", body: listing,
+    file: { sha256: hash, bytes: bytes.byteLength, grants, media: media.map(m => m.file) }, ...who }));
 });
 
-marketplaceRoutes.get("/staff/queue", async (c) => reply(c, await call(c, { op: "queue", ...(await caller(c)) })));
-marketplaceRoutes.get("/staff/reports", async (c) => reply(c, await call(c, { op: "reports", ...(await caller(c)) })));
-marketplaceRoutes.get("/staff/people", async (c) => reply(c, await call(c, { op: "people", ...(await caller(c)) })));
-marketplaceRoutes.get("/staff/audit", async (c) => reply(c, await call(c, { op: "audit", ...(await caller(c)) })));
+for (const op of ["queue", "reports", "people", "audit"] as const) marketplaceRoutes.get(`/staff/${op}`, (c) => forward(c, { op }));
 
 marketplaceRoutes.get("/staff/versions/:id", async (c) => {
   const versionId = id(c.req.param("id"));
   if (versionId === null) return c.json({ error: "No such version." }, 404);
-  return reply(c, await call(c, { op: "version", id: versionId, ...(await caller(c)) }));
+  return forward(c, { op: "version", id: versionId });
 });
 
 marketplaceRoutes.get("/staff/versions/:id/file", async (c) => {
   const versionId = id(c.req.param("id"));
-  const version = versionId === null ? null : await call(c, { op: "version", id: versionId, ...(await caller(c)) });
-  if (!version || version.status !== 200) return reply(c, version ?? { status: 404, body: { error: "No such version." } });
-  const objectKey = `mods/${(version.body as { sha256: string }).sha256}`;
-  const object = await c.env.MOD_FILES.get(objectKey);
-  if (!object) return c.notFound();
-  return c.body(object.body, 200, { "Content-Type": "application/wasm", "Cache-Control": "private, no-store",
-    "Content-Disposition": "attachment", "X-Content-Type-Options": "nosniff" });
+  if (versionId === null) return reply(c, { status: 404, body: { error: "No such version." } });
+  const version = await call(c, { op: "version", id: versionId, ...(await caller(c)) });
+  if (version.status !== 200) return reply(c, version);
+  return stream(c, `mods/${(version.body as { sha256: string }).sha256}`, { "Content-Type": "application/wasm",
+    "Cache-Control": "private, no-store", "Content-Disposition": "attachment", "X-Content-Type-Options": "nosniff" });
 });
 
 marketplaceRoutes.get("/me/mods/:id/media/:sha256", async c => {
   c.header("Cache-Control", "private, no-store");
   const target = id(c.req.param("id"));
   const hash = c.req.param("sha256");
-  if (target === null || !/^[0-9a-f]{64}$/.test(hash)) return c.notFound();
+  if (target === null || !SHA256.test(hash)) return c.notFound();
   const result = await call(c, { op: "private-media", id: target, sha256: hash, ...(await caller(c)) });
   if (result.status !== 200) return reply(c, result);
   const { key, type } = result.body as { key: string; type: string };
-  const object = await c.env.MOD_FILES.get(key);
-  return object ? c.body(object.body, 200, { "Content-Type": type, "Cache-Control": "private, no-store",
-    "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; sandbox" }) : c.notFound();
+  return stream(c, key, { "Content-Type": type, "Cache-Control": "private, no-store",
+    "X-Content-Type-Options": "nosniff", "Content-Security-Policy": IMAGE_CSP });
 });
 
 marketplaceRoutes.post("/staff/versions/:id/rescan", async c => {
   const target = id(c.req.param("id"));
-  return target === null ? c.notFound() : reply(c, await call(c, { op: "rescan", id: target, ...(await caller(c)) }));
+  return target === null ? c.notFound() : forward(c, { op: "rescan", id: target });
 });
-marketplaceRoutes.post("/staff/mods/:slug/trust", async c => {
-  const body = await readJson(c);
-  if (body === null) return c.json({ error: "Send JSON." }, 400);
-  return reply(c, await call(c, { op: "trust", slug: c.req.param("slug"), body, ...(await caller(c)) }));
-});
+marketplaceRoutes.post("/staff/mods/:slug/trust", (c) =>
+  forwardJson(c, "Send JSON.", (body) => ({ op: "trust", slug: c.req.param("slug"), body })));
 
 /** Scanner credentials authorize only this internal job protocol, never marketplace staff operations. */
 marketplaceRoutes.use("/internal/marketplace/*", async (c, next) => {
@@ -337,8 +330,7 @@ marketplaceRoutes.get("/internal/marketplace/jobs/:job/files/:sha256", async c =
   const result = await call(c, { op: "scan-file", job: c.req.param("job"), lease: c.req.header("X-Scan-Lease") ?? "", sha256: c.req.param("sha256") });
   if (result.status !== 200) return reply(c, result);
   const { key, type } = result.body as { key: string; type: string };
-  const object = await c.env.MOD_FILES.get(key);
-  return object ? c.body(object.body, 200, { "Content-Type": type, "Cache-Control": "no-store" }) : c.notFound();
+  return stream(c, key, { "Content-Type": type, "Cache-Control": "no-store" });
 });
 marketplaceRoutes.post("/internal/marketplace/jobs/:job/complete", async c => {
   const body = await readJson(c);
@@ -346,30 +338,17 @@ marketplaceRoutes.post("/internal/marketplace/jobs/:job/complete", async c => {
   return reply(c, await call(c, { op: "scan-complete", job: c.req.param("job"), lease: c.req.header("X-Scan-Lease") ?? "", body }));
 });
 
-/** Registers a staff write that takes a numeric id and a JSON body. */
-function staffWrite(path: string, op: "decide" | "pull" | "resolve"): void {
-  marketplaceRoutes.post(path, async (c) => {
-    const target = id(c.req.param("id") ?? "");
-    const body = await readJson(c);
+const INVALID_REQUEST = "Send the request as JSON.";
+for (const [path, op] of [["/staff/versions/:id/decision", "decide"], ["/staff/versions/:id/pull", "pull"],
+  ["/staff/reports/:id/resolve", "resolve"]] as const) {
+  marketplaceRoutes.post(path, (c) => {
+    const target = id(c.req.param("id"));
     if (target === null) return c.json({ error: "Not found." }, 404);
-    if (body === null) return c.json({ error: "Send the request as JSON." }, 400);
-    return reply(c, await call(c, { op, id: target, body, ...(await caller(c)) }));
+    return forwardJson(c, INVALID_REQUEST, (body) => ({ op, id: target, body }));
   });
 }
-staffWrite("/staff/versions/:id/decision", "decide");
-staffWrite("/staff/versions/:id/pull", "pull");
-staffWrite("/staff/reports/:id/resolve", "resolve");
-
-marketplaceRoutes.post("/staff/mods/:slug/hide", async (c) => {
-  const body = await readJson(c);
-  if (body === null) return c.json({ error: "Send the request as JSON." }, 400);
-  return reply(c, await call(c, { op: "hide", slug: c.req.param("slug"), body, ...(await caller(c)) }));
-});
-
-for (const [path, op] of [["/staff/people/role", "role"], ["/staff/people/suspend", "suspend"]] as const) {
-  marketplaceRoutes.post(path, async (c) => {
-    const body = await readJson(c);
-    if (body === null) return c.json({ error: "Send the request as JSON." }, 400);
-    return reply(c, await call(c, { op, body, ...(await caller(c)) }));
-  });
+marketplaceRoutes.post("/staff/mods/:slug/hide", (c) =>
+  forwardJson(c, INVALID_REQUEST, (body) => ({ op: "hide", slug: c.req.param("slug"), body })));
+for (const op of ["role", "suspend"] as const) {
+  marketplaceRoutes.post(`/staff/people/${op}`, (c) => forwardJson(c, INVALID_REQUEST, (body) => ({ op, body })));
 }

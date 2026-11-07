@@ -600,8 +600,8 @@ export class Hub extends DurableObject<Env> {
   private async publishMod(id: number): Promise<boolean> {
     this.market.publicationAttempt(id, Date.now());
     const key = this.env.MARKETPLACE_SIGNING_KEY;
-    const candidate = key && this.market.publicationReady(id, Date.now());
-    if (!candidate || !key) return false;
+    const candidate = key ? this.market.publicationReady(id, Date.now()) : null;
+    if (!key || !candidate) return false;
     try {
       for (const objectKey of [`mods/${candidate.sha256}`, ...candidate.media.map(m => `media/${m.sha256}`)]) {
         if (!await this.env.MOD_FILES.head(objectKey)) return false;

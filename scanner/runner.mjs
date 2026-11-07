@@ -90,9 +90,10 @@ export async function runOnce(config, request = fetch, analyze = isolatedAnalysi
   });
   const { job } = JSON.parse((await limitedBody(await call('claim', { method: 'POST' }), 256 * 1024)).toString('utf8'));
   if (!job) return false;
+  const model = config.AI_MODEL || MODEL;
   const report = { sha256: job.sha256, policy: SCAN_POLICY, validator: VALIDATOR, client_revision: CLIENT_REVISION, deterministic: 'error',
     imports: [], exports: [], media: (job.media ?? []).map(m => m.sha256), findings: [],
-    ai: { verdict: 'error', model: config.AI_MODEL || MODEL, prompt: PROMPT_VERSION, findings: ['Validation did not complete.'] } };
+    ai: { verdict: 'error', model, prompt: PROMPT_VERSION, findings: ['Validation did not complete.'] } };
   try {
     if (job.policy !== SCAN_POLICY || !/^[0-9a-f]{64}$/.test(job.sha256) || job.media.length > 4) throw new Error('Invalid job.');
     const download = async (hash, size) => {
@@ -108,7 +109,7 @@ export async function runOnce(config, request = fetch, analyze = isolatedAnalysi
     const analysis = await analyze(job, bytes, media);
     Object.assign(report, { deterministic: analysis.deterministic, imports: analysis.imports, exports: analysis.exports, findings: analysis.findings });
     report.ai = analysis.deterministic === 'pass' ? await reviewEvidence(analysis.evidence, config, request)
-      : { verdict: 'flag', model: config.AI_MODEL || MODEL, prompt: PROMPT_VERSION, findings: ['Deterministic policy blocked the release.'] };
+      : { verdict: 'flag', model, prompt: PROMPT_VERSION, findings: ['Deterministic policy blocked the release.'] };
   } catch { report.findings = ['Validation failed, timed out or could not verify the artifact.']; }
   await limitedBody(await call(`jobs/${encodeURIComponent(job.id)}/complete`, {
     method: 'POST', headers: { 'X-Scan-Lease': job.lease }, body: JSON.stringify(report),

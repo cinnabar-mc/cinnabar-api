@@ -2,7 +2,7 @@ import { requestedCapabilities, type Grants } from "./policy";
 
 /** Maximum accepted component size; every body reader enforces this independently of Content-Length. */
 export const MAX_COMPONENT_BYTES = 16 * 1024 * 1024;
-export interface ComponentDeclarations {
+interface ComponentDeclarations {
   name: string; description: string; version: string; authors: string; licenses: string;
   grants: Grants | null; grantsDeclared: boolean;
 }
@@ -26,7 +26,7 @@ function parseGrants(value: string): Grants {
   const tokens = value.match(/"(?:[^"\\]|\\.)*"|[{}\[\]:,]/g) || [];
   const seen = new Set<string>();
   let depth = 0;
-  tokens.forEach(function (token, index) {
+  for (const [index, token] of tokens.entries()) {
     if (token === "{" || token === "[") depth++;
     else if (token === "}" || token === "]") depth--;
     else if (depth === 1 && token[0] === '"' && tokens[index + 1] === ":") {
@@ -34,7 +34,7 @@ function parseGrants(value: string): Grants {
       if (seen.has(name)) throw new Error("Duplicate capability: " + name);
       seen.add(name);
     }
-  });
+  }
   requestedCapabilities(parsed);
   return parsed;
 }
@@ -44,14 +44,11 @@ function parseGrants(value: string): Grants {
  * additionally runs in the trusted worker; this reader never executes an upload.
  */
 export function readComponent(bytes: Uint8Array): ComponentDeclarations {
-  if (bytes.length > 16 * 1024 * 1024) throw new Error("The file is over 16 MiB.");
-  if (bytes.length < 8 || [0, 97, 115, 109].some(function (v, i) { return bytes[i] !== v; })) {
-    throw new Error("This isn't a WebAssembly file.");
-  }
-  if ([1, 0, 0, 0].every(function (v, i) { return bytes[i + 4] === v; })) {
-    throw new Error("This is a core module. Package it as a component first.");
-  }
-  if (![13, 0, 1, 0].every(function (v, i) { return bytes[i + 4] === v; })) throw new Error("Invalid component header.");
+  if (bytes.length > MAX_COMPONENT_BYTES) throw new Error("The file is over 16 MiB.");
+  const layer = (expected: number[]) => expected.every((v, i) => bytes[i + 4] === v);
+  if (bytes.length < 8 || [0, 97, 115, 109].some((v, i) => bytes[i] !== v)) throw new Error("This isn't a WebAssembly file.");
+  if (layer([1, 0, 0, 0])) throw new Error("This is a core module. Package it as a component first.");
+  if (!layer([13, 0, 1, 0])) throw new Error("Invalid component header.");
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
   const found: ComponentDeclarations = { name: "", description: "", version: "", authors: "", licenses: "", grants: null, grantsDeclared: false };
   const seen = new Set<string>();
