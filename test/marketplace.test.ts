@@ -772,7 +772,7 @@ describe("upload and publication pipeline", () => {
 
   it("rejects unmatched or oversized image captions before storing a release", async () => {
     const creator = await signIn("2535400000006109", "MetadataCreator");
-    for (const metadata of [[], [{ caption: "x".repeat(161), alt: "" }], [{ caption: "Caption", alt: null }]]) {
+    for (const metadata of [[], [{ caption: "x".repeat(161), alt: "" }], [{ caption: "Caption", alt: null }], [{ caption: "Lone \ud83d", alt: "" }]]) {
       const form = new FormData();
       form.set("listing", JSON.stringify({ slug: "bad-image-meta", name: "Bad metadata", summary: "A metadata validation fixture.", version: "1.0.0" }));
       form.set("file", new File([component([])], "fixture.wasm"));
@@ -781,5 +781,103 @@ describe("upload and publication pipeline", () => {
       expect((await upload(creator, form)).status).toBe(422);
     }
     expect(await (await creator.get("/me/mods")).json()).toEqual([]);
+  });
+});
+
+describe("moderation input and targeting", () => {
+  /** Publishes `slug` from a fresh creator with one owner approval. */
+  async function published(owner: Browser, creatorXuid: string, slug: string) {
+    const creator = await signIn(creatorXuid, `Maker${creatorXuid.slice(-4)}`);
+    const v = await (await submit(creator, slug, "1.0.0", { hud: true })).json() as { id: string };
+    expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(200);
+    return { creator, v };
+  }
+
+  it("keeps pull reasons well-formed so every client can parse the signed revocation list", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const { v } = await published(owner, "2535400000007101", "unicode-pull");
+    expect((await owner.post(`/staff/versions/${v.id}/pull`, { reason: "Broken \ud83d" })).status).toBe(422);
+    // The 500th UTF-16 unit is the emoji's high surrogate.
+    const reason = `${"a".repeat(499)}\u{1F600} and more`;
+    expect((await owner.post(`/staff/versions/${v.id}/pull`, { reason })).status).toBe(200);
+    const text = await (await api("/mods/revocations")).text();
+    expect(text).not.toMatch(/\\ud[89a-f]/i);
+    const strict = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(new TextEncoder().encode(text));
+    const revoked = (JSON.parse(strict) as { revoked: { slug: string; reason: string }[] }).revoked;
+    const entry = revoked.find((r) => r.slug === "unicode-pull")!;
+    expect(entry.reason.isWellFormed()).toBe(true);
+    expect(entry.reason).toBe(`${"a".repeat(499)}\u{1F600}`);
+  });
+
+  it("refuses ill-formed staff and creator text before it reaches stored or signed bodies", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const creator = await signIn("2535400000007102", "TextCreator");
+    const bad = await submit(creator, "lone-text", "1.0.0", { hud: true }, { name: "Lone \udc00" });
+    expect(bad.status).toBe(422);
+    expect(await bad.json()).toMatchObject({ fields: { name: expect.any(String) } });
+    const commands = await submit(creator, "lone-text", "1.0.0", { commands: ["lone\ud83d"] }, { source: "https://github.com/cinnabar-mc/lone-text" });
+    expect(commands.status).toBe(422);
+    expect(await commands.json()).toMatchObject({ error: expect.stringContaining("Unicode") });
+    const v = await (await submit(creator, "lone-text", "1.0.0", { hud: true })).json() as { id: string };
+    expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "changes", note: "Fix \ud83d" })).status).toBe(422);
+    expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(200);
+    const reporter = await signIn("2535400000007103", "TextReporter");
+    expect((await reporter.post("/mods/lone-text/reports", { reason: "broken", details: "It crashes on load \ud83d" })).status).toBe(422);
+    expect((await owner.post("/staff/mods/lone-text/hide", { hidden: false, reason: "Audit \ud83d" })).status).toBe(422);
+  });
+
+  it("makes legacy stored text well-formed in signed release statements", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const creator = await signIn("2535400000007104", "LegacyTextCreator");
+    const v = await (await submit(creator, "legacy-text", "1.0.0", { hud: true })).json() as { id: string };
+    await runInDurableObject(hub(), (_: Hub, state) => {
+      const row = state.storage.sql.exec<{ metadata: string }>("SELECT metadata FROM mod_pipeline WHERE version_id = ?", Number(v.id)).one();
+      // JSON keeps the lone surrogate as an ASCII escape, so it survives storage.
+      const metadata = JSON.stringify({ ...JSON.parse(row.metadata), name: "Legacy \ud83d" });
+      state.storage.sql.exec("UPDATE mod_pipeline SET metadata = ? WHERE version_id = ?", metadata, Number(v.id));
+    });
+    expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(200);
+    const { release } = await (await api("/mods/legacy-text")).json() as { release: { statement: string; signature: string } };
+    expect(release.statement).not.toMatch(/\\ud[89a-f]/i);
+    expect(JSON.parse(release.statement)).toMatchObject({ metadata: { name: "Legacy \ufffd" } });
+    expect(await verifies(release.statement, release.signature)).toBe(true);
+  });
+
+  it("refuses role changes and suspensions when several accounts share a gamertag", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    await signIn("2535400000007111", "Twin");
+    await signIn("2535400000007112", "twin");
+    const role = await owner.post("/staff/people/role", { gamertag: "Twin", role: "moderator", reason: "Ambiguous target" });
+    expect(role.status).toBe(409);
+    const suspend = await owner.post("/staff/people/suspend", { gamertag: "TWIN", suspended: true, reason: "Ambiguous target" });
+    expect(suspend.status).toBe(409);
+    const people = await (await owner.get("/staff/people")).json() as { xuid: string }[];
+    expect(people.map((p) => p.xuid)).not.toEqual(expect.arrayContaining(["2535400000007111"]));
+    expect(people.map((p) => p.xuid)).not.toEqual(expect.arrayContaining(["2535400000007112"]));
+  });
+
+  it("refuses reports from suspended accounts and against hidden listings", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    await published(owner, "2535400000007121", "report-gates");
+    const details = { reason: "broken", details: "The panel won't close with Escape." };
+    const suspended = await signIn("2535400000007122", "SuspendedReporter");
+    expect((await owner.post("/staff/people/suspend", { gamertag: "SuspendedReporter", suspended: true, reason: "Spam reports" })).status).toBe(200);
+    expect((await suspended.post("/mods/report-gates/reports", details)).status).toBe(403);
+    const reporter = await signIn("2535400000007123", "HiddenReporter");
+    expect((await owner.post("/staff/mods/report-gates/hide", { hidden: true, reason: "Under review" })).status).toBe(200);
+    expect((await reporter.post("/mods/report-gates/reports", details)).status).toBe(404);
+    const reports = await (await owner.get("/staff/reports")).json() as { slug: string }[];
+    expect(reports.filter((r) => r.slug === "report-gates")).toEqual([]);
+  });
+
+  it("forbids staff from rescanning their own pending release", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const creator = await signIn("2535400000007131", "StaffCreator");
+    await promote(owner, "StaffCreator", "moderator");
+    const v = await (await submit(creator, "self-rescan", "1.0.0", { hud: true })).json() as { id: string };
+    const own = await creator.post(`/staff/versions/${v.id}/rescan`);
+    expect(own.status).toBe(403);
+    expect(await (await owner.get(`/staff/versions/${v.id}`)).json()).toMatchObject({ scan: { state: "complete" } });
+    expect((await owner.post(`/staff/versions/${v.id}/rescan`)).status).toBe(200);
   });
 });

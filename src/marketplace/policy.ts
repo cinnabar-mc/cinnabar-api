@@ -52,6 +52,21 @@ export function trimmed(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
+/**
+ * Whether any of `values` is a string that isn't well-formed Unicode (it holds a lone surrogate half).
+ * JSON bodies can carry escaped lone surrogates; strict UTF-8 decoders, such as the client's, reject them.
+ */
+export function malformedText(...values: unknown[]): boolean {
+  return values.some((value) => typeof value === "string" && !value.isWellFormed());
+}
+
+/** The first `max` code points of `text`, so truncation never splits a surrogate pair. */
+export function clip(text: string, max: number): string {
+  let units = 0;
+  for (let points = 0; points < max && units < text.length; points++) units += text.codePointAt(units)! > 0xffff ? 2 : 1;
+  return text.slice(0, units);
+}
+
 /** Lists requested capability names, throwing on unknown names or malformed values. */
 export function requestedCapabilities(grants: unknown): string[] {
   if (grants === null || grants === undefined) return [];
@@ -153,6 +168,7 @@ export function validateListing(input: unknown, reach: Reach): { fields: Listing
     category: text("category"), license: text("license"), notes: text("notes"),
   };
   const errors: Record<string, string> = {};
+  for (const key of Object.keys(fields)) if (malformedText(raw[key])) errors[key] = "Use valid Unicode text.";
   if (!/^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])$/.test(fields.slug)) errors.slug = "Use 3–40 lowercase letters, numbers and dashes.";
   if (!fields.name || fields.name.length > 64) errors.name = "Name it in 64 characters or fewer.";
   if (fields.summary.length < 10 || fields.summary.length > 140) errors.summary = "Summarise it in 10–140 characters.";

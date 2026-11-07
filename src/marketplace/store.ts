@@ -1,6 +1,6 @@
 import type { ModLibraryEntry } from "../protocol";
 import {
-  ROLES, approvalRule, approvalsComplete, atLeast, canApprove, canReview, canSetRole, fieldsOf, grantDiff, reachOf,
+  ROLES, approvalRule, approvalsComplete, atLeast, canApprove, canReview, canSetRole, clip, fieldsOf, grantDiff, malformedText, reachOf,
   requestedCapabilities, trimmed, validateListing, type Actor, type Grants, type ListingFields, type Reach, type ReviewState,
   type Role,
 } from "./policy";
@@ -15,6 +15,7 @@ const MAX_PENDING_SUBMISSIONS = 5;
 const MAX_REPORTS_PER_DAY = 10;
 const MAX_LIBRARY = 100;
 const REPORT_REASONS = ["broken", "advantage", "malicious", "stolen", "other"];
+const MALFORMED_TEXT = "Use valid Unicode text.";
 
 /** An HTTP-shaped answer, plus accounts whose live clients should receive their library again. */
 export interface MarketResult {
@@ -81,6 +82,9 @@ const ok = (body: unknown, extra: Partial<MarketResult> = {}): MarketResult => (
 const fail = (status: number, error: string, fields?: Record<string, string>): MarketResult =>
   ({ status, body: fields ? { error, fields } : { error } });
 const reportOf = (p: PipelineRow): ScanReport | null => p.report ? JSON.parse(p.report) as ScanReport : null;
+/** Parses stored JSON with every string value made well-formed, so legacy rows can't put lone surrogates in signed bodies. */
+const parseWellFormed = (json: string): unknown => JSON.parse(json, (_, value) => typeof value === "string" ? value.toWellFormed() : value);
+
 /** A version's listing snapshot; snapshots migrated from before category, license and notes read them as "". */
 const snapshotOf = (p: PipelineRow): ListingFields => ({ category: "", license: "", notes: "", ...JSON.parse(p.metadata) });
 /** SQL for a version clients may fetch: approved, actually signed, unpulled and with a complete scan. */
@@ -200,11 +204,15 @@ export class MarketplaceStore {
     return { xuid: row.xuid, gamertag: row.gamertag, role, suspended: !!row.suspended };
   }
 
-  /** The account currently holding `gamertag`, case-insensitively, or null when nobody with it has signed in. */
-  private accountNamed(gamertag: string): Account | null {
-    const xuid = this.sql.exec<{ xuid: string }>("SELECT xuid FROM market_accounts WHERE gamertag = ? COLLATE NOCASE", gamertag)
-      .toArray()[0]?.xuid;
-    return xuid ? this.account(xuid) : null;
+  /**
+   * The account last seen with `gamertag`, case-insensitively, or the refusal when nobody with it has signed in or
+   * several accounts were (gamertags change, and stale rows keep the old one until that player signs in again).
+   */
+  private accountNamed(gamertag: string): Account | MarketResult {
+    const rows = this.sql.exec<{ xuid: string }>("SELECT xuid FROM market_accounts WHERE gamertag = ? COLLATE NOCASE LIMIT 2", gamertag)
+      .toArray();
+    if (rows.length > 1) return fail(409, "More than one account has signed in with that gamertag. Ask them to sign in again.");
+    return (rows[0] && this.account(rows[0].xuid)) ?? fail(404, "No Cinnabar account with that gamertag has signed in yet.");
   }
 
   /** Resolves a live session; staff sessions expire after twelve hours, player sessions after thirty days. */
@@ -245,7 +253,7 @@ export class MarketplaceStore {
 
   private log(actor: string, action: string, target: string, note: string, now: number): void {
     this.sql.exec("INSERT INTO staff_audit (at, actor, action, target, note) VALUES (?, ?, ?, ?, ?)",
-      now, actor, action, target, note.slice(0, 500));
+      now, actor, action, target, clip(note, 500));
   }
 
   // --- Reads ---------------------------------------------------------------------------------------------
@@ -262,8 +270,8 @@ export class MarketplaceStore {
   library(xuid: string): ModLibraryEntry[] {
     return this.sql.exec<VersionRow & { sent_at: number }>(`SELECT v.*, l.sent_at FROM mod_library l
       JOIN mod_versions v ON v.id = l.version_id WHERE l.xuid = ? ORDER BY l.sent_at`, xuid).toArray()
-      .map((v) => ({ slug: v.slug, version: v.version, sha256: v.sha256, bytes: v.bytes, grants: JSON.parse(v.grants) as Grants,
-        sent_at: new Date(v.sent_at).toISOString(), pulled: !!v.pulled, ...(v.pulled ? { pull_reason: v.pull_reason } : {}) }));
+      .map((v) => ({ slug: v.slug, version: v.version, sha256: v.sha256, bytes: v.bytes, grants: parseWellFormed(v.grants) as Grants,
+        sent_at: new Date(v.sent_at).toISOString(), pulled: !!v.pulled, ...(v.pulled ? { pull_reason: v.pull_reason.toWellFormed() } : {}) }));
   }
 
   private versions(where: string, ...args: SqlStorageValue[]): VersionRow[] {
@@ -351,8 +359,8 @@ export class MarketplaceStore {
     if (v.statement !== null) return v.statement;
     const approvers = this.approvals(v.id).map((a) => a.xuid);
     const p = this.pipeline(v.id)!;
-    return JSON.stringify({ approved_at: v.decided_at, approvers, bytes: v.bytes, grants: JSON.parse(v.grants), sha256: v.sha256,
-      slug: v.slug, version: v.version, metadata: JSON.parse(p.metadata), media: JSON.parse(p.media),
+    return JSON.stringify({ approved_at: v.decided_at, approvers, bytes: v.bytes, grants: parseWellFormed(v.grants), sha256: v.sha256,
+      slug: v.slug, version: v.version, metadata: parseWellFormed(p.metadata), media: parseWellFormed(p.media),
       policy: SCAN_POLICY, client_revision: CLIENT_REVISION, scan_job: p.job_id, publication: p.publish_mode });
   }
 
@@ -373,11 +381,11 @@ export class MarketplaceStore {
     return true;
   }
 
-  /** Pulled versions with the reason staff gave, as the canonical body of the signed revocation list. */
+  /** Pulled versions with the reason staff gave, as the canonical body of the signed revocation list; reasons are always well-formed. */
   revocations(now: number): string {
     const revoked = this.sql.exec<{ slug: string; version: string; sha256: string; pull_reason: string }>(
       "SELECT slug, version, sha256, pull_reason FROM mod_versions WHERE pulled = 1 ORDER BY id").toArray()
-      .map((v) => ({ slug: v.slug, version: v.version, sha256: v.sha256, reason: v.pull_reason }));
+      .map((v) => ({ slug: v.slug, version: v.version, sha256: v.sha256, reason: v.pull_reason.toWellFormed() }));
     return JSON.stringify({ issued_at: now, expires_at: now + 15 * 60_000, revoked });
   }
 
@@ -424,13 +432,17 @@ export class MarketplaceStore {
       AND version_id IN (SELECT id FROM mod_versions WHERE slug = ? AND sha256 = ?)`, xuid, slug, at, slug, sha256).rowsWritten > 0;
   }
 
+  /** Files a report against a visible listing's live version; suspended accounts can't report. */
   report(caller: Caller, slug: string, input: unknown, now: number): MarketResult {
     const session = this.writer(caller, now);
     if ("status" in session) return session;
-    const live = this.liveVersion(slug);
+    if (session.account.suspended) return fail(403, "Your account is suspended.");
+    const listing = this.listing(slug);
+    const live = listing && !listing.hidden ? this.liveVersion(slug) : undefined;
     if (!live) return fail(404, "No public mod with that name.");
     const body = fieldsOf(input);
     if (typeof body.reason !== "string" || !REPORT_REASONS.includes(body.reason)) return fail(400, "Choose a reason.");
+    if (malformedText(body.details)) return fail(422, MALFORMED_TEXT);
     const details = trimmed(body.details);
     if (details.length < 10) return fail(400, "Describe what happened in a sentence or two.");
     const xuid = session.account.xuid;
@@ -438,7 +450,7 @@ export class MarketplaceStore {
       xuid, now - 86_400_000).one().n;
     if (recent >= MAX_REPORTS_PER_DAY) return fail(429, "You've sent a lot of reports today. Try again tomorrow.");
     this.sql.exec("INSERT INTO mod_reports (slug, version, reporter, reason, details, at) VALUES (?, ?, ?, ?, ?, ?)",
-      slug, live.version, xuid, body.reason, details.slice(0, 1000), now);
+      slug, live.version, xuid, body.reason, clip(details, 1000), now);
     return ok({ received: true });
   }
 
@@ -633,6 +645,7 @@ export class MarketplaceStore {
     if ("status" in staff) return staff;
     const v = this.versionRow(id);
     if (!v || v.status !== "submitted") return fail(409, "Only pending releases can be rescanned.");
+    if (v.creator === staff.xuid) return fail(403, "You can't rescan your own mod.");
     this.sql.exec(`UPDATE mod_pipeline SET job_id = ?, state = 'queued', attempts = 0, lease = NULL,
       lease_until = NULL, report = NULL, completed_at = NULL, publish_mode = NULL WHERE version_id = ?`, crypto.randomUUID(), id);
     this.sql.exec("DELETE FROM mod_approvals WHERE version_id = ?", id);
@@ -650,7 +663,8 @@ export class MarketplaceStore {
     if (!listing) return fail(404, "No such mod.");
     if (listing.creator === session.account.xuid) return fail(403, "You can't establish your own trust.");
     const body = fieldsOf(input);
-    const reason = trimmed(body.reason).slice(0, 500);
+    if (malformedText(body.reason)) return fail(422, MALFORMED_TEXT);
+    const reason = clip(trimmed(body.reason), 500);
     if (!reason || typeof body.trusted !== "boolean") return fail(422, "Supply trusted and an audit reason.");
     if (body.trusted) {
       const humanApproved = this.sql.exec(`SELECT 1 FROM mod_versions v JOIN mod_pipeline p ON p.version_id = v.id
@@ -711,7 +725,8 @@ export class MarketplaceStore {
     const v = this.versionRow(id);
     if (!v) return fail(404, "No such version.");
     const body = fieldsOf(input);
-    const note = trimmed(body.note).slice(0, 1000);
+    if (malformedText(body.note)) return fail(422, MALFORMED_TEXT);
+    const note = clip(trimmed(body.note), 1000);
     const state: ReviewState = { creator: v.creator, status: v.status, reach: v.reach as Reach,
       approvals: this.approvals(v.id).map((a) => ({ xuid: a.xuid, admin: a.admin })) };
     const target = `${v.slug} ${v.version}`;
@@ -750,9 +765,11 @@ export class MarketplaceStore {
     if (!atLeast(staff, "admin")) return fail(403, "Only admins can pull a published version.");
     const v = this.versionRow(id);
     if (!v || v.status !== "approved" || v.pulled) return fail(404, "Only published versions can be pulled.");
-    const reason = trimmed(fieldsOf(input).reason);
+    const rawReason = fieldsOf(input).reason;
+    if (malformedText(rawReason)) return fail(422, MALFORMED_TEXT);
+    const reason = clip(trimmed(rawReason), 500);
     if (!reason) return fail(400, "Say why it's being pulled.");
-    this.sql.exec("UPDATE mod_versions SET pulled = 1, pull_reason = ? WHERE id = ?", reason.slice(0, 500), v.id);
+    this.sql.exec("UPDATE mod_versions SET pulled = 1, pull_reason = ? WHERE id = ?", reason, v.id);
     this.sql.exec("DELETE FROM mod_trust WHERE slug = ?", v.slug);
     this.log(staff.xuid, "pulled", `${v.slug} ${v.version}`, reason, now);
     const holders = this.sql.exec<{ xuid: string }>("SELECT xuid FROM mod_library WHERE version_id = ?", v.id).toArray().map((r) => r.xuid);
@@ -764,6 +781,7 @@ export class MarketplaceStore {
     if ("status" in staff) return staff;
     if (!this.listing(slug)) return fail(404, "No such mod.");
     const body = fieldsOf(input);
+    if (malformedText(body.reason)) return fail(422, MALFORMED_TEXT);
     const reason = trimmed(body.reason);
     if (!reason) return fail(400, "Note why, for the audit log.");
     const hidden = body.hidden === true;
@@ -791,9 +809,11 @@ export class MarketplaceStore {
     if ("status" in staff) return staff;
     const report = this.sql.exec<{ slug: string; version: string }>("SELECT slug, version FROM mod_reports WHERE id = ?", id).toArray()[0];
     if (!report) return fail(404, "No such report.");
-    const note = trimmed(fieldsOf(input).note);
+    const rawNote = fieldsOf(input).note;
+    if (malformedText(rawNote)) return fail(422, MALFORMED_TEXT);
+    const note = clip(trimmed(rawNote), 1000);
     if (!note) return fail(400, "Write what you found.");
-    this.sql.exec("UPDATE mod_reports SET status = 'resolved', resolution = ?, resolved_by = ? WHERE id = ?", note.slice(0, 1000), staff.xuid, id);
+    this.sql.exec("UPDATE mod_reports SET status = 'resolved', resolution = ?, resolved_by = ? WHERE id = ?", note, staff.xuid, id);
     this.log(staff.xuid, "resolved report", `${report.slug} ${report.version}`, note, now);
     return ok({ id: String(id), status: "resolved" });
   }
@@ -814,12 +834,13 @@ export class MarketplaceStore {
     if ("status" in session) return session;
     const body = fieldsOf(input);
     const target = this.accountNamed(trimmed(body.gamertag));
-    if (!target) return fail(404, "No Cinnabar account with that gamertag has signed in yet.");
+    if ("status" in target) return target;
     const role = body.role as Role;
     if (!ROLES.includes(role)) return fail(400, "Choose a role.");
     const allowed = canSetRole(session.account, target, role);
     if (!allowed.ok) return fail(403, allowed.reason);
     if (session.created_at + ROLE_CHANGE_SIGN_IN_MS <= now) return fail(401, "For safety, sign out and sign in again before changing roles.");
+    if (malformedText(body.reason)) return fail(422, MALFORMED_TEXT);
     const reason = trimmed(body.reason);
     if (!reason) return fail(400, "Note why, for the audit log.");
     this.sql.exec("UPDATE market_accounts SET role = ? WHERE xuid = ?", role, target.xuid);
@@ -835,8 +856,9 @@ export class MarketplaceStore {
     if (!atLeast(staff, "admin")) return fail(403, "Only admins can suspend accounts.");
     const body = fieldsOf(input);
     const target = this.accountNamed(trimmed(body.gamertag));
-    if (!target) return fail(404, "No Cinnabar account with that gamertag has signed in yet.");
+    if ("status" in target) return target;
     if (target.xuid === staff.xuid || atLeast(target, "admin") && !atLeast(staff, "owner")) return fail(403, "You can't suspend this account.");
+    if (malformedText(body.reason)) return fail(422, MALFORMED_TEXT);
     const reason = trimmed(body.reason);
     if (!reason) return fail(400, "Note why, for the audit log.");
     const suspended = body.suspended === true;

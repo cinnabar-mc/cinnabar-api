@@ -122,7 +122,10 @@ Acts and Network listings must link their GitHub source.
   no added permissions or commands, and no suspension, withdrawal or open-report hold.
   Acts and Network releases always need human approval. See [the pipeline contract](docs/marketplace.md).
 - An approved version is signed with the Ed25519 `MARKETPLACE_SIGNING_KEY` over a canonical statement
-  `{approved_at, approvers, bytes, grants, sha256, slug, version}`, returned as `release` on `GET /v1/mods/:slug`.
+  `{approved_at, approvers, bytes, grants, sha256, slug, version, metadata, media, policy, client_revision, scan_job, publication}`,
+  returned as `release` on `GET /v1/mods/:slug`. `metadata` is the immutable listing snapshot, `media` the gallery
+  descriptors, `policy` and `client_revision` the scan policy and pinned client revision, `scan_job` the scan job ID
+  and `publication` `manual` or `automatic`.
 - Pulled versions appear in `GET /v1/mods/revocations`, signed in `X-Cinnabar-Signature`.
 
 **Send to game.**

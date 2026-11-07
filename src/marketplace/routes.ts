@@ -2,7 +2,7 @@ import { Hono, type Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { hubFor } from "../routing";
 import { MAX_COMPONENT_BYTES, readComponent } from "./component";
-import type { Grants } from "./policy";
+import { clip, malformedText, type Grants } from "./policy";
 import { SignInFailure, authorizeUrl, randomToken, sha256Base64Url, xboxIdentity } from "./microsoft";
 import { PLAYER_SESSION_MS, type Caller, type MarketCall, type MarketResult, type MediaFile } from "./store";
 import { BodyLimitError, MAX_IMAGES, MAX_UPLOAD_BYTES, imageType, readLimited, sha256 } from "./uploads";
@@ -253,7 +253,8 @@ marketplaceRoutes.post("/submissions", async (c) => {
       const raw: unknown = JSON.parse(metadata[0]);
       if (!Array.isArray(raw) || raw.length !== images.length) throw new Error();
       imageMetadata = raw.map(item => {
-        if (!item || typeof item.caption !== "string" || item.caption.length > 160 || typeof item.alt !== "string" || item.alt.length > 300) throw new Error();
+        if (!item || typeof item.caption !== "string" || item.caption.length > 160 || typeof item.alt !== "string" || item.alt.length > 300
+          || malformedText(item.caption, item.alt)) throw new Error();
         return { caption: item.caption, alt: item.alt };
       });
     } catch { return c.json({ error: "Supply one caption and alt text per image, within their limits.", fields: { images: "Invalid image metadata." } }, 422); }
@@ -266,7 +267,7 @@ marketplaceRoutes.post("/submissions", async (c) => {
       const type = imageType(data);
       const details = imageMetadata[i];
       media.push({ data, file: { sha256: await sha256(data), bytes: data.length, type,
-        caption: details?.caption ?? image.name.slice(0, 160), alt: details?.alt ?? "" } });
+        caption: details?.caption ?? clip(image.name.toWellFormed(), 160), alt: details?.alt ?? "" } });
     }
   } catch (error) { return c.json({ error: error instanceof Error ? error.message : "Invalid image." }, 422); }
   const hash = await sha256(bytes);

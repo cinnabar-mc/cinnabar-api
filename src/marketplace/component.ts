@@ -1,4 +1,4 @@
-import { requestedCapabilities, type Grants } from "./policy";
+import { malformedText, requestedCapabilities, type Grants } from "./policy";
 
 /** Maximum accepted component size; every body reader enforces this independently of Content-Length. */
 export const MAX_COMPONENT_BYTES = 16 * 1024 * 1024;
@@ -36,6 +36,7 @@ function parseGrants(value: string): Grants {
     }
   }
   requestedCapabilities(parsed);
+  if (Array.isArray(parsed.commands) && malformedText(...parsed.commands)) throw new Error("Command names must be valid Unicode text.");
   return parsed;
 }
 
