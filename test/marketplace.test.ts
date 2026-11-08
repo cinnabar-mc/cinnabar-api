@@ -27,6 +27,10 @@ function installFakeGoogle(): void {
   const previous = spy.getMockImplementation()!;
   spy.mockImplementation(async (input, init) => {
     const url = input instanceof Request ? input.url : String(input);
+    // workerd throws for any other redirect mode, and the fetch mock would otherwise hide that.
+    if ((url === TOKEN_URL || url === USERINFO_URL) && init?.redirect !== undefined && !["follow", "manual"].includes(init.redirect)) {
+      throw new TypeError('Invalid redirect value, must be one of "follow" or "manual"');
+    }
     if (url === TOKEN_URL) {
       const form = new URLSearchParams(String(init?.body));
       expect(form.get("code_verifier")).toMatch(/^[A-Za-z0-9_-]{43}$/);
