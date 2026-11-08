@@ -1,3 +1,4 @@
+import { equalHash, type ProviderIdentity } from "./auth";
 import { compareVersions, type ModLibraryEntry } from "../protocol";
 import type { MarketplaceUpdateQuery } from "./updates";
 import { canonicalRelease, type ModRelease } from "../mod-releases";
@@ -19,7 +20,7 @@ const MAX_REPORTS_PER_DAY = 10;
 const MAX_LIBRARY = 100;
 const REPORT_REASONS = ["broken", "advantage", "malicious", "stolen", "other"];
 const MALFORMED_TEXT = "Use valid Unicode text.";
-const SIGN_IN_FIRST = "Sign in with Microsoft first.";
+const SIGN_IN_FIRST = "Sign in to Cinnabar first.";
 const NO_SUCH_IMAGE = "No such image.";
 
 /** An HTTP-shaped answer, plus accounts whose live clients should receive their library again. */
@@ -38,10 +39,12 @@ export interface Caller {
 }
 
 interface Account extends Actor {
-  gamertag: string;
+  display_name: string;
+  email: string;
+  email_verified: boolean;
 }
 type SessionRow = {
-  xuid: string;
+  account_id: string;
   csrf: string;
   created_at: number;
 };
@@ -183,6 +186,35 @@ export class MarketplaceStore {
       "CREATE INDEX mod_versions_updates ON mod_versions (slug, api_revision)");
     // Keep the complete original manifest outside the fixed marketplace signed-statement format.
     migrate(7, `CREATE TABLE mod_official_releases (version_id INTEGER PRIMARY KEY, release TEXT NOT NULL, validation TEXT NOT NULL)`);
+
+    // Move every marketplace reference to an opaque account ID. Keep legacy rows for rollback diagnostics;
+    // signed statements are immutable and are deliberately never rewritten. No production web accounts existed.
+    migrate(8,
+      `CREATE TABLE accounts (id TEXT PRIMARY KEY, display_name TEXT NOT NULL, email TEXT NOT NULL,
+        email_verified INTEGER NOT NULL DEFAULT 0, role TEXT NOT NULL DEFAULT 'player',
+        suspended INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)`,
+      `CREATE INDEX accounts_verified_email ON accounts (email, email_verified)`,
+      `CREATE TABLE identities (provider TEXT NOT NULL, subject TEXT NOT NULL, account_id TEXT NOT NULL,
+        email TEXT NOT NULL, email_verified INTEGER NOT NULL, PRIMARY KEY (provider, subject))`,
+      `CREATE INDEX identities_account ON identities (account_id)`,
+      `CREATE TABLE xbox_links (xuid TEXT PRIMARY KEY, account_id TEXT NOT NULL UNIQUE, gamertag TEXT NOT NULL, linked_at INTEGER NOT NULL)`,
+      `CREATE TABLE account_link_codes (code_hash TEXT PRIMARY KEY, account_id TEXT NOT NULL UNIQUE, expires_at INTEGER NOT NULL)`,
+      `CREATE TABLE account_link_attempts (account_id TEXT NOT NULL, at INTEGER NOT NULL)`,
+      `CREATE INDEX account_link_attempts_account ON account_link_attempts (account_id, at)`,
+      `CREATE TABLE market_account_migration (xuid TEXT PRIMARY KEY, account_id TEXT NOT NULL)`,
+      `INSERT INTO market_account_migration SELECT xuid, CASE WHEN xuid = '${OFFICIAL_CREATOR}' THEN xuid ELSE lower(hex(randomblob(16))) END FROM market_accounts`,
+      `INSERT INTO accounts SELECT m.account_id, a.gamertag, '', 0, CASE WHEN a.role = 'owner' THEN 'player' ELSE a.role END,
+        a.suspended, a.seen_at FROM market_accounts a JOIN market_account_migration m ON m.xuid = a.xuid`,
+      `INSERT INTO xbox_links SELECT a.xuid, m.account_id, a.gamertag, a.seen_at FROM market_accounts a JOIN market_account_migration m ON m.xuid = a.xuid
+        WHERE a.xuid != '${OFFICIAL_CREATOR}'`,
+      ...["web_sessions", "mod_approvals", "mod_library", "mod_library_clock"].flatMap(table => [
+        `ALTER TABLE ${table} RENAME COLUMN xuid TO account_id`,
+        `UPDATE ${table} SET account_id = COALESCE((SELECT account_id FROM market_account_migration m WHERE m.xuid = ${table}.account_id), account_id)`,
+      ]),
+      ...[["mod_listings", "creator"], ["mod_reports", "reporter"], ["mod_reports", "resolved_by"],
+        ["mod_trust", "creator"], ["mod_trust", "granted_by"], ["mod_upload_attempts", "creator"], ["staff_audit", "actor"], ["staff_audit", "target"]].map(([table, column]) =>
+        `UPDATE ${table} SET ${column} = COALESCE((SELECT account_id FROM market_account_migration m WHERE m.xuid = ${table}.${column}), ${column})`),
+      `DROP TABLE market_account_migration`);
   }
 
   /** Increases whenever the set of pulled versions changes, so callers can tell a memoized revocation list is stale. */
@@ -202,7 +234,7 @@ export class MarketplaceStore {
     if (this.officialDigestPulled(m.artifact.sha256)) return null;
     const metadata: ListingFields = { slug: OFFICIAL_SLUG, name: "Cinnabar Official Mod", summary: "The official Cinnabar gameplay and interface mod.",
       description: "The Official Mod, published by Cinnabar's authenticated release pipeline.", source: "", category: "Utilities", license, notes: "", version: m.version };
-    this.sql.exec(`INSERT OR IGNORE INTO market_accounts (xuid, gamertag, seen_at) VALUES (?, 'Cinnabar', ?)`, OFFICIAL_CREATOR, now);
+    this.sql.exec(`INSERT OR IGNORE INTO accounts (id, display_name, email, email_verified, created_at) VALUES (?, 'Cinnabar', '', 0, ?)`, OFFICIAL_CREATOR, now);
     this.sql.exec(`INSERT OR IGNORE INTO mod_listings (slug, creator, name, summary, description, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
       OFFICIAL_SLUG, OFFICIAL_CREATOR, metadata.name, metadata.summary, metadata.description, metadata.source, now);
     const id = this.sql.exec<{ id: number }>(`INSERT INTO mod_versions (slug, version, sha256, bytes, grants, reach, status, submitted_at, decided_at, api_revision)
@@ -249,12 +281,34 @@ export class MarketplaceStore {
 
   // --- Sign-in -------------------------------------------------------------------------------------------
 
-  /** Records the verified Xbox identity and opens a session under the hash of its cookie. */
-  signIn(xuid: string, gamertag: string, sessionHash: string, csrf: string, now: number): void {
-    this.sql.exec(`INSERT INTO market_accounts (xuid, gamertag, seen_at) VALUES (?, ?, ?)
-      ON CONFLICT (xuid) DO UPDATE SET gamertag = excluded.gamertag, seen_at = excluded.seen_at`, xuid, gamertag, now);
+  /**
+   * Resolves (provider, subject) first. New identities may join an existing account only when both emails
+   * are verified and match after trim/lowercase normalization. Ambiguous verified matches never auto-link.
+   * Existing identities stay attached to their account even when provider email/name claims change.
+   */
+  signIn(identity: ProviderIdentity, sessionHash: string, csrf: string, now: number): void {
+    const email = identity.email.trim().toLowerCase();
+    const existing = this.sql.exec<{ account_id: string }>(
+      "SELECT account_id FROM identities WHERE provider = ? AND subject = ?", identity.provider, identity.subject).toArray()[0];
+    let accountId = existing?.account_id;
+    if (!accountId && identity.email_verified && email) {
+      const matches = this.sql.exec<{ id: string }>("SELECT id FROM accounts WHERE email = ? AND email_verified = 1 LIMIT 2", email).toArray();
+      if (matches.length === 1) accountId = matches[0]!.id;
+    }
+    if (!accountId) {
+      accountId = crypto.randomUUID();
+      this.sql.exec("INSERT INTO accounts (id, display_name, email, email_verified, created_at) VALUES (?, ?, ?, ?, ?)",
+        accountId, identity.display_name, email, identity.email_verified ? 1 : 0, now);
+    } else if (existing) {
+      // Refresh the account's primary claims only from its existing identity, never from an unverified email match.
+      this.sql.exec("UPDATE accounts SET display_name = ?, email = ?, email_verified = ? WHERE id = ?",
+        identity.display_name, email, identity.email_verified ? 1 : 0, accountId);
+    }
+    this.sql.exec(`INSERT INTO identities (provider, subject, account_id, email, email_verified) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT (provider, subject) DO UPDATE SET email = excluded.email, email_verified = excluded.email_verified`,
+      identity.provider, identity.subject, accountId, email, identity.email_verified ? 1 : 0);
     this.sql.exec("DELETE FROM web_sessions WHERE created_at <= ?", now - PLAYER_SESSION_MS);
-    this.sql.exec("INSERT INTO web_sessions (id_hash, xuid, csrf, created_at) VALUES (?, ?, ?, ?)", sessionHash, xuid, csrf, now);
+    this.sql.exec("INSERT INTO web_sessions (id_hash, account_id, csrf, created_at) VALUES (?, ?, ?, ?)", sessionHash, accountId, csrf, now);
   }
 
   /** End only the authenticated browser's session; suspended accounts can still sign out. */
@@ -265,31 +319,30 @@ export class MarketplaceStore {
     return ok({});
   }
 
-  private account(xuid: string): Account | null {
-    const row = this.sql.exec<{ xuid: string; gamertag: string; role: string; suspended: number }>(
-      "SELECT xuid, gamertag, role, suspended FROM market_accounts WHERE xuid = ?", xuid).toArray()[0];
+  private account(id: string): Account | null {
+    const row = this.sql.exec<{ id: string; display_name: string; email: string; email_verified: number; role: string; suspended: number }>(
+      "SELECT id, display_name, email, email_verified, role, suspended FROM accounts WHERE id = ?", id).toArray()[0];
     if (!row) return null;
-    const role: Role = this.owners.has(row.xuid) ? "owner" : ROLES.includes(row.role as Role) ? row.role as Role : "player";
-    return { xuid: row.xuid, gamertag: row.gamertag, role, suspended: !!row.suspended };
+    const role: Role = row.email_verified && this.owners.has(row.email.trim().toLowerCase()) ? "owner"
+      : ROLES.includes(row.role as Role) && row.role !== "owner" ? row.role as Role : "player";
+    return { ...row, role, email_verified: !!row.email_verified, suspended: !!row.suspended };
   }
 
-  /**
-   * The account last seen with `gamertag`, case-insensitively, or the refusal when nobody with it has signed in or
-   * several accounts were (gamertags change, and stale rows keep the old one until that player signs in again).
-   */
-  private accountNamed(gamertag: string): Account | MarketResult {
-    const rows = this.sql.exec<{ xuid: string }>("SELECT xuid FROM market_accounts WHERE gamertag = ? COLLATE NOCASE LIMIT 2", gamertag)
-      .toArray();
-    if (rows.length > 1) return fail(409, "More than one account has signed in with that gamertag. Ask them to sign in again.");
-    return (rows[0] && this.account(rows[0].xuid)) ?? fail(404, "No Cinnabar account with that gamertag has signed in yet.");
+  /** Resolves an opaque account ID, with an unambiguous display-name fallback for existing staff forms. */
+  private accountNamed(input: Record<string, unknown>): Account | MarketResult {
+    if (typeof input.account_id === "string") return this.account(input.account_id) ?? fail(404, "No such Cinnabar account.");
+    const name = trimmed(input.display_name ?? input.gamertag);
+    const rows = this.sql.exec<{ id: string }>("SELECT id FROM accounts WHERE display_name = ? COLLATE NOCASE LIMIT 2", name).toArray();
+    if (rows.length > 1) return fail(409, "More than one account has that display name. Use an account ID.");
+    return (rows[0] && this.account(rows[0].id)) ?? fail(404, "No Cinnabar account with that display name has signed in yet.");
   }
 
   /** Resolves a live session; staff sessions expire after twelve hours, player sessions after thirty days. */
   private session(caller: Caller, now: number): (SessionRow & { account: Account }) | null {
     if (!caller.session) return null;
-    const row = this.sql.exec<SessionRow>("SELECT xuid, csrf, created_at FROM web_sessions WHERE id_hash = ?",
+    const row = this.sql.exec<SessionRow>("SELECT account_id, csrf, created_at FROM web_sessions WHERE id_hash = ?",
       caller.session).toArray()[0];
-    const account = row && this.account(row.xuid);
+    const account = row && this.account(row.account_id);
     if (!row || !account) return null;
     const lifetime = atLeast(account, "moderator") ? STAFF_SESSION_MS : PLAYER_SESSION_MS;
     if (row.created_at + lifetime <= now) {
@@ -315,9 +368,9 @@ export class MarketplaceStore {
     return session.account;
   }
 
-  private name(xuid: string): string {
-    return this.sql.exec<{ gamertag: string }>("SELECT gamertag FROM market_accounts WHERE xuid = ?", xuid)
-      .toArray()[0]?.gamertag ?? "Unknown";
+  private name(id: string): string {
+    return this.sql.exec<{ display_name: string }>("SELECT display_name FROM accounts WHERE id = ?", id)
+      .toArray()[0]?.display_name ?? "Unknown";
   }
 
   private log(actor: string, action: string, target: string, note: string, now: number): void {
@@ -331,16 +384,84 @@ export class MarketplaceStore {
   me(caller: Caller, now: number): MarketResult {
     const session = this.session(caller, now);
     if (!session) return anonymousResult("me")!;
-    const { xuid, gamertag, role, suspended } = session.account;
-    return ok({ account: { xuid, gamertag, role, suspended }, library: this.library(xuid), csrf: session.csrf });
+    const { id, display_name, email, role, suspended } = session.account;
+    return ok({ account: { id, display_name, email, role, suspended, xbox: this.xbox(id) },
+      library: this.library(id), csrf: session.csrf, game_online: false });
   }
 
-  /** The library entries a player's client should hold, including pulled versions with staff's reason. */
-  library(xuid: string): ModLibraryEntry[] {
+  /** The current Xbox identity linked to an account, or null; libraries themselves belong to account IDs. */
+  xbox(accountId: string): { xuid: string; gamertag: string } | null {
+    return this.sql.exec<{ xuid: string; gamertag: string }>("SELECT xuid, gamertag FROM xbox_links WHERE account_id = ?", accountId).toArray()[0] ?? null;
+  }
+
+  /** Resolves the verified game XUID at the delivery boundary, never treating it as a marketplace account ID. */
+  accountForXbox(xuid: string): string | null {
+    return this.sql.exec<{ account_id: string }>("SELECT account_id FROM xbox_links WHERE xuid = ?", xuid).toArray()[0]?.account_id ?? null;
+  }
+
+  /** A linked game socket's account library; an unlinked XUID receives an empty library. */
+  libraryForXbox(xuid: string): ModLibraryEntry[] {
+    const id = this.accountForXbox(xuid);
+    return id ? this.library(id) : [];
+  }
+
+  /** Removes a game selection only from the account currently linked to that connection's verified XUID. */
+  removeXboxLibrary(xuid: string, slug: string, sha256: string, sentAt: string): boolean {
+    const id = this.accountForXbox(xuid);
+    return !!id && this.removeLibrary(id, slug, sha256, sentAt);
+  }
+
+  /** The library entries an account holds, including pulled versions with staff's reason. */
+  library(accountId: string): ModLibraryEntry[] {
     return this.sql.exec<VersionRow & { sent_at: number }>(`SELECT v.*, l.sent_at FROM mod_library l
-      JOIN mod_versions v ON v.id = l.version_id WHERE l.xuid = ? ORDER BY l.sent_at`, xuid).toArray()
+      JOIN mod_versions v ON v.id = l.version_id WHERE l.account_id = ? ORDER BY l.sent_at`, accountId).toArray()
       .map((v) => ({ slug: v.slug, version: v.version, sha256: v.sha256, bytes: v.bytes, grants: parseWellFormed(v.grants) as Grants,
         sent_at: new Date(v.sent_at).toISOString(), pulled: !!v.pulled, ...(v.pulled ? { pull_reason: v.pull_reason.toWellFormed() } : {}) }));
+  }
+
+  /** Issues at most five codes/account per ten minutes. Replacement invalidates the previous code atomically. */
+  issueLinkCode(caller: Caller, codeHash: string, now: number): MarketResult {
+    const session = this.writer(caller, now);
+    if ("status" in session) return session;
+    if (session.account.suspended) return fail(403, "Your account is suspended.");
+    if (this.xbox(session.account.id)) return fail(409, "Unlink your Xbox account first.");
+    this.sql.exec("DELETE FROM account_link_attempts WHERE at <= ?", now - 600_000);
+    const count = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM account_link_attempts WHERE account_id = ?", session.account.id).one().n;
+    if (count >= 5) return fail(429, "Too many link codes. Try again in ten minutes.");
+    this.sql.exec("INSERT INTO account_link_attempts (account_id, at) VALUES (?, ?)", session.account.id, now);
+    this.sql.exec("DELETE FROM account_link_codes WHERE account_id = ?", session.account.id);
+    this.sql.exec("INSERT INTO account_link_codes (code_hash, account_id, expires_at) VALUES (?, ?, ?)", codeHash, session.account.id, now + 600_000);
+    return ok({});
+  }
+
+  /** Clears the binding and any pending code; existing selections stay on the Cinnabar account. */
+  unlinkXbox(caller: Caller, now: number): MarketResult {
+    const session = this.writer(caller, now);
+    if ("status" in session) return session;
+    const previous = this.xbox(session.account.id);
+    this.sql.exec("DELETE FROM xbox_links WHERE account_id = ?", session.account.id);
+    this.sql.exec("DELETE FROM account_link_codes WHERE account_id = ?", session.account.id);
+    return { status: 204, body: null, notify: previous ? [previous.xuid] : [] };
+  }
+
+  /**
+   * Consumes a hashed, unexpired code synchronously with binding the verified game identity. The indexed hash
+   * lookup is followed by a fixed-length constant-time digest comparison, including the missing-code path.
+   * Refused bindings preserve the code; successful bindings delete it, so replay cannot relink an account.
+   */
+  linkXbox(codeHash: string, xuid: string, gamertag: string, now: number):
+    { ok: true; account: { display_name: string } } | { ok: false; error: "invalid" | "expired" | "already_linked" | "rate_limited" } {
+    const row = this.sql.exec<{ code_hash: string; account_id: string; expires_at: number }>(
+      "SELECT code_hash, account_id, expires_at FROM account_link_codes WHERE code_hash = ?", codeHash).toArray()[0];
+    const matches = equalHash(codeHash, row?.code_hash ?? "!".repeat(43));
+    if (!matches || !row) return { ok: false, error: "invalid" };
+    if (row.expires_at <= now) return { ok: false, error: "expired" };
+    const account = this.account(row.account_id);
+    if (!account || account.suspended) return { ok: false, error: "invalid" };
+    if (this.accountForXbox(xuid) || this.xbox(account.id)) return { ok: false, error: "already_linked" };
+    this.sql.exec("INSERT INTO xbox_links (xuid, account_id, gamertag, linked_at) VALUES (?, ?, ?, ?)", xuid, account.id, gamertag, now);
+    this.sql.exec("DELETE FROM account_link_codes WHERE account_id = ?", account.id);
+    return { ok: true, account: { display_name: account.display_name } };
   }
 
   private versions(where: string, ...args: SqlStorageValue[]): VersionRow[] {
@@ -352,10 +473,10 @@ export class MarketplaceStore {
     return this.versions("v.id = ?", id)[0];
   }
 
-  private approvals(versionId: number): { xuid: string; admin: boolean; at: number; gamertag: string }[] {
-    return this.sql.exec<{ xuid: string; admin: number; at: number }>(
-      "SELECT xuid, admin, at FROM mod_approvals WHERE version_id = ? ORDER BY at", versionId).toArray()
-      .map((a) => ({ xuid: a.xuid, admin: !!a.admin, at: a.at, gamertag: this.name(a.xuid) }));
+  private approvals(versionId: number): { id: string; admin: boolean; at: number; display_name: string }[] {
+    return this.sql.exec<{ account_id: string; admin: number; at: number }>(
+      "SELECT account_id, admin, at FROM mod_approvals WHERE version_id = ? ORDER BY at", versionId).toArray()
+      .map((a) => ({ id: a.account_id, admin: !!a.admin, at: a.at, display_name: this.name(a.account_id) }));
   }
 
   private liveVersion(slug: string): VersionRow | undefined {
@@ -387,7 +508,7 @@ export class MarketplaceStore {
       version: live.version, version_id: String(live.id), reach: live.reach,
       status: "approved",
       capabilities: requestedCapabilities(grants), sha256: live.sha256, bytes: live.bytes,
-      updated_at: live.decided_at, reviewed_by: this.approvals(live.id).map((a) => a.gamertag).join(", "),
+      updated_at: live.decided_at, reviewed_by: this.approvals(live.id).map((a) => a.display_name).join(", "),
       publication: p.publish_mode,
       // Public summaries omit private scanner findings and source evidence.
       scan: { state: p.state, completed_at: p.completed_at, report: report ? {
@@ -415,7 +536,7 @@ export class MarketplaceStore {
     const history = this.versions("v.slug = ? AND v.status = 'approved' ORDER BY v.decided_at DESC", slug).map((v) => {
       const p = this.pipeline(v.id)!;
       return { version: v.version, at: v.decided_at, pulled: !!v.pulled, reach: v.reach,
-        reviewers: this.approvals(v.id).map((a) => a.gamertag), publication: p.publish_mode, notes: snapshotOf(p).notes };
+        reviewers: this.approvals(v.id).map((a) => a.display_name), publication: p.publish_mode, notes: snapshotOf(p).notes };
     });
     return ok({ ...this.publicListing(listing, live), history, release: { statement: live.statement, signature: live.signature } });
   }
@@ -431,7 +552,7 @@ export class MarketplaceStore {
     const v = this.versionRow(versionId)!;
     if (v.statement !== null) return v.statement;
     const p = this.pipeline(v.id)!;
-    const approvers = p.publish_mode === "official" ? [OFFICIAL_CREATOR] : this.approvals(v.id).map((a) => a.xuid);
+    const approvers = p.publish_mode === "official" ? [OFFICIAL_CREATOR] : this.approvals(v.id).map((a) => a.id);
     return JSON.stringify({ approved_at: v.decided_at, approvers, bytes: v.bytes, grants: parseWellFormed(v.grants), sha256: v.sha256,
       slug: v.slug, version: v.version, metadata: parseWellFormed(p.metadata), media: parseWellFormed(p.media),
       policy: p.publish_mode === "official" ? OFFICIAL_POLICY : SCAN_POLICY,
@@ -488,17 +609,18 @@ export class MarketplaceStore {
     const session = this.writer(caller, now);
     if ("status" in session) return session;
     if (session.account.suspended) return fail(403, "Your account is suspended.");
+    if (!this.xbox(session.account.id)) return fail(409, "Link your Xbox account in Cinnabar first.");
     const live = this.publicVersion(this.listing(slug));
     if (!live) return fail(404, "No public mod with that name.");
-    const xuid = session.account.xuid;
-    const count = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM mod_library WHERE xuid = ? AND slug != ?", xuid, slug).one().n;
+    const account_id = session.account.id;
+    const count = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM mod_library WHERE account_id = ? AND slug != ?", account_id, slug).one().n;
     if (count >= MAX_LIBRARY) return fail(409, "Your library is full. Remove a mod from your library first.");
-    const sentAt = this.sql.exec<{ sent_at: number }>(`INSERT INTO mod_library_clock (xuid, sent_at) VALUES (?, ?)
-      ON CONFLICT (xuid) DO UPDATE SET sent_at = MAX(excluded.sent_at, mod_library_clock.sent_at + 1)
-      RETURNING sent_at`, xuid, now).one().sent_at;
-    this.sql.exec(`INSERT INTO mod_library (xuid, slug, version_id, sent_at) VALUES (?, ?, ?, ?)
-      ON CONFLICT (xuid, slug) DO UPDATE SET version_id = excluded.version_id, sent_at = excluded.sent_at`, xuid, slug, live.id, sentAt);
-    return ok({ queued: true, version: live.version }, { notify: [xuid] });
+    const sentAt = this.sql.exec<{ sent_at: number }>(`INSERT INTO mod_library_clock (account_id, sent_at) VALUES (?, ?)
+      ON CONFLICT (account_id) DO UPDATE SET sent_at = MAX(excluded.sent_at, mod_library_clock.sent_at + 1)
+      RETURNING sent_at`, account_id, now).one().sent_at;
+    this.sql.exec(`INSERT INTO mod_library (account_id, slug, version_id, sent_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT (account_id, slug) DO UPDATE SET version_id = excluded.version_id, sent_at = excluded.sent_at`, account_id, slug, live.id, sentAt);
+    return ok({ queued: true, version: live.version }, { notify: [this.xbox(account_id)!.xuid] });
   }
 
   /** Authorizes a browser removal and broadcasts only a successfully removed exact selection. */
@@ -509,19 +631,20 @@ export class MarketplaceStore {
     const at = typeof body.sent_at === "string" && body.sent_at.length <= 32 ? Date.parse(body.sent_at) : NaN;
     if (typeof body.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(body.sha256) || !Number.isSafeInteger(at)
       || new Date(at).toISOString() !== body.sent_at) return fail(422, "Choose a library selection with its hash and send timestamp.");
-    const xuid = session.account.xuid;
-    if (!this.removeLibrary(xuid, slug, body.sha256, String(body.sent_at))) {
+    const account_id = session.account.id;
+    if (!this.removeLibrary(account_id, slug, body.sha256, String(body.sent_at))) {
       return fail(409, "Your library changed. Review the current selection and try again.");
     }
-    return ok({ removed: true }, { notify: [xuid] });
+    const xbox = this.xbox(account_id);
+    return ok({ removed: true }, { notify: xbox ? [xbox.xuid] : [] });
   }
 
   /** Removes only the authenticated account's exact send request; stale removals cannot erase a later send. */
-  removeLibrary(xuid: string, slug: string, sha256: string, sentAt: string): boolean {
+  removeLibrary(account_id: string, slug: string, sha256: string, sentAt: string): boolean {
     const at = Date.parse(sentAt);
     if (!Number.isSafeInteger(at)) return false;
-    return this.sql.exec(`DELETE FROM mod_library WHERE xuid = ? AND slug = ? AND sent_at = ?
-      AND version_id IN (SELECT id FROM mod_versions WHERE slug = ? AND sha256 = ?)`, xuid, slug, at, slug, sha256).rowsWritten > 0;
+    return this.sql.exec(`DELETE FROM mod_library WHERE account_id = ? AND slug = ? AND sent_at = ?
+      AND version_id IN (SELECT id FROM mod_versions WHERE slug = ? AND sha256 = ?)`, account_id, slug, at, slug, sha256).rowsWritten > 0;
   }
 
   /** Files a report against a visible listing's live version; suspended accounts can't report. */
@@ -537,19 +660,19 @@ export class MarketplaceStore {
     if (malformedText(body.details)) return fail(422, MALFORMED_TEXT);
     const details = trimmed(body.details);
     if (details.length < 10) return fail(400, "Describe what happened in a sentence or two.");
-    const xuid = session.account.xuid;
+    const account_id = session.account.id;
     const recent = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM mod_reports WHERE reporter = ? AND at > ?",
-      xuid, now - 86_400_000).one().n;
+      account_id, now - 86_400_000).one().n;
     if (recent >= MAX_REPORTS_PER_DAY) return fail(429, "You've sent a lot of reports today. Try again tomorrow.");
     this.sql.exec("INSERT INTO mod_reports (slug, version, reporter, reason, details, at) VALUES (?, ?, ?, ?, ?, ?)",
-      slug, live.version, xuid, body.reason, clip(details, 1000), now);
+      slug, live.version, account_id, body.reason, clip(details, 1000), now);
     return ok({ received: true });
   }
 
   mine(caller: Caller, now: number): MarketResult {
     const session = this.session(caller, now);
     if (!session) return fail(401, SIGN_IN_FIRST);
-    return ok(this.versions("l.creator = ? ORDER BY v.submitted_at DESC", session.account.xuid).map((v) => this.versionView(v)));
+    return ok(this.versions("l.creator = ? ORDER BY v.submitted_at DESC", session.account.id).map((v) => this.versionView(v)));
   }
 
   /** Checks a submission before its file is stored, so a refused listing costs no upload. */
@@ -564,12 +687,12 @@ export class MarketplaceStore {
     if ("status" in session) return session;
     if (session.account.suspended) return fail(403, "Your account is suspended.");
     const pending = this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM mod_versions v JOIN mod_listings l ON l.slug = v.slug
-      WHERE l.creator = ? AND v.status = 'submitted'`, session.account.xuid).one().n;
+      WHERE l.creator = ? AND v.status = 'submitted'`, session.account.id).one().n;
     if (pending >= MAX_PENDING_SUBMISSIONS) return fail(429, "You have five versions waiting for review. Wait for a decision first.");
     const { fields, errors } = validateListing(listingInput, 0);
     if (Object.keys(errors).length) return fail(422, "Check the highlighted fields.", errors);
     const existing = this.listing(fields.slug);
-    if (existing && existing.creator !== session.account.xuid) {
+    if (existing && existing.creator !== session.account.id) {
       return fail(409, "That name is taken.", { slug: "Another creator owns this name." });
     }
     if (this.sql.exec("SELECT 1 FROM mod_versions WHERE slug = ? AND version = ?", fields.slug, fields.version).toArray().length) {
@@ -589,7 +712,7 @@ export class MarketplaceStore {
     // Durable Object storage commits the synchronous writes of one turn atomically.
     this.sql.exec(`INSERT INTO mod_listings (slug, creator, name, summary, description, source, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (slug) DO NOTHING`,
-      fields.slug, session.account.xuid, fields.name, fields.summary, fields.description, fields.source, now);
+      fields.slug, session.account.id, fields.name, fields.summary, fields.description, fields.source, now);
     const id = this.sql.exec<{ id: number }>(`INSERT INTO mod_versions (slug, version, sha256, bytes, grants, reach, status, submitted_at, api_revision)
         VALUES (?, ?, ?, ?, ?, ?, 'submitted', ?, ?) RETURNING id`,
       fields.slug, fields.version, file.sha256, file.bytes, JSON.stringify(grants), reach, now, API_REVISION).one().id;
@@ -606,10 +729,10 @@ export class MarketplaceStore {
     if ("status" in session) return session;
     if (session.account.suspended) return fail(403, "Your account is suspended.");
     this.sql.exec("DELETE FROM mod_upload_attempts WHERE at <= ?", now - 3_600_000);
-    if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM mod_upload_attempts WHERE creator = ?", session.account.xuid).one().n >= 20) {
+    if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM mod_upload_attempts WHERE creator = ?", session.account.id).one().n >= 20) {
       return fail(429, "Upload limit reached. Try again in an hour.");
     }
-    this.sql.exec("INSERT INTO mod_upload_attempts (creator, at) VALUES (?, ?)", session.account.xuid, now);
+    this.sql.exec("INSERT INTO mod_upload_attempts (creator, at) VALUES (?, ?)", session.account.id, now);
     return ok({});
   }
 
@@ -632,7 +755,7 @@ export class MarketplaceStore {
     if (!session || session.account.suspended) return fail(404, NO_SUCH_IMAGE);
     const v = this.versionRow(id);
     const media = this.media(id).find(item => item.sha256 === sha256);
-    if (!v || !media || (v.creator !== session.account.xuid && !atLeast(session.account, "moderator"))) return fail(404, NO_SUCH_IMAGE);
+    if (!v || !media || (v.creator !== session.account.id && !atLeast(session.account, "moderator"))) return fail(404, NO_SUCH_IMAGE);
     return ok({ key: `media/${media.sha256}`, type: media.type });
   }
 
@@ -643,7 +766,7 @@ export class MarketplaceStore {
   mediaAllowed(sha256: string): boolean {
     return this.sql.exec(`SELECT 1 FROM mod_media m JOIN mod_versions v ON v.id = m.version_id
       JOIN mod_listings l ON l.slug = v.slug JOIN mod_pipeline pm ON pm.version_id = v.id
-      LEFT JOIN market_accounts a ON a.xuid = l.creator
+      LEFT JOIN accounts a ON a.id = l.creator
       WHERE m.sha256 = ? AND ${PUBLISHED} AND l.hidden = 0 AND COALESCE(a.suspended, 0) = 0
       AND EXISTS (SELECT 1 FROM json_each(pm.media) j WHERE json_extract(j.value, '$.sha256') = m.sha256) LIMIT 1`, sha256)
       .toArray().length > 0;
@@ -732,7 +855,7 @@ export class MarketplaceStore {
     const grant = this.sql.exec<{ granted_by: string }>("SELECT granted_by FROM mod_trust WHERE slug = ? AND creator = ? AND expires_at > ?",
       slug, creator, now).toArray()[0];
     const granter = grant && this.account(grant.granted_by);
-    return !!granter && !granter.suspended && atLeast(granter, "admin") && granter.xuid !== creator;
+    return !!granter && !granter.suspended && atLeast(granter, "admin") && granter.id !== creator;
   }
 
   /** Return publication material only while current scan, account and decision gates still hold. */
@@ -746,8 +869,8 @@ export class MarketplaceStore {
     // Manual approvals count only from staff who are still active and aren't the creator.
     const decided = p.publish_mode === "official" || (p.publish_mode === "automatic" ? this.automaticAllowed(v, now)
       : p.publish_mode === "manual" && approvalsComplete(v.reach as Reach, this.approvals(id).flatMap(a => {
-        const actor = this.account(a.xuid);
-        return actor && !actor.suspended && atLeast(actor, "moderator") && actor.xuid !== v.creator ? [{ admin: atLeast(actor, "admin") }] : [];
+        const actor = this.account(a.id);
+        return actor && !actor.suspended && atLeast(actor, "moderator") && actor.id !== v.creator ? [{ admin: atLeast(actor, "admin") }] : [];
       })));
     return decided ? { sha256: v.sha256, bytes: v.bytes, media: this.media(id), statement: this.statement(id) } : null;
   }
@@ -779,11 +902,11 @@ export class MarketplaceStore {
     const v = this.versionRow(id);
     if (!v || v.status !== "submitted") return fail(409, "Only pending releases can be rescanned.");
     if (this.isOfficialVersion(id)) return fail(409, "Official releases use release-hook validation.");
-    if (v.creator === staff.xuid) return fail(403, "You can't rescan your own mod.");
+    if (v.creator === staff.id) return fail(403, "You can't rescan your own mod.");
     this.sql.exec(`UPDATE mod_pipeline SET job_id = ?, state = 'queued', attempts = 0, lease = NULL,
       lease_until = NULL, report = NULL, completed_at = NULL, publish_mode = NULL WHERE version_id = ?`, crypto.randomUUID(), id);
     this.sql.exec("DELETE FROM mod_approvals WHERE version_id = ?", id);
-    this.log(staff.xuid, "rescan", `${v.slug} ${v.version}`, "New scan job", now);
+    this.log(staff.id, "rescan", `${v.slug} ${v.version}`, "New scan job", now);
     return ok(this.versionView(v));
   }
 
@@ -795,7 +918,7 @@ export class MarketplaceStore {
     if (session.created_at + ROLE_CHANGE_SIGN_IN_MS <= now) return fail(401, "Sign in again before changing trust.");
     const listing = this.listing(slug);
     if (!listing) return fail(404, "No such mod.");
-    if (listing.creator === session.account.xuid) return fail(403, "You can't establish your own trust.");
+    if (listing.creator === session.account.id) return fail(403, "You can't establish your own trust.");
     const body = fieldsOf(input);
     if (malformedText(body.reason)) return fail(422, MALFORMED_TEXT);
     const reason = clip(trimmed(body.reason), 500);
@@ -808,9 +931,9 @@ export class MarketplaceStore {
       }
       this.sql.exec(`INSERT INTO mod_trust (slug, creator, granted_by, expires_at, reason) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT (slug) DO UPDATE SET creator = excluded.creator, granted_by = excluded.granted_by,
-        expires_at = excluded.expires_at, reason = excluded.reason`, slug, listing.creator, session.account.xuid, now + 90 * 86_400_000, reason);
+        expires_at = excluded.expires_at, reason = excluded.reason`, slug, listing.creator, session.account.id, now + 90 * 86_400_000, reason);
     } else this.sql.exec("DELETE FROM mod_trust WHERE slug = ?", slug);
-    this.log(session.account.xuid, body.trusted ? "established creator" : "revoked trust", slug, reason, now);
+    this.log(session.account.id, body.trusted ? "established creator" : "revoked trust", slug, reason, now);
     return ok({ trusted: body.trusted });
   }
 
@@ -865,7 +988,7 @@ export class MarketplaceStore {
     if (malformedText(body.note)) return fail(422, MALFORMED_TEXT);
     const note = clip(trimmed(body.note), 1000);
     const state: ReviewState = { creator: v.creator, status: v.status, reach: v.reach as Reach,
-      approvals: this.approvals(v.id).map((a) => ({ xuid: a.xuid, admin: a.admin })) };
+      approvals: this.approvals(v.id).map((a) => ({ id: a.id, admin: a.admin })) };
     const target = `${v.slug} ${v.version}`;
     if (body.decision === "approve") {
       const allowed = canApprove(staff, state);
@@ -875,14 +998,14 @@ export class MarketplaceStore {
       if (reportOf(p)!.ai.verdict === "flag" && !note) return fail(422, "Explain how the flagged findings were resolved before approving.");
       if (this.account(v.creator)?.suspended || this.listing(v.slug)?.hidden) return fail(409, "Restore the creator and listing before approving.");
       const admin = atLeast(staff, "admin");
-      this.sql.exec("INSERT INTO mod_approvals (version_id, xuid, admin, at) VALUES (?, ?, ?, ?)", v.id, staff.xuid, admin ? 1 : 0, now);
-      const approvals = [...state.approvals, { xuid: staff.xuid, admin }];
+      this.sql.exec("INSERT INTO mod_approvals (version_id, account_id, admin, at) VALUES (?, ?, ?, ?)", v.id, staff.id, admin ? 1 : 0, now);
+      const approvals = [...state.approvals, { id: staff.id, admin }];
       const done = approvalsComplete(state.reach, approvals);
       if (done) {
         this.sql.exec("UPDATE mod_versions SET decided_at = ?, note = ? WHERE id = ?", now, note, v.id);
         this.sql.exec("UPDATE mod_pipeline SET publish_mode = 'manual' WHERE version_id = ?", v.id);
       }
-      this.log(staff.xuid, done ? "approved" : `approved (${approvals.length} of ${approvalRule(state.reach).count})`, target, note, now);
+      this.log(staff.id, done ? "approved" : `approved (${approvals.length} of ${approvalRule(state.reach).count})`, target, note, now);
       return ok(this.versionView(this.versionRow(v.id)!), done ? { approved: v.id } : {});
     }
     if (body.decision !== "reject" && body.decision !== "changes") return fail(400, "Unknown decision.");
@@ -891,7 +1014,7 @@ export class MarketplaceStore {
     if (!note) return fail(400, "Tell the creator why.");
     const status = body.decision === "reject" ? "rejected" : "changes";
     this.sql.exec("UPDATE mod_versions SET status = ?, decided_at = ?, note = ? WHERE id = ?", status, now, note, v.id);
-    this.log(staff.xuid, status === "rejected" ? "rejected" : "requested changes", target, note, now);
+    this.log(staff.id, status === "rejected" ? "rejected" : "requested changes", target, note, now);
     return ok(this.versionView(this.versionRow(v.id)!));
   }
 
@@ -914,8 +1037,8 @@ export class MarketplaceStore {
     this.sql.exec("UPDATE mod_versions SET pulled = 1, pull_reason = ? WHERE id = ?", reason, v.id);
     this.revocationRevision++;
     this.sql.exec("DELETE FROM mod_trust WHERE slug = ?", v.slug);
-    this.log(staff.xuid, "pulled", `${v.slug} ${v.version}`, reason, now);
-    const holders = this.sql.exec<{ xuid: string }>("SELECT xuid FROM mod_library WHERE version_id = ?", v.id).toArray().map((r) => r.xuid);
+    this.log(staff.id, "pulled", `${v.slug} ${v.version}`, reason, now);
+    const holders = this.sql.exec<{ account_id: string }>("SELECT account_id FROM mod_library WHERE version_id = ?", v.id).toArray().flatMap((r) => this.xbox(r.account_id)?.xuid ?? []);
     return ok(this.versionView(this.versionRow(v.id)!), { notify: holders });
   }
 
@@ -925,7 +1048,7 @@ export class MarketplaceStore {
     if ("status" in staff) return staff;
     const listing = this.listing(slug);
     if (!listing) return fail(404, "No such mod.");
-    if (listing.creator === staff.xuid) return fail(403, "You can't hide or restore your own mod.");
+    if (listing.creator === staff.id) return fail(403, "You can't hide or restore your own mod.");
     const body = fieldsOf(input);
     if (malformedText(body.reason)) return fail(422, MALFORMED_TEXT);
     const reason = trimmed(body.reason);
@@ -935,7 +1058,7 @@ export class MarketplaceStore {
     if (!hidden && !atLeast(staff, "admin")) return fail(403, "Only admins can restore a hidden listing.");
     this.sql.exec("UPDATE mod_listings SET hidden = ? WHERE slug = ?", hidden ? 1 : 0, slug);
     if (hidden) this.sql.exec("DELETE FROM mod_trust WHERE slug = ?", slug);
-    this.log(staff.xuid, hidden ? "hid listing" : "restored listing", slug, reason, now);
+    this.log(staff.id, hidden ? "hid listing" : "restored listing", slug, reason, now);
     return ok({ hidden });
   }
 
@@ -958,34 +1081,35 @@ export class MarketplaceStore {
     if ("status" in staff) return staff;
     const report = this.sql.exec<{ slug: string; version: string }>("SELECT slug, version FROM mod_reports WHERE id = ?", id).toArray()[0];
     if (!report) return fail(404, "No such report.");
-    if (this.listing(report.slug)?.creator === staff.xuid) return fail(403, "You can't resolve reports about your own mod.");
+    if (this.listing(report.slug)?.creator === staff.id) return fail(403, "You can't resolve reports about your own mod.");
     const rawNote = fieldsOf(input).note;
     if (malformedText(rawNote)) return fail(422, MALFORMED_TEXT);
     const note = clip(trimmed(rawNote), 1000);
     if (!note) return fail(400, "Write what you found.");
-    this.sql.exec("UPDATE mod_reports SET status = 'resolved', resolution = ?, resolved_by = ? WHERE id = ?", note, staff.xuid, id);
-    this.log(staff.xuid, "resolved report", `${report.slug} ${report.version}`, note, now);
+    this.sql.exec("UPDATE mod_reports SET status = 'resolved', resolution = ?, resolved_by = ? WHERE id = ?", note, staff.id, id);
+    this.log(staff.id, "resolved report", `${report.slug} ${report.version}`, note, now);
     return ok({ id: String(id), status: "resolved" });
   }
 
   people(caller: Caller, now: number): MarketResult {
     const staff = this.staff(caller, now, false);
     if ("status" in staff) return staff;
-    const rows = this.sql.exec<{ xuid: string }>("SELECT xuid FROM market_accounts WHERE role != 'player' OR suspended = 1").toArray()
-      .map((r) => r.xuid);
-    for (const owner of this.owners) if (!rows.includes(owner)) rows.push(owner);
-    return ok(rows.map((xuid) => this.account(xuid)).filter((a): a is Account => a !== null)
-      .sort((a, b) => ROLES.indexOf(b.role) - ROLES.indexOf(a.role) || a.gamertag.localeCompare(b.gamertag)));
+    const emails = [...this.owners];
+    const rows = this.sql.exec<{ id: string }>(`SELECT id FROM accounts WHERE role != 'player' OR suspended = 1
+      ${emails.length ? `OR (email_verified = 1 AND email IN (${emails.map(() => "?").join(",")}))` : ""}`, ...emails).toArray();
+    return ok(rows
+      .map(r => this.account(r.id)!).filter(a => a.role !== "player" || a.suspended)
+      .sort((a, b) => ROLES.indexOf(b.role) - ROLES.indexOf(a.role) || a.display_name.localeCompare(b.display_name)));
   }
 
   /** Changes a signed-in player's role; needs a fresh sign-in and a reason. */
   setRole(caller: Caller, input: unknown, now: number): MarketResult {
     const session = this.writer(caller, now);
     if ("status" in session) return session;
-    // Authority comes before the gamertag lookup, so players can't probe which gamertags have signed in.
+    // Authority comes before the display_name lookup, so players can't probe which display_names have signed in.
     if (!managesStaff(session.account)) return fail(403, STAFF_MANAGERS_ONLY);
     const body = fieldsOf(input);
-    const target = this.accountNamed(trimmed(body.gamertag));
+    const target = this.accountNamed(body);
     if ("status" in target) return target;
     const role = body.role as Role;
     if (!ROLES.includes(role)) return fail(400, "Choose a role.");
@@ -995,10 +1119,10 @@ export class MarketplaceStore {
     if (malformedText(body.reason)) return fail(422, MALFORMED_TEXT);
     const reason = trimmed(body.reason);
     if (!reason) return fail(400, "Note why, for the audit log.");
-    this.sql.exec("UPDATE market_accounts SET role = ? WHERE xuid = ?", role, target.xuid);
-    if (role === "player") this.sql.exec("DELETE FROM web_sessions WHERE xuid = ?", target.xuid);
-    this.log(session.account.xuid, "changed role", `${target.gamertag}: ${target.role} → ${role}`, reason, now);
-    return ok(this.account(target.xuid));
+    this.sql.exec("UPDATE accounts SET role = ? WHERE id = ?", role, target.id);
+    if (role === "player") this.sql.exec("DELETE FROM web_sessions WHERE account_id = ?", target.id);
+    this.log(session.account.id, "changed role", target.id, reason, now);
+    return ok(this.account(target.id));
   }
 
   /** Suspends or restores a player: they can't submit, send or review while suspended. */
@@ -1007,18 +1131,18 @@ export class MarketplaceStore {
     if ("status" in staff) return staff;
     if (!atLeast(staff, "admin")) return fail(403, "Only admins can suspend accounts.");
     const body = fieldsOf(input);
-    const target = this.accountNamed(trimmed(body.gamertag));
+    const target = this.accountNamed(body);
     if ("status" in target) return target;
-    if (target.xuid === staff.xuid || atLeast(target, "admin") && !atLeast(staff, "owner")) return fail(403, "You can't suspend this account.");
+    if (target.id === staff.id || atLeast(target, "admin") && !atLeast(staff, "owner")) return fail(403, "You can't suspend this account.");
     if (malformedText(body.reason)) return fail(422, MALFORMED_TEXT);
     const reason = trimmed(body.reason);
     if (!reason) return fail(400, "Note why, for the audit log.");
     if (typeof body.suspended !== "boolean") return fail(422, "Supply suspended as true or false.");
     const suspended = body.suspended;
-    this.sql.exec("UPDATE market_accounts SET suspended = ? WHERE xuid = ?", suspended ? 1 : 0, target.xuid);
-    if (suspended) this.sql.exec("DELETE FROM mod_trust WHERE creator = ?", target.xuid);
-    this.log(staff.xuid, suspended ? "suspended" : "restored", target.gamertag, reason, now);
-    return ok(this.account(target.xuid));
+    this.sql.exec("UPDATE accounts SET suspended = ? WHERE id = ?", suspended ? 1 : 0, target.id);
+    if (suspended) this.sql.exec("DELETE FROM mod_trust WHERE creator = ?", target.id);
+    this.log(staff.id, suspended ? "suspended" : "restored", target.id, reason, now);
+    return ok(this.account(target.id));
   }
 
   audit(caller: Caller, now: number): MarketResult {
@@ -1056,14 +1180,15 @@ export type MarketCall = Caller & (
   | { op: "private-media"; id: number; sha256: string }
   | { op: "scan-claim" } | { op: "scan-file"; job: string; lease: string; sha256: string }
   | { op: "scan-complete"; job: string; lease: string; body: unknown }
-  | { op: "signin"; xuid: string; gamertag: string; newSession: string; newCsrf: string }
+  | { op: "signin"; identity: ProviderIdentity; newSession: string; newCsrf: string }
+  | { op: "link-code"; codeHash: string } | { op: "unlink" }
 );
 
 /**
  * Operations that read the caller's session before anything else, so a caller without a session cookie always gets
  * the same answer from them. A test checks every one against the Hub's actual anonymous answer.
  */
-export const SESSION_OPS = ["me", "mine", "signout", "send", "remove", "report", "upload-auth", "precheck", "submit", "version",
+export const SESSION_OPS = ["me", "mine", "signout", "link-code", "unlink", "send", "remove", "report", "upload-auth", "precheck", "submit", "version",
   "decide", "pull", "hide", "resolve", "role", "suspend", "queue", "reports", "people", "audit", "trust", "rescan", "private-media",
 ] as const satisfies readonly MarketCall["op"][];
 
@@ -1083,6 +1208,8 @@ export function anonymousResult(op: MarketCall["op"]): MarketResult | null {
 export function handle(store: MarketplaceStore, call: MarketCall, now: number): MarketResult {
   switch (call.op) {
     case "me": return store.me(call, now);
+    case "link-code": return store.issueLinkCode(call, call.codeHash, now);
+    case "unlink": return store.unlinkXbox(call, now);
     case "mods": return store.mods();
     case "mod": return store.mod(call.slug);
     case "release": return store.release(call.slug, call.version, call.sha256);
@@ -1114,7 +1241,7 @@ export function handle(store: MarketplaceStore, call: MarketCall, now: number): 
     case "scan-file": return store.scanFile(call.job, call.lease, call.sha256, now);
     case "scan-complete": return store.completeScan(call.job, call.lease, call.body, now);
     case "signin":
-      store.signIn(call.xuid, call.gamertag, call.newSession, call.newCsrf, now);
+      store.signIn(call.identity, call.newSession, call.newCsrf, now);
       return ok({});
     case "signout":
       return store.signOut(call, now);

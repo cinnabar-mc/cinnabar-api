@@ -120,6 +120,8 @@ export type ServerMessage =
   | { type: "cosmetic_ownership"; owned_cosmetics: string[] }
   | ({ type: "welcome"; xuid: string; loadout_revision?: number; owned_cosmetics?: string[]; mod_library?: ModLibraryEntry[] }
     & WelcomeParameters)
+  | ({ type: "account_link_result" } & ({ ok: true; account: { display_name: string } }
+    | { ok: false; error: "invalid" | "expired" | "already_linked" | "rate_limited" }))
   | { type: "mod_library"; mods: ModLibraryEntry[] }
   | { type: "error"; code: "unauthorized" | "invalid_loadout" }
   | { type: "error"; code: "rate_limited"; id: number }
@@ -128,6 +130,7 @@ export type ServerMessage =
   | { type: "emote"; xuid: string; uuid: string; emote_id: string | null; elapsed_ms: number; valid_for_ms: number };
 
 interface ClientMessages {
+  account_link: { type: "account_link"; code: string };
   mod_library_remove: { type: "mod_library_remove"; slug: string; sha256: string; sent_at: string };
   hello: Hello;
   proof: Proof;
@@ -138,7 +141,7 @@ interface ClientMessages {
 }
 export type ClientMessage = ClientMessages[keyof ClientMessages];
 
-const defNames = { hello: "Hello", proof: "Proof", visibility: "Visibility", lookup: "Lookup", emote_state: "EmoteState", loadout: "LoadoutState", mod_library_remove: "ModLibraryRemove" } as const;
+const defNames = { account_link: "AccountLink", hello: "Hello", proof: "Proof", visibility: "Visibility", lookup: "Lookup", emote_state: "EmoteState", loadout: "LoadoutState", mod_library_remove: "ModLibraryRemove" } as const;
 
 /** Returns a validator for one `$defs` entry of schema/v1.json, so the schema stays the single source of limits. */
 function validatorFor(def: string): Validator {

@@ -1,3 +1,4 @@
+import { normalizeLinkCode, sha256Base64Url } from "./marketplace/auth";
 import { UniqueUsers } from "./unique-users";
 import { catalog, admitLoadout } from "./cosmetics";
 import { loadCatalog, type Catalog } from "./catalog-store";
@@ -58,6 +59,7 @@ type Session =
       visible: boolean;
     }
   | { stage: "ready"; xuid: string; displayName: string; uuid: string; channel: Channel; visible: boolean; lastSeen?: number;
+      linkAttempts?: number;
       loadout?: LoadoutState;
       watching?: string[]; emote?: { id: string; elapsed: number; updated: number }; lookupBudget?: LookupBudget };
 
@@ -116,8 +118,8 @@ export class Hub extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.history = new PresenceHistory(ctx.storage.sql, env.API_CACHE, env.METRICS);
-    this.market = new MarketplaceStore(ctx.storage.sql,
-      new Set((env.OWNER_XUIDS ?? "").split(",").map((xuid) => xuid.trim()).filter((xuid) => /^[0-9]{1,20}$/.test(xuid))));
+    this.market = ctx.storage.transactionSync(() => new MarketplaceStore(ctx.storage.sql,
+      new Set((env.OWNER_EMAILS ?? "").split(",").map(email => email.trim().toLowerCase()).filter(Boolean))));
     this.mods = new ModReleases(ctx.storage.sql);
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS lookup_budgets (
       xuid TEXT PRIMARY KEY, tokens REAL NOT NULL, updated_at INTEGER NOT NULL
@@ -418,9 +420,10 @@ export class Hub extends DurableObject<Env> {
       case "proof":
         return msg.type === "proof" ? this.onProof(ws, attachment, msg.signature) : this.reject(ws);
       case "ready":
+        if (msg.type === "account_link") return this.onAccountLink(ws, attachment, msg.code, now);
         if (msg.type === "mod_library_remove") {
-          if (this.market.removeLibrary(attachment.xuid, msg.slug, msg.sha256, msg.sent_at)) this.notifyModLibrary(attachment.xuid);
-          else send(ws, { type: "mod_library", mods: this.market.library(attachment.xuid) });
+          if (this.market.removeXboxLibrary(attachment.xuid, msg.slug, msg.sha256, msg.sent_at)) this.notifyModLibrary(attachment.xuid);
+          else send(ws, { type: "mod_library", mods: this.market.libraryForXbox(attachment.xuid) });
           return;
         }
         if (msg.type === "visibility") return this.onVisibility(ws, attachment, msg.visible);
@@ -512,7 +515,7 @@ export class Hub extends DurableObject<Env> {
     this.uniqueUsers.record(userDigest);
     this.save(ws, { stage: "ready", xuid, displayName, uuid, channel, visible, loadout, lastSeen: now });
     this.claimLoginRewards(xuid, now, ws);
-    const modLibrary = this.market.library(xuid);
+    const modLibrary = this.market.libraryForXbox(xuid);
     send(ws, { type: "welcome", xuid, loadout_revision: loadout?.revision ?? 0, owned_cosmetics: this.ownedCosmetics(xuid),
       ...(modLibrary.length ? { mod_library: modLibrary } : {}), ...SERVER_PARAMETERS });
 
@@ -621,10 +624,10 @@ export class Hub extends DurableObject<Env> {
    * whose library changed get it pushed to every live client.
    */
   async marketplace(call: MarketCall): Promise<MarketResult> {
-    const result = handle(this.market, call, Date.now());
+    const result = this.ctx.storage.transactionSync(() => handle(this.market, call, Date.now()));
     if (call.op === "me" && result.status === 200) {
-      const account = (result.body as { account: { xuid: string } | null }).account;
-      (result.body as { game_online: boolean }).game_online = !!account && [...(this.byXuid.get(account.xuid) ?? [])]
+      const account = (result.body as { account: { xbox: { xuid: string } | null } | null }).account;
+      (result.body as { game_online: boolean }).game_online = !!account?.xbox && [...(this.byXuid.get(account.xbox.xuid) ?? [])]
         .some((ws) => this.sessions.get(ws)?.stage === "ready");
     }
     if (result.approved !== undefined) {
@@ -639,9 +642,23 @@ export class Hub extends DurableObject<Env> {
     return { status: result.status, body: result.body };
   }
 
+  /** Links only the authenticated socket's signed XUID/name, with ten attempts per connection across hibernation. */
+  private async onAccountLink(ws: WebSocket, state: Ready, code: string, now: number): Promise<void> {
+    const attempts = (state.linkAttempts ?? 0) + 1;
+    this.save(ws, { ...state, linkAttempts: attempts });
+    if (attempts > 10) {
+      send(ws, { type: "account_link_result", ok: false, error: "rate_limited" });
+      return;
+    }
+    const hash = await sha256Base64Url(normalizeLinkCode(code));
+    const result = this.ctx.storage.transactionSync(() => this.market.linkXbox(hash, state.xuid, state.displayName, now));
+    send(ws, { type: "account_link_result", ...result });
+    if (result.ok) this.notifyModLibrary(state.xuid);
+  }
+
   /** Broadcasts one account's current selections to its own authenticated clients only. */
   private notifyModLibrary(xuid: string): void {
-    const mods = this.market.library(xuid);
+    const mods = this.market.libraryForXbox(xuid);
     for (const ws of this.byXuid.get(xuid) ?? []) if (this.sessions.get(ws)?.stage === "ready") send(ws, { type: "mod_library", mods });
   }
 

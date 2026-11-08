@@ -21,6 +21,8 @@
     "COSMETICS_ADMIN_WORKFLOW": "cinnabar-mc/cinnabar-cosmetics/.github/workflows/entitlements.yml@refs/heads/main",
     // The website origin allowed to call marketplace routes with credentials and to receive sign-in returns.
     "MARKETPLACE_ORIGIN": "https://cinnabar.gg",
+    "GOOGLE_CLIENT_ID": "662205004327-ea4m7qoli4fdnulrcash7q9in385s557.apps.googleusercontent.com",
+    "OWNER_EMAILS": "google@restartfu.com",
     // The authorization service's OIDC issuer for Minecraft multiplayer tokens.
     "ISSUER": "https://authorization.franchise.minecraft-services.net/"
   },

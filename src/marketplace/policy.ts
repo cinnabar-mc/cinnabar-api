@@ -28,7 +28,7 @@ export type Grants = Record<string, boolean | string[]>;
 
 /** An account as the marketplace sees it. */
 export interface Actor {
-  xuid: string;
+  id: string;
   role: Role;
   suspended: boolean;
 }
@@ -38,7 +38,7 @@ export interface ReviewState {
   creator: string;
   status: "submitted" | "approved" | "changes" | "rejected";
   reach: Reach;
-  approvals: { xuid: string; admin: boolean }[];
+  approvals: { id: string; admin: boolean }[];
 }
 
 export type Verdict = { ok: true } | { ok: false; reason: string };
@@ -108,12 +108,12 @@ const deny = (reason: string): Verdict => ({ ok: false, reason });
 
 /** Whether `actor` may review (approve, reject or ask for changes on) `version`. */
 export function canReview(actor: Actor | null, version: ReviewState): Verdict {
-  if (!actor) return deny("Sign in with Microsoft first.");
+  if (!actor) return deny("Sign in to Cinnabar first.");
   if (actor.suspended) return deny("Your account is suspended.");
   if (!atLeast(actor, "moderator")) return deny("Only staff review mods.");
-  if (version.creator === actor.xuid) return deny("You can't review your own mod.");
+  if (version.creator === actor.id) return deny("You can't review your own mod.");
   if (version.status !== "submitted") return deny("This version isn't waiting for review.");
-  if (version.approvals.some((a) => a.xuid === actor.xuid)) return deny("You've already approved this version.");
+  if (version.approvals.some((a) => a.id === actor.id)) return deny("You've already approved this version.");
   return { ok: true };
 }
 
@@ -147,9 +147,9 @@ export function managesStaff(actor: Actor): boolean {
 
 /** Who may assign `role` to `target`: admins manage moderators, only owners manage admins, owners come from config. */
 export function canSetRole(actor: Actor | null, target: Actor, role: Role): Verdict {
-  if (!actor) return deny("Sign in with Microsoft first.");
+  if (!actor) return deny("Sign in to Cinnabar first.");
   if (!managesStaff(actor)) return deny(STAFF_MANAGERS_ONLY);
-  if (target.xuid === actor.xuid) return deny("You can't change your own role.");
+  if (target.id === actor.id) return deny("You can't change your own role.");
   if (role === "owner" || target.role === "owner") return deny("Owners are set in the API's configuration.");
   const needed: Role = role === "admin" || target.role === "admin" ? "owner" : "admin";
   return atLeast(actor, needed) ? { ok: true } : deny("Only the owner manages admins.");
