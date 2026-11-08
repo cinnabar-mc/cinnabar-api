@@ -19,6 +19,8 @@
     "MOD_HOST_REPOSITORY": "https://github.com/cinnabar-mc/cinnabar.git",
     "COSMETICS_REPOSITORY_ID": "1426158837",
     "COSMETICS_ADMIN_WORKFLOW": "cinnabar-mc/cinnabar-cosmetics/.github/workflows/entitlements.yml@refs/heads/main",
+    // The website origin allowed to call marketplace routes with credentials and to receive sign-in returns.
+    "MARKETPLACE_ORIGIN": "https://cinnabar.gg",
     // The authorization service's OIDC issuer for Minecraft multiplayer tokens.
     "ISSUER": "https://authorization.franchise.minecraft-services.net/"
   },
