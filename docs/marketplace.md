@@ -274,8 +274,14 @@ The old routes keep their URLs, bodies and status codes, without redirects:
   and installed revision identities, supported API list, current version and
   different mod revision retain their old checks. There is no API fallback.
 - `GET /v1/mod/download` streams the newest eligible official component with its
-  original filename, or 404. It preserves released-host API reports, including
-  the pre-first-report behavior and empty-report exclusion.
+  original filename, or 404. Optional query parameter `channel` accepts `stable`,
+  `beta` or `nightly`, defaults to `beta`, and returns 400 for any other value.
+  Selection uses only that channel's latest reported host API revisions across
+  the legacy/marketplace union above, with the same visibility and pull rules.
+  If the selected channel has never reported, selection falls back to the union
+  of all channels' reported revisions; if no channel has reported, no revision
+  is excluded. Once the selected channel has reported, an empty report excludes
+  every version even if other channels support them. Responses remain `no-store`.
 - `GET /v1/mod/assets/<sha256>` streams the same original bytes, or 404. It and
   all official public downloads now use `no-store` so new requests observe pulls.
   Previously cached immutable responses cannot be recalled from existing caches.

@@ -1,6 +1,6 @@
 import { Validator, type Schema } from "@cfworker/json-schema";
 import schema from "../schema/v1.json";
-import { compareVersions } from "./protocol";
+import { compareVersions, type Channel } from "./protocol";
 
 export interface ModRelease {
   manifest: {
@@ -140,15 +140,18 @@ export class ModReleases {
   }
 
   /**
-   * Selects the highest stable version for a first installation that a published host build can
-   * load. A catalogue release may need a host that is not out yet, and only updates, which name
-   * their host's revisions, can match it. Until any build has reported its revisions, none is
-   * excluded, so that the download survives deployment; after that, an empty report excludes all.
+   * Selects the highest version for a first installation supported by the selected channel.
+   * A channel that has never reported falls back to the union of all reported channels; until
+   * any channel has reported, no revision is excluded. A selected channel's empty report excludes
+   * all versions, even if other channels support them.
    */
-  latest(packageName: string, hostRepository: string, candidates?: ModRelease[]): ModRelease | null {
+  latest(packageName: string, hostRepository: string, channel: Channel = "beta", candidates?: ModRelease[]): ModRelease | null {
+    const channelReported = this.sql.exec("SELECT 1 FROM released_mod_api_channels WHERE channel = ?", channel).toArray().length > 0;
     const reported = this.sql.exec("SELECT 1 FROM released_mod_api_channels LIMIT 1").toArray().length > 0;
-    const released = new Set(this.sql.exec<{ revision: string }>("SELECT revision FROM released_mod_apis").toArray()
-      .map((row) => row.revision));
+    const rows = channelReported
+      ? this.sql.exec<{ revision: string }>("SELECT revision FROM released_mod_apis WHERE channel = ?", channel)
+      : this.sql.exec<{ revision: string }>("SELECT revision FROM released_mod_apis");
+    const released = new Set(rows.toArray().map((row) => row.revision));
     candidates ??= this.sql.exec<{ release: string }>(
       "SELECT release FROM mod_releases WHERE package = ?", packageName,
     ).toArray().map(row => JSON.parse(row.release) as ModRelease);

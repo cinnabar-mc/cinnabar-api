@@ -275,10 +275,10 @@ export class Hub extends DurableObject<Env> {
       this.officialCandidates());
   }
 
-  /** Resolves the newest official stable mod for a first installation. */
-  latestModRelease(): ModRelease | null {
+  /** Resolves the newest official mod compatible with a channel's report, defaulting to beta. */
+  latestModRelease(channel: Channel = "beta"): ModRelease | null {
     return this.mods.latest(this.env.MOD_RELEASE_PACKAGE ?? "", this.env.MOD_HOST_REPOSITORY ?? "",
-      this.officialCandidates());
+      channel, this.officialCandidates());
   }
 
   /** Returns the expected byte count only for an artifact belonging to a published release. */

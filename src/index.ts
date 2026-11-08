@@ -6,7 +6,7 @@ import { downloadCount, DownloadSourceError } from "./download-count";
 import { count } from "./metrics";
 import { isModRelease, isModUpdateQuery, publisherAllows, type ModRelease } from "./mod-releases";
 import { uploadModAsset, downloadModAsset } from "./mod-assets";
-import { isModHostRevisionsRequest, isReleaseHookRequest } from "./protocol";
+import { isChannel, isModHostRevisionsRequest, isReleaseHookRequest } from "./protocol";
 import { hubFor } from "./routing";
 import { marketplaceRoutes } from "./marketplace/routes";
 import { DEFAULT_HISTORY_RANGE, HISTORY_RANGES, loadHistory, snapshotHistory, type HistoryRange } from "./history-snapshot";
@@ -143,7 +143,9 @@ app.get("/v1/mod/assets/:hash", async (c) => {
 
 app.get("/v1/mod/download", async (c) => {
   c.header("Cache-Control", "no-store");
-  const release = await hubFor(c.env).latestModRelease();
+  const channel = c.req.query("channel") ?? "beta";
+  if (!isChannel(channel)) return c.body(null, 400);
+  const release = await hubFor(c.env).latestModRelease(channel);
   if (!release) return c.body(null, 404);
   const artifact = release.manifest.artifact;
   const response = await downloadModAsset(artifact.sha256, artifact.size, c.env.MOD_ASSETS);

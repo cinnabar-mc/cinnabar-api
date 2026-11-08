@@ -20,7 +20,7 @@ messages against it.
 | `POST /v1/mod/releases` | Requires a dedicated `MOD_RELEASE_HOOK_SECRET` bearer credential; the native release-hook credential is rejected. Publishes `{manifest, download_url}` for an immutable stable mod version. Identical retries return 204; changed metadata for that package/version returns 409. |
 | `PUT /v1/mod/assets/:sha256` | Dedicated mod-publisher bearer credential required. Verifies the component header, SHA-256 and 32 MiB limit before storing it under its content hash. Uploading alone does not publish it. |
 | `GET /v1/mod/assets/:sha256` | Anonymous WASM download, available only after metadata publication and withdrawn on a marketplace pull. Responses are not cached. Never exposes the private source repository or an upload credential. |
-| `GET /v1/mod/download` | Anonymous first-install download of the newest published stable mod for the configured package and host repository. No hash or installed version required. Streams the verified WASM with its download filename; returns 404 if unavailable. Responses are not cached. Older hosts should use the compatibility-aware update route. |
+| `GET /v1/mod/download` | Anonymous first-install download of the newest published mod compatible with the selected host channel for the configured package and host repository. Optional `channel=stable\|beta\|nightly`, default `beta`; invalid values return 400. No hash or installed version required. Streams the verified WASM with its download filename; returns 404 if unavailable. Responses are not cached. Older hosts should use the compatibility-aware update route. |
 | `GET /v1/mod/update` | Requires full `host_revision` and comma-separated supported `api_revisions`, installed `current_version` and full `current_revision`; the official package and host repository are fixed server-side. Returns 200 with the newest newer compatible stable release or 204 with no body. Invalid or missing identities return 400. Responses are not cached. |
 | `GET /v1/connect` | WebSocket. The client authenticates with a Minecraft multiplayer token plus an ES384 proof of its key, then can toggle visibility, look up which XUIDs or UUIDs recently used Cinnabar, and receives release pushes. |
 
@@ -222,10 +222,13 @@ selected API revision is supported, identity, size and digest before atomic inst
 Deploy this API support before configuring publishers to call the hook. A publisher
 must upload its release artifact before registering the matching metadata. Changing
 bytes or compatibility metadata requires a new package version. Keep downloads for
-previously published versions available. `GET /v1/mod/download` serves the newest version that
-the latest report from any channel supports, so a version needing a newer host waits for that
-build without any publisher action. Before the first report nothing is excluded, and a host build
-whose report fails stays unknown until its publication job is re-run. Configure publisher credentials through its
+previously published versions available. `GET /v1/mod/download?channel=beta` serves the newest version
+supported by that channel's latest report. The optional `channel` accepts `stable`, `beta` or
+`nightly` and defaults to `beta`; any other value returns 400. A channel that has never reported
+falls back to the union of all channels' reported revisions. If no channel has reported, no API
+revision is excluded. Once the selected channel has reported, only its revisions are eligible;
+an empty report excludes all versions, returning 404. A host build whose report fails stays
+unknown until its publication job is re-run. Configure publisher credentials through its
 secret store, using the same value as this Worker's `MOD_RELEASE_HOOK_SECRET`.
 The configured `MOD_RELEASE_REPOSITORY` and `MOD_RELEASE_PACKAGE`
 restrict that credential to its repository and package and immutable versioned GitHub

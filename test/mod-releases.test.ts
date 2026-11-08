@@ -161,6 +161,9 @@ describe("revision-aware mod releases", () => {
     // Simulate a pre-migration catalogue row for exactly the version now managed by the marketplace.
     expect(await hub().publishModRelease(served(body))).toBe(true);
     expect((await publish(body)).status).toBe(204);
+    for (const channel of ["stable", "beta", "nightly"] as const) {
+      await hub().recordReleasedModApis(channel, [HOST_A]);
+    }
     for (const path of ["/v1/mods", "/v1/mods/cinnabar-mod"]) {
       const response = await exports.default.fetch(`https://api.test${path}`);
       expect(response.status).toBe(200);
@@ -173,7 +176,8 @@ describe("revision-aware mod releases", () => {
     expect((await update()).status).toBe(204);
     expect(await hub().latestModRelease()).toBeNull();
     const query = new URLSearchParams({ api_revisions: HOST_A, host_revision: HOST_A, current_version: "0.1.0", current_sha256: "0".repeat(64) });
-    for (const path of ["/v1/mod/download", `/v1/mod/assets/${HASH}`, `/v1/mods/assets/${HASH}`,
+    for (const path of ["/v1/mod/download", ...["stable", "beta", "nightly"].map(channel => `/v1/mod/download?channel=${channel}`),
+      `/v1/mod/assets/${HASH}`, `/v1/mods/assets/${HASH}`,
       `/v1/mods/cinnabar-mod/releases/1.0.0/${HASH}`, "/v1/mods/cinnabar-mod"]) {
       expect((await exports.default.fetch(`https://api.test${path}`)).status, path).toBe(404);
     }
@@ -312,6 +316,67 @@ describe("revision-aware mod releases", () => {
     expect(await hub().latestModRelease()).toEqual(official);
   });
 
+  it("selects fresh downloads by channel across legacy and official marketplace releases", async () => {
+    const nightlyApi = "c".repeat(40);
+    const releases: ModRelease[] = [];
+    const artifacts: Uint8Array[] = [];
+    for (const [index, [version, api]] of [
+      ["1.0.0", HOST_A], ["1.10.0", HOST_B], ["1.2.0", HOST_B], ["2.0.0", nightlyApi],
+    ].entries()) {
+      const bytes = BYTES.slice(); bytes[255] = index + 1;
+      const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
+        .map(b => b.toString(16).padStart(2, "0")).join("");
+      const body = release(version, api, String(index + 1).repeat(40));
+      body.manifest.artifact.sha256 = hash;
+      await env.MOD_ASSETS.put(`mod-releases/${hash}`, bytes, { customMetadata: { sha256: hash } });
+      if (index === 0) expect(await hub().publishModRelease(served(body))).toBe(true);
+      else expect((await publish(body)).status).toBe(204);
+      releases.push(body); artifacts.push(bytes);
+    }
+    for (const [channel, api] of [["stable", HOST_A], ["beta", HOST_B], ["nightly", nightlyApi]]) {
+      const response = await exports.default.fetch("https://api.test/v1/mod/host-revisions", {
+        method: "POST", headers: { Authorization: "Bearer test-hook-secret", "Content-Type": "application/json" },
+        body: JSON.stringify({ channel, mod_api_revisions: [api] }),
+      });
+      expect(response.status).toBe(204);
+    }
+    await evictDurableObject(hub());
+    for (const [query, index] of [["?channel=nightly", 3], ["?channel=beta", 1], ["?channel=stable", 0], ["", 1]] as const) {
+      const response = await exports.default.fetch(`https://api.test/v1/mod/download${query}`);
+      expect(response.status, query).toBe(200);
+      expect(response.headers.get("Content-Disposition")).toBe('attachment; filename="Example.wasm"');
+      expect(response.headers.get("Content-Type")).toBe("application/wasm");
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+      expect(new Uint8Array(await response.arrayBuffer()), query).toEqual(artifacts[index]);
+    }
+    // The caller's own revisions still control updates, independently of channel reports.
+    expect(await (await update({ api_revisions: nightlyApi })).json()).toEqual(served(releases[3]!));
+    await market({ op: "signin", xuid: "2535400000009001", gamertag: "Owner", newSession: "owner-session", newCsrf: "owner-csrf" });
+    for (const version of ["1.10.0", "2.0.0"]) {
+      const id = await runInDurableObject(hub(), (_, state) => state.storage.sql.exec<{ id: number }>(
+        "SELECT id FROM mod_versions WHERE slug = 'cinnabar-mod' AND version = ?", version).one().id);
+      expect((await market({ op: "pull", session: "owner-session", csrf: "owner-csrf", id,
+        body: { reason: "Withdraw test release" } })).status).toBe(200);
+    }
+    await evictDurableObject(hub());
+    for (const query of ["", "?channel=beta"]) {
+      const response = await exports.default.fetch(`https://api.test/v1/mod/download${query}`);
+      expect(response.status).toBe(200);
+      expect(new Uint8Array(await response.arrayBuffer())).toEqual(artifacts[2]);
+    }
+    const unavailable = await exports.default.fetch("https://api.test/v1/mod/download?channel=nightly");
+    expect(unavailable.status).toBe(404);
+    expect(unavailable.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("rejects invalid fresh-download channels with the existing Channel schema", async () => {
+    for (const channel of ["", "unknown", "Beta", "nightly,stable", "null"]) {
+      const response = await exports.default.fetch(`https://api.test/v1/mod/download?${new URLSearchParams({ channel })}`);
+      expect(response.status, channel).toBe(400);
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+    }
+  });
+
   it("advances the first-install download across API generations and keeps compatibility updates scoped", async () => {
     await publish(release());
     await publish(release("2.0.0", HOST_B, "2".repeat(40)));
@@ -323,7 +388,7 @@ describe("revision-aware mod releases", () => {
     expect(response.headers.get("Cache-Control")).toBe("no-store");
   });
 
-  it("offers first installs only versions a published host build supports", async () => {
+  it("uses the reported-channel union until the selected channel first reports", async () => {
     const report = (channel: string, mod_api_revisions: unknown, secret = "test-hook-secret") =>
       exports.default.fetch("https://api.test/v1/mod/host-revisions", {
         method: "POST",
@@ -346,7 +411,7 @@ describe("revision-aware mod releases", () => {
     expect(download.status).toBe(200);
     await download.arrayBuffer();
 
-    // Any channel's build makes a version available, and each report replaces its channel's list.
+    // Beta has never reported, so it uses the union; each report replaces its channel's list.
     expect((await report("stable", [HOST_B])).status).toBe(204);
     expect(await newestInstall()).toBe("2.0.0");
     expect((await report("stable", [HOST_A, HOST_A])).status).toBe(204);
@@ -361,6 +426,16 @@ describe("revision-aware mod releases", () => {
     expect((await report("nightly", [])).status).toBe(204);
     expect(await newestInstall()).toBeUndefined();
     expect((await exports.default.fetch("https://api.test/v1/mod/download")).status).toBe(404);
+
+    // Beta's own first report ends the union fallback, including an explicit empty report.
+    expect((await report("nightly", [HOST_B])).status).toBe(204);
+    expect(await newestInstall()).toBe("2.0.0");
+    expect((await report("beta", [])).status).toBe(204);
+    expect(await newestInstall()).toBeUndefined();
+    expect((await exports.default.fetch("https://api.test/v1/mod/download?channel=beta")).status).toBe(404);
+    expect((await report("beta", [HOST_A])).status).toBe(204);
+    await evictDurableObject(hub());
+    expect(await newestInstall()).toBe("1.0.0");
   });
 
   it("accepts a report of every supported revision and rejects invalid ones", async () => {
