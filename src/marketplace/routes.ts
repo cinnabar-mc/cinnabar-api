@@ -1,5 +1,6 @@
 import { Hono, type Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
+import { publicCache } from "../public-cache";
 import { hubFor } from "../routing";
 import { MAX_COMPONENT_BYTES, readComponent } from "./component";
 import { clip, malformedText, type Grants } from "./policy";
@@ -14,6 +15,10 @@ const MAX_JSON_BYTES = 64 * 1024;
 const SHA256 = /^[0-9a-f]{64}$/;
 /** Keeps stored images inert even if a browser is tricked into rendering one as a document. */
 const IMAGE_CSP = "default-src 'none'; sandbox";
+/** Edge and browser lifetimes of the public catalogue, a missing listing and the signed revocation list. */
+const CATALOGUE_CACHE = "public, max-age=30";
+const MISSING_LISTING_CACHE = "public, max-age=10";
+const REVOCATIONS_CACHE = "public, max-age=60";
 
 type Ctx = Context<{ Bindings: Env }>;
 
@@ -171,11 +176,11 @@ marketplaceRoutes.post("/auth/signout", async (c) => {
 
 marketplaceRoutes.get("/me", (c) => forward(c, { op: "me" }));
 marketplaceRoutes.get("/me/mods", (c) => forward(c, { op: "mine" }));
-marketplaceRoutes.get("/mods", async (c) => reply(c, await call(c, { op: "mods" }), "public, max-age=30"));
+marketplaceRoutes.get("/mods", publicCache(CATALOGUE_CACHE), async (c) => reply(c, await call(c, { op: "mods" }), CATALOGUE_CACHE));
 
-marketplaceRoutes.get("/mods/revocations", async (c) => {
+marketplaceRoutes.get("/mods/revocations", publicCache(REVOCATIONS_CACHE), async (c) => {
   const { body, signature } = await hubFor(c.env).modRevocations();
-  c.header("Cache-Control", "public, max-age=60");
+  c.header("Cache-Control", REVOCATIONS_CACHE);
   if (signature) c.header("X-Cinnabar-Signature", signature);
   return c.body(body, 200, { "Content-Type": "application/json" });
 });
@@ -194,7 +199,10 @@ marketplaceRoutes.get("/mods/media/:sha256", async c => {
   return c.body(object.body, 200, { "Content-Type": object.httpMetadata?.contentType ?? "application/octet-stream",
     "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": IMAGE_CSP });
 });
-marketplaceRoutes.get("/mods/:slug", async (c) => reply(c, await call(c, { op: "mod", slug: c.req.param("slug") }), "public, max-age=30"));
+marketplaceRoutes.get("/mods/:slug", publicCache(CATALOGUE_CACHE), async (c) => {
+  const result = await call(c, { op: "mod", slug: c.req.param("slug") });
+  return reply(c, result, result.status === 404 ? MISSING_LISTING_CACHE : CATALOGUE_CACHE);
+});
 marketplaceRoutes.get("/mods/:slug/releases/:version/:sha256", async c => {
   const hash = c.req.param("sha256");
   return SHA256.test(hash) ? reply(c, await call(c, { op: "release", slug: c.req.param("slug"), version: c.req.param("version"), sha256: hash })) : c.notFound();

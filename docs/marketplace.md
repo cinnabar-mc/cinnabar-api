@@ -16,7 +16,8 @@ before reading the body. Five pending releases per creator are allowed.
 
 Listing fields are `slug`, `name`, `summary`, `description` (40,000 characters),
 `version`, optional GitHub `source`, category, license (128 characters) and release
-notes (4,000 characters). Acts/Network releases require source.
+notes (4,000 characters). Acts/Network releases require source. Slugs that are
+fixed path segments under `/v1/mods/` (`revocations`, `assets`, `media`) are refused.
 If the component declares a version it must match the listing version. The API
 reads grants itself, rejects ambiguous/duplicate declarations, and hashes actual
 bytes. Maximums are 16 MiB per component, four 1 MiB images, and 20 MiB + 256 KiB
@@ -46,8 +47,9 @@ The code change removes the old binding; it does not delete the old bucket or da
 - immutable description and `gallery` descriptors `{sha256, bytes, type, caption, alt}`.
 
 Public component/media URLs are `/v1/mods/assets/<sha256>` and
-`/v1/mods/media/<sha256>`. Authorization is checked on each request. Only signed,
-approved, unpulled releases with an active creator and visible listing qualify.
+`/v1/mods/media/<sha256>`. Authorization is checked on each request with one indexed
+digest lookup. Only signed, approved, unpulled releases with an active creator and
+visible listing qualify. These checks have no per-client rate limit; they stay cheap instead.
 Responses use `no-store` and `nosniff`; private files never use a public cache path.
 Staff fetch submitted components through `/v1/staff/versions/<id>/file`.
 Clients fetch the exact signed statement and signature from
@@ -55,7 +57,11 @@ Clients fetch the exact signed statement and signature from
 Pulled, hidden, unsigned or suspended-creator releases are unavailable. Revocations
 include signed millisecond `issued_at` and `expires_at` timestamps, valid for fifteen
 minutes. Clients must reject expired/rollback snapshots, retain known revocations,
-and hold managed mods when current revocation evidence is unavailable.
+and hold managed mods when current revocation evidence is unavailable. The Hub reuses
+one signed list for up to thirty seconds until a pull changes it, and the edge caches
+it for sixty, so a list may be up to ninety seconds old when fetched. Clients refuse
+bodies over 1 MiB, so a pull that would make the body exceed 768 KiB returns 409; an
+operator must compact old revocations before more versions can be pulled.
 An authenticated game socket can send `mod_library_remove` with `slug`, `sha256`
 and the exact `sent_at` timestamp. It removes that account's matching selection
 and broadcasts its new library; stale requests cannot remove a later website send.
@@ -133,7 +139,11 @@ An admin with a sign-in less than ten minutes old can call
 project/creator scoped, audited, revocable, lasts ninety days and cannot be
 self-granted. Establishing trust requires an active creator, visible current
 release and at least one unpulled human-approved release. Downloads or AI confidence
-never establish trust.
+never establish trust. Trust works only while its granter is still an unsuspended admin.
+
+Staff cannot hide or restore their own listing or resolve reports about their own mod.
+Any staff member can hide a listing; only admins can restore one. The hide route's
+`hidden` field must be a boolean.
 
 Automatic publication additionally requires a clear AI response, reach below Acts,
 the exact approved baseline captured at submission, no additional permissions or

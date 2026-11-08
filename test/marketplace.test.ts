@@ -4,7 +4,9 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Hub } from "../src/hub";
 import { readComponent } from "../src/marketplace/component";
 import { TOKEN_URL, XBOX_USER_URL, XSTS_URL } from "../src/marketplace/microsoft";
-import { approvalRule, canApprove, canSetRole, grantDiff, reachOf, type Actor } from "../src/marketplace/policy";
+import { approvalRule, canApprove, canSetRole, grantDiff, reachOf, validateListing, type Actor } from "../src/marketplace/policy";
+import { REVOCATION_BUDGET_BYTES, REVOCATION_MEMO_MS } from "../src/marketplace/revocations";
+import { marketplaceRoutes } from "../src/marketplace/routes";
 import { CLIENT_REVISION, SCAN_POLICY, VALIDATOR, PROMPT_VERSION, SCAN_LEASE_MS } from "../src/marketplace/scanning";
 import { BodyLimitError, readLimited } from "../src/marketplace/uploads";
 import { MarketplaceStore } from "../src/marketplace/store";
@@ -47,6 +49,8 @@ function installFakeXbox(): void {
 beforeAll(() => {
   installFakeIssuer();
   installFakeXbox();
+  // These tests observe current Hub state after each change; test/edge-cache.test.ts covers the public cache path.
+  vi.spyOn(caches, "open").mockRejectedValue(new Error("Edge cache disabled for marketplace state tests"));
 });
 afterEach(() => Promise.all(open.splice(0).map((client) => (client.close(), client.closed))));
 
@@ -784,15 +788,15 @@ describe("upload and publication pipeline", () => {
   });
 });
 
-describe("moderation input and targeting", () => {
-  /** Publishes `slug` from a fresh creator with one owner approval. */
-  async function published(owner: Browser, creatorXuid: string, slug: string) {
-    const creator = await signIn(creatorXuid, `Maker${creatorXuid.slice(-4)}`);
-    const v = await (await submit(creator, slug, "1.0.0", { hud: true })).json() as { id: string };
-    expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(200);
-    return { creator, v };
-  }
+/** Publishes `slug` from a fresh creator with one owner approval. */
+async function published(owner: Browser, creatorXuid: string, slug: string) {
+  const creator = await signIn(creatorXuid, `Maker${creatorXuid.slice(-4)}`);
+  const v = await (await submit(creator, slug, "1.0.0", { hud: true })).json() as { id: string };
+  expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(200);
+  return { creator, v };
+}
 
+describe("moderation input and targeting", () => {
   it("keeps pull reasons well-formed so every client can parse the signed revocation list", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
     const { v } = await published(owner, "2535400000007101", "unicode-pull");
@@ -879,5 +883,222 @@ describe("moderation input and targeting", () => {
     expect(own.status).toBe(403);
     expect(await (await owner.get(`/staff/versions/${v.id}`)).json()).toMatchObject({ scan: { state: "complete" } });
     expect((await owner.post(`/staff/versions/${v.id}/rescan`)).status).toBe(200);
+  });
+});
+
+describe("staff conflicts, public load and revocation limits", () => {
+  // Earlier tests can leave jobs queued, such as a requested rescan; scanOne claims the oldest job.
+  beforeAll(async () => {
+    for (let job = await claim(); job; job = await claim()) await scanner(`jobs/${job.id}/complete`, report(job), job.lease);
+  });
+
+  it("refuses staff hiding, restoring or resolving reports on their own mod, and leaves restoring to admins", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const admin = await signIn("2535400000008001", "ConflictAdmin");
+    const reviewer = await signIn("2535400000008002", "ConflictReviewer");
+    const { creator, v } = await published(owner, "2535400000008003", "conflict-mod");
+    await promote(owner, "ConflictAdmin", "admin");
+    await promote(owner, "ConflictReviewer", "moderator");
+    await promote(owner, "Maker8003", "moderator");
+    const hide = (by: Browser, body: unknown) => by.post("/staff/mods/conflict-mod/hide", body);
+    expect((await hide(creator, { hidden: true, reason: "Hiding my own mod" })).status).toBe(403);
+    expect((await hide(admin, { hidden: true, reason: "Reported as malicious" })).status).toBe(200);
+    expect((await hide(creator, { hidden: false, reason: "Restoring my own mod" })).status).toBe(403);
+    expect((await hide(reviewer, { hidden: false, reason: "Looks fine to me" })).status).toBe(403);
+    // A missing or non-boolean value is not a restoration.
+    expect((await hide(admin, { reason: "No explicit value" })).status).toBe(422);
+    expect((await hide(admin, { hidden: "false", reason: "String value" })).status).toBe(422);
+    expect((await hide(admin, { hidden: 0, reason: "Number value" })).status).toBe(422);
+    expect((await api("/mods/conflict-mod")).status).toBe(404);
+    expect((await hide(admin, { hidden: false, reason: "Administrative review completed" })).status).toBe(200);
+    expect((await api("/mods/conflict-mod")).status).toBe(200);
+
+    // An open report holds the creator's trusted updates; they can't clear it themselves.
+    expect((await owner.post("/staff/mods/conflict-mod/trust", { trusted: true, reason: "Re-established after review" })).status).toBe(200);
+    const reporter = await signIn("2535400000008004", "ConflictReporter");
+    expect((await reporter.post("/mods/conflict-mod/reports", { reason: "malicious", details: "It sends my inventory somewhere." })).status).toBe(200);
+    const reportId = (await (await owner.get("/staff/reports")).json() as { id: string; slug: string }[]).find(r => r.slug === "conflict-mod")!.id;
+    expect((await creator.post(`/staff/reports/${reportId}/resolve`, { note: "Not malicious" })).status).toBe(403);
+    expect((await (await owner.get("/staff/reports")).json() as { id: string; status: string }[]).find(r => r.id === reportId)!.status).toBe("open");
+    await submit(creator, "conflict-mod", "1.0.1", { hud: true }, {}, false);
+    expect(await (await scanOne()).json()).toMatchObject({ automatic: false });
+    expect(await (await api("/mods/conflict-mod")).json()).toMatchObject({ version: "1.0.0", version_id: v.id });
+    expect((await reviewer.post(`/staff/reports/${reportId}/resolve`, { note: "Checked the network calls" })).status).toBe(200);
+  });
+
+  it("refuses listing slugs that fixed routes under /mods/ would shadow", async () => {
+    const fixed = new Set(marketplaceRoutes.routes.flatMap(route => /^\/mods\/([^/:*]+)/.exec(route.path)?.[1] ?? []));
+    expect(fixed).toContain("revocations");
+    for (const slug of fixed) {
+      expect(validateListing({ slug, name: slug, summary: "A reserved slug fixture.", version: "1.0.0" }, 0).errors.slug, slug).toBeTruthy();
+    }
+    const creator = await signIn("2535400000008011", "ReservedCreator");
+    const refused = await submit(creator, "revocations", "1.0.0", { hud: true }, {}, false);
+    expect(refused.status).toBe(422);
+    expect(await refused.json()).toMatchObject({ fields: { slug: expect.any(String) } });
+  });
+
+  it("stops automatic publication once the granting admin is demoted or suspended", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const granter = await signIn("2535400000008021", "TrustGranter");
+    await promote(owner, "TrustGranter", "admin");
+    const { creator } = await published(owner, "2535400000008022", "granted-mod");
+    expect((await granter.post("/staff/mods/granted-mod/trust", { trusted: true, reason: "Reviewed the project history" })).status).toBe(200);
+    const update = async (version: string) => {
+      const v = await (await submit(creator, "granted-mod", version, { hud: true }, {}, false)).json() as { id: string };
+      return { id: v.id, automatic: (await (await scanOne()).json() as { automatic: boolean }).automatic };
+    };
+    expect((await update("1.0.1")).automatic).toBe(true);
+    await promote(owner, "TrustGranter", "moderator");
+    const held = await update("1.0.2");
+    expect(held.automatic).toBe(false);
+    expect(await (await owner.get(`/staff/versions/${held.id}`)).json()).toMatchObject({ trust: { trusted: false } });
+    await promote(owner, "TrustGranter", "admin");
+    expect((await update("1.0.3")).automatic).toBe(true);
+    expect((await owner.post("/staff/people/suspend", { gamertag: "TrustGranter", suspended: true, reason: "Account compromised" })).status).toBe(200);
+    expect((await update("1.0.4")).automatic).toBe(false);
+    expect(await (await api("/mods/granted-mod")).json()).toMatchObject({ version: "1.0.3" });
+  });
+
+  it("authorizes public screenshots exactly as before, through a digest index", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const admin = await signIn("2535400000008031", "MediaAdmin");
+    await promote(owner, "MediaAdmin", "admin");
+    const creator = await signIn("2535400000008032", "MediaCreator");
+    /** Uploads a release with one PNG whose digest is unique to `version`, returning the version and image digest. */
+    const release = async (version: string) => {
+      const form = new FormData();
+      form.set("listing", JSON.stringify({ slug: "indexed-media", name: "Indexed media", summary: "A screenshot index fixture.", version }));
+      form.set("file", new File([component([["cinnabar:grants", "{}"]])], "indexed-media.wasm"));
+      const png = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, ...new TextEncoder().encode(`indexed-media ${version}`)]);
+      form.append("images", new File([png], "screenshot.png", { type: "image/png" }));
+      const v = await (await upload(creator, form)).json() as { id: string; sha256: string; gallery: { sha256: string }[] };
+      await scanOne();
+      return { id: v.id, sha256: v.sha256, image: v.gallery[0]!.sha256 };
+    };
+    const status = async (image: string) => (await api(`/mods/media/${image}`)).status;
+    const first = await release("1.0.0");
+    expect(await status(first.image)).toBe(404);
+    expect((await owner.post(`/staff/versions/${first.id}/decision`, { decision: "approve" })).status).toBe(200);
+    expect(await status(first.image)).toBe(200);
+    // A pending release's screenshot stays private while an older one of the same listing is public.
+    const second = await release("1.1.0");
+    expect(await status(second.image)).toBe(404);
+    expect((await admin.post("/staff/mods/indexed-media/hide", { hidden: true, reason: "Media review" })).status).toBe(200);
+    expect(await status(first.image)).toBe(404);
+    expect((await admin.post("/staff/mods/indexed-media/hide", { hidden: false, reason: "Media reviewed" })).status).toBe(200);
+    expect(await status(first.image)).toBe(200);
+    expect((await owner.post("/staff/people/suspend", { gamertag: "MediaCreator", suspended: true, reason: "Media review" })).status).toBe(200);
+    expect(await status(first.image)).toBe(404);
+    expect((await owner.post("/staff/people/suspend", { gamertag: "MediaCreator", suspended: false, reason: "Media reviewed" })).status).toBe(200);
+    expect(await status(first.image)).toBe(200);
+
+    await runInDurableObject(hub(), (_: Hub, state) => {
+      const sql = state.storage.sql;
+      // Releases stored before the index existed are backfilled once.
+      sql.exec("DELETE FROM mod_media");
+      sql.exec("DELETE FROM market_schema WHERE version = 4");
+      new MarketplaceStore(sql, new Set([OWNER]));
+      const cursors: SqlStorageCursor<Record<string, SqlStorageValue>>[] = [];
+      const counting = { exec: (query: string, ...bindings: SqlStorageValue[]) => {
+        const cursor = sql.exec(query, ...bindings);
+        cursors.push(cursor);
+        return cursor;
+      } } as unknown as SqlStorage;
+      const store = new MarketplaceStore(counting, new Set([OWNER]));
+      /** Rows the public checks for the first release read. */
+      const rowsRead = () => {
+        cursors.length = 0;
+        expect(store.mediaAllowed(first.image)).toBe(true);
+        expect(store.assetAllowed(first.sha256)).toBe(true);
+        expect(store.mediaAllowed(second.image)).toBe(false);
+        return cursors.reduce((total, cursor) => total + cursor.rowsRead, 0);
+      };
+      const before = rowsRead();
+      // Many more published releases must not make each anonymous check read more rows.
+      sql.exec(`INSERT INTO mod_listings (slug, creator, name, summary, description, source, created_at)
+        VALUES ('bulk-media', '2535400000008033', 'Bulk', 'Bulk media fixture.', '', '', 0)`);
+      for (let i = 0; i < 200; i++) {
+        const hash = i.toString(16).padStart(64, "b");
+        const id = sql.exec<{ id: number }>(`INSERT INTO mod_versions (slug, version, sha256, bytes, grants, reach, status, submitted_at,
+          decided_at, signature, statement) VALUES ('bulk-media', ?, ?, 1, '{}', 0, 'approved', 0, 0, 'fixture', 'fixture') RETURNING id`,
+          `0.0.${i}`, hash).one().id;
+        sql.exec("INSERT INTO mod_pipeline (version_id, metadata, media, job_id, state) VALUES (?, '{}', ?, ?, 'complete')", id,
+          JSON.stringify([{ sha256: hash.replace(/b/g, "c"), bytes: 12, type: "image/png", caption: "Bulk" }]), `bulk-media-${i}`);
+      }
+      sql.exec("DELETE FROM market_schema WHERE version = 4");
+      new MarketplaceStore(sql, new Set([OWNER]));
+      expect(store.mediaAllowed((7).toString(16).padStart(64, "b").replace(/b/g, "c"))).toBe(true);
+      expect(rowsRead()).toBe(before);
+      sql.exec("DELETE FROM mod_media WHERE version_id IN (SELECT id FROM mod_versions WHERE slug = 'bulk-media')");
+      sql.exec("DELETE FROM mod_pipeline WHERE version_id IN (SELECT id FROM mod_versions WHERE slug = 'bulk-media')");
+      sql.exec("DELETE FROM mod_versions WHERE slug = 'bulk-media'");
+      sql.exec("DELETE FROM mod_listings WHERE slug = 'bulk-media'");
+    });
+    expect(await status(first.image)).toBe(200);
+    expect((await owner.post(`/staff/versions/${first.id}/pull`, { reason: "Withdraw indexed screenshot" })).status).toBe(200);
+    expect(await status(first.image)).toBe(404);
+  });
+
+  it("reuses a signed revocation list briefly and signs a new one after a pull", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const { v } = await published(owner, "2535400000008041", "memo-pull");
+    const start = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(start);
+    try {
+      const read = async () => {
+        const response = await api("/mods/revocations");
+        const text = await response.text();
+        expect(await verifies(text, response.headers.get("X-Cinnabar-Signature")!)).toBe(true);
+        return { text, body: JSON.parse(text) as { issued_at: number; revoked: { slug: string }[] } };
+      };
+      const first = await read();
+      clock.mockReturnValue(start + 10_000);
+      expect((await read()).text).toBe(first.text);
+      expect((await owner.post(`/staff/versions/${v.id}/pull`, { reason: "Memo fixture withdrawal" })).status).toBe(200);
+      const pulled = await read();
+      expect(pulled.body.issued_at).toBe(start + 10_000);
+      expect(pulled.body.revoked.map(r => r.slug)).toContain("memo-pull");
+      clock.mockReturnValue(start + 10_000 + REVOCATION_MEMO_MS);
+      expect((await read()).body.issued_at).toBe(start + 10_000 + REVOCATION_MEMO_MS);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("refuses a pull whose signed revocation list would exceed the client's size budget", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const { v } = await published(owner, "2535400000008051", "budget-pull");
+    const encoder = new TextEncoder();
+    await runInDurableObject(hub(), (_: Hub, state) => {
+      const sql = state.storage.sql;
+      const store = new MarketplaceStore(sql, new Set([OWNER]));
+      // Fill the list to within a few hundred bytes of the budget, tracking each appended entry's size.
+      let size = encoder.encode(store.revocations(Date.now())).byteLength;
+      for (let i = 0; size < REVOCATION_BUDGET_BYTES - 400; i++) {
+        const reason = "r".repeat(Math.max(1, Math.min(500, REVOCATION_BUDGET_BYTES - 400 - size - 150)));
+        const entry = { slug: "budget-filler", version: `0.0.${i}`, sha256: "d".repeat(64), reason };
+        sql.exec(`INSERT INTO mod_versions (slug, version, sha256, bytes, grants, reach, status, submitted_at, pulled, pull_reason)
+          VALUES (?, ?, ?, 1, '{}', 0, 'approved', 0, 1, ?)`, entry.slug, entry.version, entry.sha256, reason);
+        size += encoder.encode(JSON.stringify(entry)).byteLength + 1;
+      }
+      size = encoder.encode(store.revocations(Date.now())).byteLength;
+      expect(size).toBeGreaterThanOrEqual(REVOCATION_BUDGET_BYTES - 400);
+      expect(size).toBeLessThanOrEqual(REVOCATION_BUDGET_BYTES - 200);
+    });
+    try {
+      const refused = await owner.post(`/staff/versions/${v.id}/pull`, { reason: "x".repeat(500) });
+      expect(refused.status).toBe(409);
+      expect(await refused.json()).toMatchObject({ error: expect.stringContaining("revocation list") });
+      expect((await api("/mods/budget-pull")).status).toBe(200);
+      expect(await (await owner.get(`/staff/versions/${v.id}`)).json()).toMatchObject({ pulled: false });
+      // A shorter reason still fits, and the list clients download stays within the budget.
+      expect((await owner.post(`/staff/versions/${v.id}/pull`, { reason: "Short reason" })).status).toBe(200);
+      const served = await (await api("/mods/revocations")).arrayBuffer();
+      expect(served.byteLength).toBeLessThanOrEqual(REVOCATION_BUDGET_BYTES);
+      expect(new TextDecoder().decode(served)).toContain("budget-pull");
+    } finally {
+      await runInDurableObject(hub(), (_: Hub, state) => { state.storage.sql.exec("DELETE FROM mod_versions WHERE slug = 'budget-filler'"); });
+    }
   });
 });

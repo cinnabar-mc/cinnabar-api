@@ -146,6 +146,12 @@ export function canSetRole(actor: Actor | null, target: Actor, role: Role): Verd
   return atLeast(actor, needed) ? { ok: true } : deny("Only the owner manages admins.");
 }
 
+/**
+ * Fixed path segments under `/v1/mods/`. A listing with one of these slugs would have its public page shadowed by
+ * the fixed route, so listing validation refuses them; a test checks this list against the registered routes.
+ */
+export const RESERVED_SLUGS: readonly string[] = ["revocations", "assets", "media"];
+
 export interface ListingFields {
   slug: string;
   name: string;
@@ -170,6 +176,7 @@ export function validateListing(input: unknown, reach: Reach): { fields: Listing
   const errors: Record<string, string> = {};
   for (const key of Object.keys(fields)) if (malformedText(raw[key])) errors[key] = "Use valid Unicode text.";
   if (!/^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])$/.test(fields.slug)) errors.slug = "Use 3–40 lowercase letters, numbers and dashes.";
+  else if (RESERVED_SLUGS.includes(fields.slug)) errors.slug = "That name is reserved. Choose another.";
   if (!fields.name || fields.name.length > 64) errors.name = "Name it in 64 characters or fewer.";
   if (fields.summary.length < 10 || fields.summary.length > 140) errors.summary = "Summarise it in 10–140 characters.";
   if (fields.description.length > 40000) errors.description = "Keep the description under 40,000 characters.";

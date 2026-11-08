@@ -5,6 +5,7 @@ import { ModReleases, type ModRelease, type ModUpdateQuery } from "./mod-release
 import { DurableObject } from "cloudflare:workers";
 import { MarketplaceStore, handle, type MarketCall, type MarketResult } from "./marketplace/store";
 import { signText } from "./marketplace/signing";
+import { reusableRevocations, type SignedRevocations } from "./marketplace/revocations";
 import { PresenceHistory } from "./presence-history";
 import { LoginRewards, type LoginReward } from "./login-rewards";
 import { count } from "./metrics";
@@ -105,6 +106,8 @@ export class Hub extends DurableObject<Env> {
   private readonly lookupBudgets = new Map<string, LookupBudget>();
   private cosmeticCatalog: Catalog = catalog;
   private readonly market: MarketplaceStore;
+  /** The last signed revocation list, see `reusableRevocations`. */
+  private revocationMemo: SignedRevocations | null = null;
   private readonly entitlements = new Map<string, Set<string>>();
   private readonly loginRewards: LoginRewards;
 
@@ -619,11 +622,16 @@ export class Hub extends DurableObject<Env> {
     for (const id of this.market.pendingPublications()) await this.publishMod(id);
   }
 
-  /** The signed list of pulled versions; the signature is null until a signing key is configured. */
+  /** The signed list of pulled versions, briefly reused until a pull; the signature is null without a signing key. */
   async modRevocations(): Promise<{ body: string; signature: string | null }> {
-    const body = this.market.revocations(Date.now());
-    const key = this.env.MARKETPLACE_SIGNING_KEY;
-    return { body, signature: key ? await signText(key, body) : null };
+    const now = Date.now(), revision = this.market.revocationRevision;
+    let signed = reusableRevocations(this.revocationMemo, revision, now);
+    if (!signed) {
+      const body = this.market.revocations(now), key = this.env.MARKETPLACE_SIGNING_KEY;
+      // A pull during signing leaves this list unreusable, because its revision is already behind.
+      this.revocationMemo = signed = { body, signature: key ? await signText(key, body) : null, at: now, revision };
+    }
+    return { body: signed.body, signature: signed.signature };
   }
 
   /** Reads paid ownership from the durable database, including after hibernation. */

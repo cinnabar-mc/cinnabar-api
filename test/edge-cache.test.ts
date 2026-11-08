@@ -36,6 +36,8 @@ it.each([
   ["/v1/presence/history?range=30d", "public, max-age=60", false, false],
   ["/v1/cosmetics/catalog", "public, max-age=300", false, true],
   [asset.url, "public, max-age=31536000, immutable", false, true],
+  ["/v1/mods", "public, max-age=30", true, false],
+  ["/v1/mods/revocations", "public, max-age=60", true, false],
 ])("caches %s at the edge without another Hub or R2 call", async (path, policy, usesHub, usesR2) => {
   await env.COSMETIC_ASSETS.put(asset.sha256, new Uint8Array(asset.bytes).fill(42));
   const hub = vi.spyOn(env.HUB, "get");
@@ -197,4 +199,27 @@ it.each(["read", "write"])("keeps public responses available during cache %s fai
   expect(response.status).toBe(200);
   expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
   expect(await response.json()).toEqual({ ok: true, api: "v1" });
+});
+
+it("serves cached marketplace reads with the catalogue's CORS and signed revocation headers", async () => {
+  const hub = vi.spyOn(env.HUB, "get");
+  const first = await request("/v1/mods/revocations");
+  const body = await first.text();
+  const cached = await request("/v1/mods/revocations", { headers: { Origin: "https://elsewhere.test" } });
+  expect(await cached.text()).toBe(body);
+  expect(cached.headers.get("X-Cinnabar-Signature")).toBe(first.headers.get("X-Cinnabar-Signature"));
+  expect(cached.headers.get("Access-Control-Allow-Origin")).toBe("*");
+  expect(hub).toHaveBeenCalledTimes(1);
+});
+
+it("briefly caches a missing marketplace listing", async () => {
+  const hub = vi.spyOn(env.HUB, "get");
+  const put = vi.spyOn(edge, "put");
+  for (let repeat = 0; repeat < 2; repeat++) {
+    const response = await request("/v1/mods/no-such-listing");
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=10");
+  }
+  expect(hub).toHaveBeenCalledTimes(1);
+  expect(put).toHaveBeenCalledTimes(1);
 });

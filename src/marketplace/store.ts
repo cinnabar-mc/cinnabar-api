@@ -4,6 +4,7 @@ import {
   requestedCapabilities, trimmed, validateListing, type Actor, type Grants, type ListingFields, type Reach, type ReviewState,
   type Role,
 } from "./policy";
+import { revocationBody, withinRevocationBudget, type RevokedRow } from "./revocations";
 import { CLIENT_REVISION, MAX_SCAN_ATTEMPTS, SCAN_LEASE_MS, SCAN_MAX_AGE_MS, SCAN_POLICY, parseScanReport, scanReady, type ScanReport } from "./scanning";
 
 export const PLAYER_SESSION_MS = 30 * 24 * 3_600_000;
@@ -131,6 +132,9 @@ export class MarketplaceStore {
       `CREATE INDEX IF NOT EXISTS mod_pipeline_queue ON mod_pipeline (state, lease_until)`,
       `CREATE TABLE IF NOT EXISTS mod_upload_attempts (creator TEXT NOT NULL, at INTEGER NOT NULL)`,
       `CREATE INDEX IF NOT EXISTS mod_upload_creator ON mod_upload_attempts (creator, at)`,
+      // Public file checks look a digest up directly instead of scanning every release.
+      `CREATE INDEX IF NOT EXISTS mod_versions_sha256 ON mod_versions (sha256)`,
+      `CREATE TABLE IF NOT EXISTS mod_media (sha256 TEXT NOT NULL, version_id INTEGER NOT NULL, PRIMARY KEY (sha256, version_id))`,
     ]) sql.exec(statement);
     /** Runs `statements` once, recording `version` in market_schema. */
     const migrate = (version: number, ...statements: string[]) => {
@@ -161,7 +165,14 @@ export class MarketplaceStore {
       "UPDATE mod_versions SET status = 'submitted', signature = NULL WHERE signature IS NOT NULL AND statement IS NULL");
     // Preserve send identities across removals and restarts, including libraries created before the clock existed.
     migrate(3, "INSERT OR IGNORE INTO mod_library_clock (xuid, sent_at) SELECT xuid, MAX(sent_at) FROM mod_library GROUP BY xuid");
+    // Index the media digests of releases submitted before mod_media existed.
+    migrate(4, `INSERT OR IGNORE INTO mod_media (sha256, version_id)
+      SELECT json_extract(m.value, '$.sha256'), p.version_id FROM mod_pipeline p, json_each(p.media) m
+      WHERE json_type(m.value, '$.sha256') = 'text'`);
   }
+
+  /** Increases whenever the set of pulled versions changes, so callers can tell a memoized revocation list is stale. */
+  revocationRevision = 0;
 
   // --- Sign-in -------------------------------------------------------------------------------------------
 
@@ -383,10 +394,11 @@ export class MarketplaceStore {
 
   /** Pulled versions with the reason staff gave, as the canonical body of the signed revocation list; reasons are always well-formed. */
   revocations(now: number): string {
-    const revoked = this.sql.exec<{ slug: string; version: string; sha256: string; pull_reason: string }>(
-      "SELECT slug, version, sha256, pull_reason FROM mod_versions WHERE pulled = 1 ORDER BY id").toArray()
-      .map((v) => ({ slug: v.slug, version: v.version, sha256: v.sha256, reason: v.pull_reason.toWellFormed() }));
-    return JSON.stringify({ issued_at: now, expires_at: now + 15 * 60_000, revoked });
+    return revocationBody(now, this.revoked());
+  }
+
+  private revoked(): RevokedRow[] {
+    return this.sql.exec<RevokedRow>("SELECT id, slug, version, sha256, pull_reason FROM mod_versions WHERE pulled = 1 ORDER BY id").toArray();
   }
 
   // --- Player writes -------------------------------------------------------------------------------------
@@ -504,6 +516,7 @@ export class MarketplaceStore {
     const baseline = this.liveVersion(fields.slug)?.id ?? null;
     this.sql.exec(`INSERT INTO mod_pipeline (version_id, metadata, media, baseline, job_id) VALUES (?, ?, ?, ?, ?)`,
       id, JSON.stringify(fields), JSON.stringify(file.media), baseline, crypto.randomUUID());
+    for (const item of file.media) this.sql.exec("INSERT OR IGNORE INTO mod_media (sha256, version_id) VALUES (?, ?)", item.sha256, id);
     return ok(this.versionView(this.versionRow(id)!));
   }
 
@@ -543,10 +556,17 @@ export class MarketplaceStore {
     return ok({ key: `media/${media.sha256}`, type: media.type });
   }
 
-  /** Check public media authorization without revealing another version's private files. */
+  /**
+   * Whether `sha256` is a screenshot of a published release on a visible listing whose creator isn't suspended.
+   * The digest index only finds candidates; each release's own immutable media list stays authoritative.
+   */
   mediaAllowed(sha256: string): boolean {
-    return this.versions(`${PUBLISHED} AND l.hidden = 0`)
-      .some(v => !this.account(v.creator)?.suspended && this.media(v.id).some(m => m.sha256 === sha256));
+    return this.sql.exec(`SELECT 1 FROM mod_media m JOIN mod_versions v ON v.id = m.version_id
+      JOIN mod_listings l ON l.slug = v.slug JOIN mod_pipeline pm ON pm.version_id = v.id
+      LEFT JOIN market_accounts a ON a.xuid = l.creator
+      WHERE m.sha256 = ? AND ${PUBLISHED} AND l.hidden = 0 AND COALESCE(a.suspended, 0) = 0
+      AND EXISTS (SELECT 1 FROM json_each(pm.media) j WHERE json_extract(j.value, '$.sha256') = m.sha256) LIMIT 1`, sha256)
+      .toArray().length > 0;
   }
 
   /** SQL jobs are a transactional outbox: creation commits with the version, independent of scanner availability. */
@@ -606,10 +626,8 @@ export class MarketplaceStore {
     const creator = this.account(v.creator);
     if (v.status !== "submitted" || v.pulled || v.reach >= 3 || this.listing(v.slug)!.hidden || !creator || creator.suspended
       || !this.scanPassed(p, now) || reportOf(p)!.ai.verdict !== "clear") return false;
-    const trusted = this.sql.exec("SELECT 1 FROM mod_trust WHERE slug = ? AND creator = ? AND expires_at > ?",
-      v.slug, v.creator, now).toArray().length > 0;
     const baseline = this.liveVersion(v.slug);
-    if (!trusted || !baseline || baseline.id !== p.baseline) return false;
+    if (!this.trusted(v.slug, v.creator, now) || !baseline || baseline.id !== p.baseline) return false;
     if (this.sql.exec("SELECT 1 FROM mod_reports WHERE slug = ? AND status = 'open'", v.slug).toArray().length) return false;
     const prior = this.pipeline(baseline.id)!;
     const priorReport = reportOf(prior);
@@ -622,6 +640,17 @@ export class MarketplaceStore {
     const after = JSON.parse(p.metadata) as Record<string, unknown>;
     return !["name", "summary", "description", "source", "category", "license"].some(key => before[key] !== after[key])
       && prior.media === p.media;
+  }
+
+  /**
+   * Whether `creator` holds unexpired trust for `slug` from someone who is still an active admin and isn't the
+   * creator, so a later demotion or suspension of the granter withdraws it.
+   */
+  private trusted(slug: string, creator: string, now: number): boolean {
+    const grant = this.sql.exec<{ granted_by: string }>("SELECT granted_by FROM mod_trust WHERE slug = ? AND creator = ? AND expires_at > ?",
+      slug, creator, now).toArray()[0];
+    const granter = grant && this.account(grant.granted_by);
+    return !!granter && !granter.suspended && atLeast(granter, "admin") && granter.xuid !== creator;
   }
 
   /** Return publication material only while current scan, account and decision gates still hold. */
@@ -695,7 +724,7 @@ export class MarketplaceStore {
       submitted_at: v.submitted_at, decided_at: v.decided_at, pulled: !!v.pulled, pull_reason: v.pull_reason,
       name: metadata.name, summary: metadata.summary, description: metadata.description, source: metadata.source, hidden: !!listing.hidden,
       category: metadata.category, license: metadata.license, notes: metadata.notes,
-      trust: { trusted: !!trust && trust.expires_at > Date.now(), expires_at: trust?.expires_at ?? null },
+      trust: { trusted: !!trust && this.trusted(v.slug, v.creator, Date.now()), expires_at: trust?.expires_at ?? null },
       gallery: this.media(v.id), scan: { state: p.state, attempts: p.attempts, job: p.job_id,
         completed_at: p.completed_at, expires_at: p.completed_at === null ? null : p.completed_at + SCAN_MAX_AGE_MS,
         review_ready: this.scanPassed(p, Date.now()), report: reportOf(p) }, publication: p.publish_mode,
@@ -769,22 +798,33 @@ export class MarketplaceStore {
     if (malformedText(rawReason)) return fail(422, MALFORMED_TEXT);
     const reason = clip(trimmed(rawReason), 500);
     if (!reason) return fail(400, "Say why it's being pulled.");
+    const rows = [...this.revoked(), { id: v.id, slug: v.slug, version: v.version, sha256: v.sha256, pull_reason: reason }]
+      .sort((a, b) => a.id - b.id);
+    if (!withinRevocationBudget(revocationBody(now, rows))) {
+      return fail(409, "The signed revocation list is at its size limit, so clients couldn't download it. Hide the listing and ask an operator to compact revocations.");
+    }
     this.sql.exec("UPDATE mod_versions SET pulled = 1, pull_reason = ? WHERE id = ?", reason, v.id);
+    this.revocationRevision++;
     this.sql.exec("DELETE FROM mod_trust WHERE slug = ?", v.slug);
     this.log(staff.xuid, "pulled", `${v.slug} ${v.version}`, reason, now);
     const holders = this.sql.exec<{ xuid: string }>("SELECT xuid FROM mod_library WHERE version_id = ?", v.id).toArray().map((r) => r.xuid);
     return ok(this.versionView(this.versionRow(v.id)!), { notify: holders });
   }
 
+  /** Hides or restores another creator's listing; restoring needs an admin, as hiding withdrew its trust. */
   hide(caller: Caller, slug: string, input: unknown, now: number): MarketResult {
     const staff = this.staff(caller, now, true);
     if ("status" in staff) return staff;
-    if (!this.listing(slug)) return fail(404, "No such mod.");
+    const listing = this.listing(slug);
+    if (!listing) return fail(404, "No such mod.");
+    if (listing.creator === staff.xuid) return fail(403, "You can't hide or restore your own mod.");
     const body = fieldsOf(input);
     if (malformedText(body.reason)) return fail(422, MALFORMED_TEXT);
     const reason = trimmed(body.reason);
     if (!reason) return fail(400, "Note why, for the audit log.");
-    const hidden = body.hidden === true;
+    if (typeof body.hidden !== "boolean") return fail(422, "Supply hidden as true or false.");
+    const hidden = body.hidden;
+    if (!hidden && !atLeast(staff, "admin")) return fail(403, "Only admins can restore a hidden listing.");
     this.sql.exec("UPDATE mod_listings SET hidden = ? WHERE slug = ?", hidden ? 1 : 0, slug);
     if (hidden) this.sql.exec("DELETE FROM mod_trust WHERE slug = ?", slug);
     this.log(staff.xuid, hidden ? "hid listing" : "restored listing", slug, reason, now);
@@ -804,11 +844,13 @@ export class MarketplaceStore {
     }));
   }
 
+  /** Resolves a report about another creator's mod; open reports hold automatic publication. */
   resolve(caller: Caller, id: number, input: unknown, now: number): MarketResult {
     const staff = this.staff(caller, now, true);
     if ("status" in staff) return staff;
     const report = this.sql.exec<{ slug: string; version: string }>("SELECT slug, version FROM mod_reports WHERE id = ?", id).toArray()[0];
     if (!report) return fail(404, "No such report.");
+    if (this.listing(report.slug)?.creator === staff.xuid) return fail(403, "You can't resolve reports about your own mod.");
     const rawNote = fieldsOf(input).note;
     if (malformedText(rawNote)) return fail(422, MALFORMED_TEXT);
     const note = clip(trimmed(rawNote), 1000);

@@ -34,6 +34,8 @@ Public GET responses use the Cloudflare Cache API with lifetimes declared beside
 | `/v1/presence/history` | 60 seconds per supported range |
 | `/v1/cosmetics/catalog` | 300 seconds, with `If-None-Match` revalidation on cache hits and misses |
 | `/v1/cosmetics/assets/:hash` | One year, immutable; static files when mirrored |
+| `/v1/mods`, `/v1/mods/:slug` | 30 seconds; 10 seconds for a missing listing |
+| `/v1/mods/revocations` | 60 seconds |
 
 The cache is local to each Cloudflare location. Public routes ignore unrelated query parameters and
 reuse the same anonymous response when an Authorization header is present. Private routes, writes
@@ -141,7 +143,7 @@ Acts and Network listings must link their GitHub source.
 | `POST /v1/submissions` (multipart `listing` JSON and `file`) | signed in; five pending versions at most |
 | `GET /v1/staff/queue`, `/reports`, `/people`, `/audit`, `/versions/:id`, `/versions/:id/file` | staff |
 | `POST /v1/staff/versions/:id/decision` `{decision: approve, changes or reject, note}` | staff |
-| `POST /v1/staff/reports/:id/resolve`, `POST /v1/staff/mods/:slug/hide` | staff |
+| `POST /v1/staff/reports/:id/resolve`, `POST /v1/staff/mods/:slug/hide` `{hidden, reason}` | staff, never for their own mod; restoring (`hidden: false`) needs an admin |
 | `POST /v1/staff/versions/:id/pull`, `POST /v1/staff/people/suspend` | admin |
 | `POST /v1/staff/people/role` `{gamertag, role, reason}` | admin (moderators) or owner (admins) |
 
