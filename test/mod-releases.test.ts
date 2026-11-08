@@ -64,7 +64,7 @@ beforeEach(async () => {
 
 describe("revision-aware mod releases", () => {
   it("reserves the Official Mod slug for the system publisher", () => {
-    expect(validateListing({ slug: "cinnabar-mod", name: "Impersonator", summary: "A reserved official name.", version: "1.0.0" }, 0).errors.slug).toBeTruthy();
+    expect(validateListing({ slug: "cinnabar-mod", name: "Impersonator", summary: "A reserved official name.", version: "1.0.0" }).errors.slug).toBeTruthy();
   });
 
   it("refuses official-slug submissions from ordinary creators before publication", async () => {
