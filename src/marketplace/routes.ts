@@ -11,6 +11,8 @@ import { BodyLimitError, MAX_IMAGES, MAX_UPLOAD_BYTES, imageType, readLimited, s
 
 const SESSION_COOKIE = "cinnabar_session";
 const OAUTH_COOKIE = "cinnabar_oauth";
+/** Header carrying the Ed25519 signature of a signed public body, such as the revocation list. */
+const SIGNATURE_HEADER = "X-Cinnabar-Signature";
 const CSRF_HEADER = "X-Cinnabar-CSRF";
 const MAX_JSON_BYTES = 64 * 1024;
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -111,6 +113,8 @@ const cors = async (c: Ctx, next: () => Promise<void>) => {
   } else if (c.req.method === "GET" && c.req.path.startsWith("/v1/mods")) {
     c.res.headers.set("Access-Control-Allow-Origin", "*");
   }
+  // Browsers hide custom headers cross-origin unless they are exposed, and the signature is needed to verify the body.
+  if (c.res.headers.has(SIGNATURE_HEADER)) c.res.headers.set("Access-Control-Expose-Headers", SIGNATURE_HEADER);
 };
 // Only marketplace paths, so the cached presence routes keep their own headers.
 for (const path of ["/auth/*", "/me", "/me/*", "/mods", "/mods/*", "/submissions", "/staff/*"]) marketplaceRoutes.use(path, cors);
@@ -189,7 +193,7 @@ marketplaceRoutes.get("/mods", publicCache(CATALOGUE_CACHE), async (c) => reply(
 marketplaceRoutes.get("/mods/revocations", publicCache(REVOCATIONS_CACHE), async (c) => {
   const { body, signature } = await hubFor(c.env).modRevocations();
   c.header("Cache-Control", REVOCATIONS_CACHE);
-  if (signature) c.header("X-Cinnabar-Signature", signature);
+  if (signature) c.header(SIGNATURE_HEADER, signature);
   return c.body(body, 200, { "Content-Type": "application/json" });
 });
 

@@ -209,6 +209,7 @@ it("serves cached marketplace reads with the catalogue's CORS and signed revocat
   expect(await cached.text()).toBe(body);
   expect(cached.headers.get("X-Cinnabar-Signature")).toBe(first.headers.get("X-Cinnabar-Signature"));
   expect(cached.headers.get("Access-Control-Allow-Origin")).toBe("*");
+  expect(cached.headers.get("Access-Control-Expose-Headers")).toBe("X-Cinnabar-Signature");
   expect(hub).toHaveBeenCalledTimes(1);
 });
 
