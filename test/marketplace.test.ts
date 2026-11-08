@@ -1567,6 +1567,8 @@ describe("listing addresses", () => {
     expect(listing({ name: "Café  Déjà–Vu!", slug: "" }).fields.slug).toBe("cafe-deja-vu");
     expect(listing({ name: "x".repeat(50) }).fields.slug).toHaveLength(40);
     expect(listing({ name: "Steroids for Cinnabar", slug: "" }).errors.slug).toBeUndefined();
+    // Addresses the old rules accepted, such as double dashes, keep pointing at their listing.
+    expect(listing({ name: "My mod", slug: "my--mod" }).fields.slug).toBe("my--mod");
   });
 
   it("asks for an address only when nothing usable is left", () => {

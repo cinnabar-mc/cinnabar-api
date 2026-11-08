@@ -179,6 +179,11 @@ export function slugFrom(text: string): string {
     .replace(/[^a-z0-9]+/g, "-").replace(/^-+/, "").slice(0, 40).replace(/-+$/, "");
 }
 
+/** A typed address that was already valid stays exactly as typed, so existing listings keep theirs; anything else is converted. */
+function listingAddress(typed: string, name: string): string {
+  return /^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])$/.test(typed) ? typed : slugFrom(typed || name);
+}
+
 /**
  * Normalises and validates listing fields, returning per-field messages for anything wrong.
  * The address is optional: any case or spacing is converted, and a blank one comes from the name.
@@ -187,7 +192,7 @@ export function validateListing(input: unknown): { fields: ListingFields; errors
   const raw = fieldsOf(input);
   const text = (key: string) => trimmed(raw[key]);
   const fields: ListingFields = {
-    slug: slugFrom(text("slug") || text("name")), name: text("name"), summary: text("summary"), description: text("description"),
+    slug: listingAddress(text("slug"), text("name")), name: text("name"), summary: text("summary"), description: text("description"),
     version: text("version"), source: text("source").replace(/\/$/, ""),
     category: text("category"), license: text("license"), notes: text("notes"),
   };
