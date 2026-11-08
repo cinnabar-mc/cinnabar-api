@@ -1,5 +1,7 @@
 import { compareVersions, type ModLibraryEntry } from "../protocol";
 import type { MarketplaceUpdateQuery } from "./updates";
+import { canonicalRelease, type ModRelease } from "../mod-releases";
+import { OFFICIAL_CREATOR, OFFICIAL_POLICY, OFFICIAL_SLUG } from "./official";
 import {
   ROLES, STAFF_MANAGERS_ONLY, approvalRule, approvalsComplete, atLeast, canApprove, canReview, canSetRole, clip, fieldsOf, grantDiff,
   malformedText, managesStaff, reachOf, requestedCapabilities, trimmed, validateListing, type Actor, type Grants, type ListingFields,
@@ -79,7 +81,7 @@ type PipelineRow = {
   version_id: number; metadata: string; media: string; baseline: number | null;
   job_id: string; state: "queued" | "running" | "complete" | "failed";
   attempts: number; lease: string | null; lease_until: number | null;
-  report: string | null; completed_at: number | null; publish_mode: "manual" | "automatic" | null; promotion_attempt_at: number;
+  report: string | null; completed_at: number | null; publish_mode: "manual" | "automatic" | "official" | null; promotion_attempt_at: number;
 };
 
 const ok = (body: unknown, extra: Partial<MarketResult> = {}): MarketResult => ({ status: 200, body, ...extra });
@@ -91,9 +93,13 @@ const parseWellFormed = (json: string): unknown => JSON.parse(json, (_, value) =
 
 /** A version's listing snapshot; snapshots migrated from before category, license and notes read them as "". */
 const snapshotOf = (p: PipelineRow): ListingFields => ({ category: "", license: "", notes: "", ...JSON.parse(p.metadata) });
-/** SQL for a version clients may fetch: approved, actually signed, unpulled and with a complete scan. */
+/** Public versions have a signature and completed scan or recorded official approval; revoked official bytes stay withdrawn. */
 const PUBLISHED = `v.status = 'approved' AND v.signature IS NOT NULL AND v.statement IS NOT NULL AND v.pulled = 0
-  AND EXISTS (SELECT 1 FROM mod_pipeline p WHERE p.version_id = v.id AND p.state = 'complete')`;
+  AND EXISTS (SELECT 1 FROM mod_pipeline p WHERE p.version_id = v.id AND p.state = 'complete'
+    AND (COALESCE(p.publish_mode, '') != 'official' OR (v.slug = '${OFFICIAL_SLUG}' AND EXISTS
+      (SELECT 1 FROM mod_official_releases o WHERE o.version_id = v.id))))
+  AND NOT EXISTS (SELECT 1 FROM mod_versions revoked WHERE revoked.slug = '${OFFICIAL_SLUG}'
+    AND revoked.sha256 = v.sha256 AND revoked.pulled = 1)`;
 
 /**
  * The marketplace's durable state in the Hub's SQLite: accounts and roles, web sessions, listings, versions,
@@ -175,10 +181,71 @@ export class MarketplaceStore {
     // Never infer compatibility for existing versions or rewrite their signed statements.
     migrate(6, "ALTER TABLE mod_versions ADD COLUMN api_revision TEXT",
       "CREATE INDEX mod_versions_updates ON mod_versions (slug, api_revision)");
+    // Keep the complete original manifest outside the fixed marketplace signed-statement format.
+    migrate(7, `CREATE TABLE mod_official_releases (version_id INTEGER PRIMARY KEY, release TEXT NOT NULL, validation TEXT NOT NULL)`);
   }
 
   /** Increases whenever the set of pulled versions changes, so callers can tell a memoized revocation list is stale. */
   revocationRevision = 0;
+
+  /** Records authenticated CI approval and deterministic byte validation without impersonating a scanner report. */
+  officialRelease(input: ModRelease, grants: Grants, license: string, now: number): number | null {
+    const release = canonicalRelease(input), m = release.manifest;
+    const listing = this.listing(OFFICIAL_SLUG);
+    if (listing && listing.creator !== OFFICIAL_CREATOR) return null;
+    const existing = this.versions("v.slug = ? AND v.version = ?", OFFICIAL_SLUG, m.version)[0];
+    const encoded = JSON.stringify(release);
+    if (existing) {
+      const stored = this.sql.exec<{ release: string }>("SELECT release FROM mod_official_releases WHERE version_id = ?", existing.id).toArray()[0];
+      return stored?.release === encoded ? existing.id : null;
+    }
+    if (this.officialDigestPulled(m.artifact.sha256)) return null;
+    const metadata: ListingFields = { slug: OFFICIAL_SLUG, name: "Cinnabar Official Mod", summary: "The official Cinnabar gameplay and interface mod.",
+      description: "The Official Mod, published by Cinnabar's authenticated release pipeline.", source: "", category: "Utilities", license, notes: "", version: m.version };
+    this.sql.exec(`INSERT OR IGNORE INTO market_accounts (xuid, gamertag, seen_at) VALUES (?, 'Cinnabar', ?)`, OFFICIAL_CREATOR, now);
+    this.sql.exec(`INSERT OR IGNORE INTO mod_listings (slug, creator, name, summary, description, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      OFFICIAL_SLUG, OFFICIAL_CREATOR, metadata.name, metadata.summary, metadata.description, metadata.source, now);
+    const id = this.sql.exec<{ id: number }>(`INSERT INTO mod_versions (slug, version, sha256, bytes, grants, reach, status, submitted_at, decided_at, api_revision)
+      VALUES (?, ?, ?, ?, ?, ?, 'submitted', ?, ?, ?) RETURNING id`, OFFICIAL_SLUG, m.version, m.artifact.sha256, m.artifact.size,
+      JSON.stringify(grants), reachOf(grants), now, now, m.host.api_revision).one().id;
+    this.sql.exec(`INSERT INTO mod_official_releases (version_id, release, validation) VALUES (?, ?, ?)`, id, encoded,
+      JSON.stringify({ policy: OFFICIAL_POLICY, at: now, sha256: m.artifact.sha256, bytes: m.artifact.size,
+        checks: ["manifest", "publisher", "sha256", "size", "component-framing", "declarations", "grants", "executable-size"], approval: "authenticated-release-hook" }));
+    this.sql.exec(`INSERT INTO mod_pipeline (version_id, metadata, job_id, state, completed_at, publish_mode)
+      VALUES (?, ?, ?, 'complete', ?, 'official')`, id, JSON.stringify(metadata), crypto.randomUUID(), now);
+    this.log(OFFICIAL_CREATOR, "official approval", `${OFFICIAL_SLUG} ${m.version}`, OFFICIAL_POLICY, now);
+    return id;
+  }
+
+  /** Original manifests of signed, visible official versions; callers still apply compatibility and identity selection. */
+  officialReleases(hash?: string): ModRelease[] {
+    const listing = this.listing(OFFICIAL_SLUG);
+    if (!listing || listing.hidden || this.account(OFFICIAL_CREATOR)?.suspended) return [];
+    return this.versions(`v.slug = ? AND ${PUBLISHED}${hash === undefined ? "" : " AND v.sha256 = ?"}`,
+      OFFICIAL_SLUG, ...(hash === undefined ? [] : [hash])).flatMap(v => {
+      const row = this.sql.exec<{ release: string }>("SELECT release FROM mod_official_releases WHERE version_id = ?", v.id).toArray()[0];
+      return row ? [JSON.parse(row.release) as ModRelease] : [];
+    });
+  }
+
+  /** Committed marketplace releases permanently supersede a legacy version, including while hidden or pulled. */
+  officialManaged(version: string): boolean {
+    return this.versions("v.slug = ? AND v.version = ? AND v.status = 'approved'", OFFICIAL_SLUG, version).length > 0;
+  }
+
+  /** Once official publication starts, catalogue reads must observe its withdrawals without an edge-cache delay. */
+  hasOfficialListing(): boolean { return !!this.listing(OFFICIAL_SLUG); }
+
+  /** Identical retries acknowledge a committed signature, including pulled versions, without republishing. */
+  officialSigned(id: number): boolean {
+    const v = this.versionRow(id);
+    return !!v?.signature && !!v.statement && v.status === "approved";
+  }
+
+  /** A pulled official digest cannot be resurrected by a legacy row or by another official version using identical bytes. */
+  officialDigestPulled(hash: string): boolean {
+    return this.versions("v.slug = ? AND v.sha256 = ? AND v.pulled = 1", OFFICIAL_SLUG, hash).length > 0;
+  }
 
   // --- Sign-in -------------------------------------------------------------------------------------------
 
@@ -292,6 +359,9 @@ export class MarketplaceStore {
   }
 
   private liveVersion(slug: string): VersionRow | undefined {
+    // The hook may replay historical releases; backfilling an older official generation must not replace the catalogue head.
+    if (slug === OFFICIAL_SLUG) return this.versions(`v.slug = ? AND ${PUBLISHED}`, slug)
+      .sort((a, b) => compareVersions(b.version, a.version))[0];
     return this.versions(`v.slug = ? AND ${PUBLISHED} ORDER BY v.decided_at DESC, v.id DESC LIMIT 1`, slug)[0];
   }
 
@@ -352,6 +422,7 @@ export class MarketplaceStore {
 
   /** Stored files require an actually signed, visible release before public downloads are allowed. */
   assetAllowed(sha256: string): boolean {
+    if (this.officialDigestPulled(sha256)) return false;
     return this.versions(`v.sha256 = ? AND ${PUBLISHED} AND l.hidden = 0`, sha256).some(v => !this.account(v.creator)?.suspended);
   }
 
@@ -359,11 +430,13 @@ export class MarketplaceStore {
   statement(versionId: number): string {
     const v = this.versionRow(versionId)!;
     if (v.statement !== null) return v.statement;
-    const approvers = this.approvals(v.id).map((a) => a.xuid);
     const p = this.pipeline(v.id)!;
+    const approvers = p.publish_mode === "official" ? [OFFICIAL_CREATOR] : this.approvals(v.id).map((a) => a.xuid);
     return JSON.stringify({ approved_at: v.decided_at, approvers, bytes: v.bytes, grants: parseWellFormed(v.grants), sha256: v.sha256,
       slug: v.slug, version: v.version, metadata: parseWellFormed(p.metadata), media: parseWellFormed(p.media),
-      policy: SCAN_POLICY, client_revision: CLIENT_REVISION, scan_job: p.job_id, publication: p.publish_mode,
+      policy: p.publish_mode === "official" ? OFFICIAL_POLICY : SCAN_POLICY,
+      client_revision: p.publish_mode === "official" ? this.officialManifest(versionId)!.manifest.host.revision : CLIENT_REVISION,
+      scan_job: p.job_id, publication: p.publish_mode,
       ...(v.api_revision === null ? {} : { api_revision: v.api_revision }) });
   }
 
@@ -663,19 +736,41 @@ export class MarketplaceStore {
   }
 
   /** Return publication material only while current scan, account and decision gates still hold. */
-  publicationReady(id: number, now: number): { sha256: string; media: MediaFile[]; statement: string } | null {
+  publicationReady(id: number, now: number): { sha256: string; bytes: number; media: MediaFile[]; statement: string } | null {
     const v = this.versionRow(id);
     const p = this.pipeline(id);
     if (!v || !p || v.status !== "submitted" || v.pulled || this.account(v.creator)?.suspended || this.listing(v.slug)?.hidden
-      || !this.scanPassed(p, now)) return null;
+      || (p.publish_mode === "official" ? p.state !== "complete" || v.slug !== OFFICIAL_SLUG || v.creator !== OFFICIAL_CREATOR
+        || this.officialDigestPulled(v.sha256) || !this.officialValidationReady(v, p)
+        : !this.scanPassed(p, now))) return null;
     // Manual approvals count only from staff who are still active and aren't the creator.
-    const decided = p.publish_mode === "automatic" ? this.automaticAllowed(v, now)
+    const decided = p.publish_mode === "official" || (p.publish_mode === "automatic" ? this.automaticAllowed(v, now)
       : p.publish_mode === "manual" && approvalsComplete(v.reach as Reach, this.approvals(id).flatMap(a => {
         const actor = this.account(a.xuid);
         return actor && !actor.suspended && atLeast(actor, "moderator") && actor.xuid !== v.creator ? [{ admin: atLeast(actor, "admin") }] : [];
-      }));
-    return decided ? { sha256: v.sha256, media: this.media(id), statement: this.statement(id) } : null;
+      })));
+    return decided ? { sha256: v.sha256, bytes: v.bytes, media: this.media(id), statement: this.statement(id) } : null;
   }
+
+  /** Reads the retained official manifest for signing and legacy adapters; no signed statement fields are added. */
+  private officialManifest(id: number): ModRelease | null {
+    const row = this.sql.exec<{ release: string }>("SELECT release FROM mod_official_releases WHERE version_id = ?", id).toArray()[0];
+    return row ? JSON.parse(row.release) as ModRelease : null;
+  }
+
+  /** A recoverable official decision must bind the same bytes, API and host identities under the current hook policy. */
+  private officialValidationReady(v: VersionRow, p: PipelineRow): boolean {
+    const row = this.sql.exec<{ release: string; validation: string }>(
+      "SELECT release, validation FROM mod_official_releases WHERE version_id = ?", v.id).toArray()[0];
+    if (!row) return false;
+    const m = (JSON.parse(row.release) as ModRelease).manifest;
+    const validation = JSON.parse(row.validation) as { policy: string; sha256: string; bytes: number; at: number };
+    return validation.policy === OFFICIAL_POLICY && validation.sha256 === v.sha256 && validation.bytes === v.bytes && validation.at === p.completed_at
+      && m.artifact.sha256 === v.sha256 && m.artifact.size === v.bytes && m.version === v.version && m.host.api_revision === v.api_revision;
+  }
+
+  /** Official versions use their retained MOD_ASSETS object for signing and public download checks. */
+  isOfficialVersion(id: number): boolean { return this.officialManifest(id) !== null; }
 
   /** Retry jobs with a new identity, invalidating old scanner leases and all earlier approvals. */
   rescan(caller: Caller, id: number, now: number): MarketResult {
@@ -683,6 +778,7 @@ export class MarketplaceStore {
     if ("status" in staff) return staff;
     const v = this.versionRow(id);
     if (!v || v.status !== "submitted") return fail(409, "Only pending releases can be rescanned.");
+    if (this.isOfficialVersion(id)) return fail(409, "Official releases use release-hook validation.");
     if (v.creator === staff.xuid) return fail(403, "You can't rescan your own mod.");
     this.sql.exec(`UPDATE mod_pipeline SET job_id = ?, state = 'queued', attempts = 0, lease = NULL,
       lease_until = NULL, report = NULL, completed_at = NULL, publish_mode = NULL WHERE version_id = ?`, crypto.randomUUID(), id);
@@ -738,6 +834,9 @@ export class MarketplaceStore {
         completed_at: p.completed_at, expires_at: p.completed_at === null ? null : p.completed_at + SCAN_MAX_AGE_MS,
         review_ready: this.scanPassed(p, Date.now()), report: reportOf(p) }, publication: p.publish_mode,
       capabilities: requestedCapabilities(grants), rule: approvalRule(v.reach as Reach), approvals: this.approvals(v.id),
+      ...(this.isOfficialVersion(v.id) ? { official_validation: JSON.parse(this.sql.exec<{ validation: string }>(
+        "SELECT validation FROM mod_official_releases WHERE version_id = ?", v.id).one().validation),
+        file_withdrawn: this.officialDigestPulled(v.sha256) } : {}),
       previous: previous ? { version: previous.version, sha256: previous.sha256, grants: JSON.parse(previous.grants) as Grants,
         diff: grantDiff(JSON.parse(previous.grants), grants) } : null,
     };

@@ -2,6 +2,8 @@ import { UniqueUsers } from "./unique-users";
 import { catalog, admitLoadout } from "./cosmetics";
 import { loadCatalog, type Catalog } from "./catalog-store";
 import { ModReleases, type ModRelease, type ModUpdateQuery } from "./mod-releases";
+import { readComponent } from "./marketplace/component";
+import { modAssetKey, MAX_MOD_ASSET_BYTES } from "./mod-assets";
 import { DurableObject } from "cloudflare:workers";
 import { MarketplaceStore, handle, type MarketCall, type MarketResult } from "./marketplace/store";
 import { signText } from "./marketplace/signing";
@@ -241,18 +243,57 @@ export class Hub extends DurableObject<Env> {
     return this.ctx.storage.transactionSync(() => this.mods.publish(release));
   }
 
+  /** Validates official bytes and records CI approval before using the marketplace signer and durable outbox. */
+  async publishOfficialModRelease(release: ModRelease): Promise<boolean> {
+    const artifact = release.manifest.artifact;
+    const object = await this.env.MOD_ASSETS.get(modAssetKey(artifact.sha256));
+    if (!object) return false;
+    if (object.size !== artifact.size || object.size > MAX_MOD_ASSET_BYTES || object.customMetadata?.sha256 !== artifact.sha256) {
+      await object.body.cancel(); return false;
+    }
+    const bytes = new Uint8Array(await object.arrayBuffer());
+    const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(b => b.toString(16).padStart(2, "0")).join("");
+    if (hash !== artifact.sha256) return false;
+    let declarations: ReturnType<typeof readComponent>;
+    try { declarations = readComponent(bytes, MAX_MOD_ASSET_BYTES); } catch { return false; }
+    if (declarations.version && declarations.version !== release.manifest.version) return false;
+    const id = this.ctx.storage.transactionSync(() => this.mods.matches(release)
+      ? this.market.officialRelease(release, declarations.grants ?? {}, declarations.licenses, Date.now()) : null);
+    return id !== null && (this.market.officialSigned(id) || await this.publishMod(id) || this.market.officialSigned(id));
+  }
+
+  /** Public original official manifests plus unshadowed legacy rows, excluding revoked bytes. */
+  private officialCandidates(hash?: string): ModRelease[] {
+    return [...this.mods.all(hash).filter(r => !this.market.officialManaged(r.manifest.version)), ...this.market.officialReleases(hash)]
+      .filter(r => r.manifest.package === this.env.MOD_RELEASE_PACKAGE && r.manifest.host.repository === this.env.MOD_HOST_REPOSITORY
+        && !this.market.officialDigestPulled(r.manifest.artifact.sha256));
+  }
+
   /** Resolves only a newer mod compatible with the installed native commit. */
   modUpdate(query: ModUpdateQuery): ModRelease | null {
-    return this.mods.update({ ...query, package: this.env.MOD_RELEASE_PACKAGE ?? "", host_repository: this.env.MOD_HOST_REPOSITORY ?? "" });
+    return this.mods.update({ ...query, package: this.env.MOD_RELEASE_PACKAGE ?? "", host_repository: this.env.MOD_HOST_REPOSITORY ?? "" },
+      this.officialCandidates());
   }
 
   /** Resolves the newest official stable mod for a first installation. */
   latestModRelease(): ModRelease | null {
-    return this.mods.latest(this.env.MOD_RELEASE_PACKAGE ?? "", this.env.MOD_HOST_REPOSITORY ?? "");
+    return this.mods.latest(this.env.MOD_RELEASE_PACKAGE ?? "", this.env.MOD_HOST_REPOSITORY ?? "",
+      this.officialCandidates());
   }
 
   /** Returns the expected byte count only for an artifact belonging to a published release. */
-  modAssetSize(hash: string): number | null { return this.mods.assetSize(hash); }
+  modAssetSize(hash: string): number | null {
+    return this.officialCandidates(hash)[0]?.manifest.artifact.size ?? null;
+  }
+
+  /** Authorizes the marketplace's alternate URL for an official artifact stored once in MOD_ASSETS. */
+  officialModAssetSize(hash: string): number | null {
+    if (this.market.officialDigestPulled(hash)) return null;
+    return this.market.officialReleases(hash)[0]?.manifest.artifact.size ?? null;
+  }
+
+  /** Official catalogue state changes must be read live, including after all its versions are pulled. */
+  hasOfficialMod(): boolean { return this.market.hasOfficialListing(); }
 
   async latestRelease(channel: Channel): Promise<ReleaseRecord | null> {
     return (await this.ctx.storage.get<ReleaseRecord>(releaseKey(channel))) ?? null;
@@ -611,8 +652,13 @@ export class Hub extends DurableObject<Env> {
     const candidate = key ? this.market.publicationReady(id, Date.now()) : null;
     if (!key || !candidate) return false;
     try {
-      for (const objectKey of [`mods/${candidate.sha256}`, ...candidate.media.map(m => `media/${m.sha256}`)]) {
-        if (!await this.env.MOD_FILES.head(objectKey)) return false;
+      if (this.market.isOfficialVersion(id)) {
+        const object = await this.env.MOD_ASSETS.head(modAssetKey(candidate.sha256));
+        if (!object || object.size !== candidate.bytes || object.customMetadata?.sha256 !== candidate.sha256) return false;
+      } else {
+        for (const objectKey of [`mods/${candidate.sha256}`, ...candidate.media.map(m => `media/${m.sha256}`)]) {
+          if (!await this.env.MOD_FILES.head(objectKey)) return false;
+        }
       }
       const signature = await signText(key, candidate.statement);
       return this.market.publish(id, candidate.statement, signature, Date.now());

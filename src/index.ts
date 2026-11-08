@@ -4,8 +4,8 @@ import { Hono } from "hono";
 import { publicCache } from "./public-cache";
 import { downloadCount, DownloadSourceError } from "./download-count";
 import { count } from "./metrics";
-import { isModRelease, isModUpdateQuery, publisherAllows } from "./mod-releases";
-import { modAssetKey, uploadModAsset, downloadModAsset } from "./mod-assets";
+import { isModRelease, isModUpdateQuery, publisherAllows, type ModRelease } from "./mod-releases";
+import { uploadModAsset, downloadModAsset } from "./mod-assets";
 import { isModHostRevisionsRequest, isReleaseHookRequest } from "./protocol";
 import { hubFor } from "./routing";
 import { marketplaceRoutes } from "./marketplace/routes";
@@ -125,12 +125,7 @@ app.post("/v1/mod/releases", async (c) => {
   let body: unknown;
   try { body = JSON.parse(text); } catch { return c.body(null, 400); }
   if (!isModRelease(body)) return c.body(null, 400);
-  if (!publisherAllows(body, c.env.MOD_RELEASE_REPOSITORY, c.env.MOD_RELEASE_PACKAGE, c.env.MOD_HOST_REPOSITORY)) return c.body(null, 403);
-  const asset = body.manifest.artifact;
-  const object = await c.env.MOD_ASSETS.head(modAssetKey(asset.sha256));
-  if (!object || object.size !== asset.size || object.customMetadata?.sha256 !== asset.sha256) return c.body(null, 409);
-  body.download_url = `${c.env.MOD_DOWNLOAD_BASE_URL}/v1/mod/assets/${asset.sha256}`;
-  return c.body(null, await hubFor(c.env).publishModRelease(body) ? 204 : 409);
+  return c.body(null, await publishOfficial(body, c.env));
 });
 
 app.put("/v1/mod/assets/:hash", async (c) => {
@@ -141,7 +136,9 @@ app.put("/v1/mod/assets/:hash", async (c) => {
 app.get("/v1/mod/assets/:hash", async (c) => {
   const hash = c.req.param("hash");
   if (!/^[0-9a-f]{64}$/.test(hash)) return c.body(null, 404);
-  return downloadModAsset(hash, await hubFor(c.env).modAssetSize(hash), c.env.MOD_ASSETS);
+  const response = await downloadModAsset(hash, await hubFor(c.env).modAssetSize(hash), c.env.MOD_ASSETS);
+  response.headers.set("Cache-Control", "no-store");
+  return response;
 });
 
 app.get("/v1/mod/download", async (c) => {
@@ -178,6 +175,13 @@ app.post("/v1/releases", async (c) => {
   await hubFor(c.env).recordRelease(body.channel, body.version, body.build);
   return c.body(null, 204);
 });
+
+/** Publishes an official Mod CI manifest as a signed marketplace version of the official listing. */
+async function publishOfficial(body: ModRelease, env: Env): Promise<204 | 403 | 409> {
+  if (!publisherAllows(body, env.MOD_RELEASE_REPOSITORY, env.MOD_RELEASE_PACKAGE, env.MOD_HOST_REPOSITORY)) return 403;
+  body.download_url = `${env.MOD_DOWNLOAD_BASE_URL}/v1/mod/assets/${body.manifest.artifact.sha256}`;
+  return await hubFor(env).publishOfficialModRelease(body) ? 204 : 409;
+}
 
 app.route("/v1", marketplaceRoutes);
 

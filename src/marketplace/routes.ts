@@ -2,6 +2,7 @@ import { Hono, type Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { publicCache } from "../public-cache";
 import { hubFor } from "../routing";
+import { downloadModAsset } from "../mod-assets";
 import { MAX_COMPONENT_BYTES, readComponent } from "./component";
 import { clip, malformedText, type Grants } from "./policy";
 import { SignInFailure, authorizeUrl, randomToken, sha256Base64Url, xboxIdentity } from "./microsoft";
@@ -9,6 +10,7 @@ import { MAX_RETURN_TO, OAUTH_STATE_MS, openSignIn, sealSignIn } from "./oauth-s
 import { PLAYER_SESSION_MS, anonymousResult, type Caller, type MarketCall, type MarketResult, type MediaFile } from "./store";
 import { BodyLimitError, MAX_IMAGES, MAX_UPLOAD_BYTES, imageType, readLimited, sha256 } from "./uploads";
 import { isMarketplaceUpdateQuery } from "./updates";
+import { OFFICIAL_SLUG } from "./official";
 
 const SESSION_COOKIE = "cinnabar_session";
 const OAUTH_COOKIE = "cinnabar_oauth";
@@ -189,7 +191,10 @@ marketplaceRoutes.post("/auth/signout", async (c) => {
 
 marketplaceRoutes.get("/me", (c) => forward(c, { op: "me" }));
 marketplaceRoutes.get("/me/mods", (c) => forward(c, { op: "mine" }));
-marketplaceRoutes.get("/mods", publicCache(CATALOGUE_CACHE), async (c) => reply(c, await call(c, { op: "mods" }), CATALOGUE_CACHE));
+marketplaceRoutes.get("/mods", publicCache(CATALOGUE_CACHE), async (c) => {
+  const cache = await hubFor(c.env).hasOfficialMod() ? "no-store" : CATALOGUE_CACHE;
+  return reply(c, await call(c, { op: "mods" }), cache);
+});
 
 marketplaceRoutes.get("/mods/revocations", publicCache(REVOCATIONS_CACHE), async (c) => {
   const { body, signature } = await hubFor(c.env).modRevocations();
@@ -200,6 +205,14 @@ marketplaceRoutes.get("/mods/revocations", publicCache(REVOCATIONS_CACHE), async
 
 marketplaceRoutes.get("/mods/assets/:sha256", async (c) => {
   const hash = c.req.param("sha256");
+  if (SHA256.test(hash)) {
+    const size = await hubFor(c.env).officialModAssetSize(hash);
+    if (size !== null) {
+      const response = await downloadModAsset(hash, size, c.env.MOD_ASSETS);
+      response.headers.set("Cache-Control", "no-store");
+      return response;
+    }
+  }
   const object = SHA256.test(hash) && await publicFile(c, { op: "asset", sha256: hash }) ? await c.env.MOD_FILES.get(`mods/${hash}`) : null;
   if (!object) return c.json({ error: "Not found." }, 404);
   return c.body(object.body, 200, { "Content-Type": "application/wasm", "Cache-Control": "no-store", ETag: `"${hash}"`,
@@ -212,9 +225,13 @@ marketplaceRoutes.get("/mods/media/:sha256", async c => {
   return c.body(object.body, 200, { "Content-Type": object.httpMetadata?.contentType ?? "application/octet-stream",
     "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": IMAGE_CSP });
 });
-marketplaceRoutes.get("/mods/:slug", publicCache(CATALOGUE_CACHE), async (c) => {
+marketplaceRoutes.get("/mods/:slug", async (c, next) => {
+  // Official pages must observe pulls on the next request, including cached missing pages before first publication.
+  if (c.req.param("slug") === OFFICIAL_SLUG) { c.header("Cache-Control", "no-store"); await next(); }
+  else await publicCache(CATALOGUE_CACHE)(c, next);
+}, async (c) => {
   const result = await call(c, { op: "mod", slug: c.req.param("slug") });
-  return reply(c, result, result.status === 404 ? MISSING_LISTING_CACHE : CATALOGUE_CACHE);
+  return reply(c, result, c.req.param("slug") === OFFICIAL_SLUG ? "no-store" : result.status === 404 ? MISSING_LISTING_CACHE : CATALOGUE_CACHE);
 });
 marketplaceRoutes.get("/mods/:slug/releases/:version/:sha256", async c => {
   const hash = c.req.param("sha256");
@@ -320,6 +337,13 @@ marketplaceRoutes.get("/staff/versions/:id/file", async (c) => {
   if (versionId === null) return reply(c, { status: 404, body: { error: "No such version." } });
   const version = await call(c, { op: "version", id: versionId, ...(await caller(c)) });
   if (version.status !== 200) return reply(c, version);
+  const details = version.body as { slug: string; sha256: string; bytes: number; pulled: boolean; file_withdrawn?: boolean };
+  if (details.slug === OFFICIAL_SLUG) {
+    if (details.pulled || details.file_withdrawn) return c.notFound();
+    const response = await downloadModAsset(details.sha256, details.bytes, c.env.MOD_ASSETS);
+    response.headers.set("Cache-Control", "private, no-store");
+    return response;
+  }
   return stream(c, `mods/${(version.body as { sha256: string }).sha256}`, { "Content-Type": "application/wasm",
     "Cache-Control": "private, no-store", "Content-Disposition": "attachment", "X-Content-Type-Options": "nosniff" });
 });

@@ -19,7 +19,7 @@ messages against it.
 | `POST /v1/mod/host-revisions` | Requires `RELEASE_HOOK_SECRET`. Body `{"channel","mod_api_revisions"}`, sent after each published host build, replaces that channel's supported mod API revisions, even for a re-run of an older build. |
 | `POST /v1/mod/releases` | Requires a dedicated `MOD_RELEASE_HOOK_SECRET` bearer credential; the native release-hook credential is rejected. Publishes `{manifest, download_url}` for an immutable stable mod version. Identical retries return 204; changed metadata for that package/version returns 409. |
 | `PUT /v1/mod/assets/:sha256` | Dedicated mod-publisher bearer credential required. Verifies the component header, SHA-256 and 32 MiB limit before storing it under its content hash. Uploading alone does not publish it. |
-| `GET /v1/mod/assets/:sha256` | Anonymous immutable WASM download, available only after metadata publication. Never exposes the private source repository or an upload credential. |
+| `GET /v1/mod/assets/:sha256` | Anonymous WASM download, available only after metadata publication and withdrawn on a marketplace pull. Responses are not cached. Never exposes the private source repository or an upload credential. |
 | `GET /v1/mod/download` | Anonymous first-install download of the newest published stable mod for the configured package and host repository. No hash or installed version required. Streams the verified WASM with its download filename; returns 404 if unavailable. Responses are not cached. Older hosts should use the compatibility-aware update route. |
 | `GET /v1/mod/update` | Requires full `host_revision` and comma-separated supported `api_revisions`, installed `current_version` and full `current_revision`; the official package and host repository are fixed server-side. Returns 200 with the newest newer compatible stable release or 204 with no body. Invalid or missing identities return 400. Responses are not cached. |
 | `GET /v1/connect` | WebSocket. The client authenticates with a Minecraft multiplayer token plus an ES384 proof of its key, then can toggle visibility, look up which XUIDs or UUIDs recently used Cinnabar, and receives release pushes. |
@@ -35,7 +35,7 @@ Public GET responses use the Cloudflare Cache API with lifetimes declared beside
 | `/v1/presence/history` | 60 seconds per supported range |
 | `/v1/cosmetics/catalog` | 300 seconds, with `If-None-Match` revalidation on cache hits and misses |
 | `/v1/cosmetics/assets/:hash` | One year, immutable; static files when mirrored |
-| `/v1/mods`, `/v1/mods/:slug` | 30 seconds; 10 seconds for a missing listing |
+| `/v1/mods`, `/v1/mods/:slug` | 30 seconds; 10 seconds for a missing listing. Official detail pages and catalogue responses after official publication use `no-store`. |
 | `/v1/mods/revocations` | 60 seconds |
 
 The cache is local to each Cloudflare location. Public routes ignore unrelated query parameters and
@@ -132,7 +132,9 @@ Acts and Network listings must link their GitHub source.
   `{approved_at, approvers, bytes, grants, sha256, slug, version, metadata, media, policy, client_revision, scan_job, publication, api_revision}`,
   returned as `release` on `GET /v1/mods/:slug`. `metadata` is the immutable listing snapshot, `media` the gallery
   descriptors, `policy` and `client_revision` the scan policy and pinned client revision, `scan_job` the scan job ID
-  and `publication` `manual` or `automatic`. `api_revision` is the last (newest) stable API revision in the pinned
+  and `publication` `manual`, `automatic` or `official`. Official statements retain the manifest’s host and API
+  revisions and identify their separate authenticated-hook validation policy. For creator uploads, `api_revision`
+  is the last (newest) stable API revision in the pinned
   client's `crates/mod-api/compatibility-revisions.json`, derived by `pnpm source:fetch` and recorded per version
   at submission and scan completion. Older versions without this stored revision retain their original statements
   and are excluded from automatic update selection.
@@ -142,8 +144,11 @@ Acts and Network listings must link their GitHub source.
   full lowercase 40-hex revisions). The host revision is required identity, not an equality constraint on the scan
   client's pin. No match returns 204, malformed queries 400, unknown/hidden listings or suspended creators 404.
   Pulled, unsigned or incompletely scanned releases never match. Responses use `Cache-Control: no-store` so pulls
-  and visibility changes apply on the next check; there is no compatibility fallback. The official `/v1/mod/update`
-  endpoint keeps its existing contract.
+  and visibility changes apply on the next check; there is no compatibility fallback. The Official Mod is the
+  reserved `cinnabar-mod` listing owned by `system:official`. Its existing mod release hook now signs marketplace
+  versions; shipped clients keep their existing `/v1/mod/update`, `/v1/mod/download` and digest URLs with their
+  original response formats. Legacy catalogue releases remain available for older API generations.
+  See [official publication](docs/marketplace.md#official-mod-publication-and-shipped-clients).
 - Pulled versions appear in `GET /v1/mods/revocations`, signed in `X-Cinnabar-Signature`.
 
 **Send to game.**

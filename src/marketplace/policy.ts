@@ -1,4 +1,5 @@
 import contract from "../../.generated/contract.json";
+import { OFFICIAL_SLUG } from "./official";
 
 /** Reach levels, from least to most of a player's game a mod can touch: looks, reads, watches, acts and network. */
 export type Reach = 0 | 1 | 2 | 3 | 4;
@@ -155,10 +156,10 @@ export function canSetRole(actor: Actor | null, target: Actor, role: Role): Verd
 }
 
 /**
- * Fixed path segments under `/v1/mods/`. A listing with one of these slugs would have its public page shadowed by
- * the fixed route, so listing validation refuses them; a test checks this list against the registered routes.
+ * Fixed route segments under `/v1/mods/` and the system-owned official listing. Creator validation refuses both;
+ * a test also checks the fixed names against the registered routes so no creator page can be shadowed.
  */
-export const RESERVED_SLUGS: readonly string[] = ["revocations", "assets", "media"];
+export const RESERVED_SLUGS: readonly string[] = ["revocations", "assets", "media", OFFICIAL_SLUG];
 
 export interface ListingFields {
   slug: string;
