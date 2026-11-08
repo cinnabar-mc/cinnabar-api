@@ -8,7 +8,7 @@ export const USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo";
 export function authorizeUrl(clientId: string, redirectUri: string, state: string, challenge: string): string {
   const url = new URL(AUTHORIZE_URL);
   url.search = new URLSearchParams({ client_id: clientId, response_type: "code", redirect_uri: redirectUri,
-    scope: "openid email profile", state, code_challenge: challenge, code_challenge_method: "S256", prompt: "select_account" }).toString();
+    scope: "openid email", state, code_challenge: challenge, code_challenge_method: "S256", prompt: "select_account" }).toString();
   return url.toString();
 }
 
@@ -30,11 +30,10 @@ export async function googleIdentity(options: {
   const response = await fetch(USERINFO_URL, { headers: { Authorization: `Bearer ${accessToken}` },
     redirect: "manual", signal: AbortSignal.timeout(10_000) });
   if (!response.ok) throw new Error(`Google userinfo failed: ${response.status} ${await googleError(response)}`);
-  const { sub, email, email_verified, name } = await response.json() as Record<string, unknown>;
+  const { sub, email, email_verified } = await response.json() as Record<string, unknown>;
   if (typeof sub !== "string" || !sub || sub.length > 255 || typeof email !== "string" || !email || email.length > 320
     || typeof email_verified !== "boolean") throw new Error("Invalid Google identity");
-  return { provider: "google", subject: sub, email: email.trim().toLowerCase(), email_verified,
-    display_name: typeof name === "string" && name.trim() ? name.trim().toWellFormed().slice(0, 128) : "Cinnabar player" };
+  return { provider: "google", subject: sub, email: email.trim().toLowerCase(), email_verified };
 }
 
 /** Google's short OAuth error code from a failed response, for logs; never the body, tokens or codes. */

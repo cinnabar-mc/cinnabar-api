@@ -16,7 +16,6 @@ export interface ProviderIdentity {
   subject: string;
   email: string;
   email_verified: boolean;
-  display_name: string;
 }
 
 /** A 40-bit, eight-character human code. The 32-character alphabet omits ambiguous I, O, 0 and 1. */
@@ -35,4 +34,13 @@ export function normalizeLinkCode(code: string): string {
 export function equalHash(a: string, b: string): boolean {
   if (a.length !== 43 || b.length !== 43) return false;
   return crypto.subtle.timingSafeEqual(new TextEncoder().encode(a), new TextEncoder().encode(b));
+}
+
+export const USERNAME_RULES = "Use 3–16 ASCII letters, digits or underscores. Staff and project names are reserved.";
+const RESERVED_USERNAMES = new Set(["cinnabar", "admin", "administrator", "moderator", "mod", "staff", "official",
+  "support", "system", "root", "owner", "null", "undefined"]);
+
+/** Validates a case-preserving ASCII handle, rejecting reserved names case-insensitively. */
+export function validUsername(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_]{3,16}$/.test(value) && !RESERVED_USERNAMES.has(value.toLowerCase());
 }

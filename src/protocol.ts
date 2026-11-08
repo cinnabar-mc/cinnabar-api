@@ -120,7 +120,7 @@ export type ServerMessage =
   | { type: "cosmetic_ownership"; owned_cosmetics: string[] }
   | ({ type: "welcome"; xuid: string; loadout_revision?: number; owned_cosmetics?: string[]; mod_library?: ModLibraryEntry[] }
     & WelcomeParameters)
-  | ({ type: "account_link_result" } & ({ ok: true; account: { display_name: string } }
+  | ({ type: "account_link_result" } & ({ ok: true; account: { username: string | null } }
     | { ok: false; error: "invalid" | "expired" | "already_linked" | "rate_limited" }))
   | { type: "mod_library"; mods: ModLibraryEntry[] }
   | { type: "error"; code: "unauthorized" | "invalid_loadout" }

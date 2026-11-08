@@ -86,7 +86,7 @@ mod pages, files and revocations are public.
 
 **Cinnabar accounts use Google sign-in.**
 - `GET /v1/auth/google/start?return_to=` starts authorization code sign-in with PKCE and scopes
-  `openid email profile`. Return URLs must belong to `MARKETPLACE_ORIGIN`.
+  `openid email`. Return URLs must belong to `MARKETPLACE_ORIGIN`.
 - The state, provider, verifier and return address travel in an encrypted ten-minute
   `__Host-cinnabar_oauth` cookie, so starting sign-in writes nothing to the Hub.
 - `GET /v1/auth/google/callback` exchanges the code server-side and reads identity claims from
@@ -100,8 +100,11 @@ mod pages, files and revocations are public.
 - Writes need the website `Origin` and the session's `X-Cinnabar-CSRF` from `GET /v1/me`.
   Anonymous session routes are answered by the Worker without reaching the Hub.
 - Sessions last 30 days, or 12 hours for staff. A role change needs a sign-in from the last 10 minutes.
-- `GET /v1/me` returns `{account: {id, display_name, email, role, suspended, xbox: {xuid, gamertag} | null} | null,
+- `GET /v1/me` returns `{account: {id, username: string | null, email, role, suspended, xbox: {xuid, gamertag} | null} | null,
   library, csrf, game_online}`. Marketplace roles, submissions and libraries belong to account IDs.
+- `POST /v1/me/username` (session + CSRF) chooses a username exactly once and returns the updated `/v1/me` body.
+  Handles use 3–16 ASCII letters, digits or underscores, preserve case and are unique case-insensitively.
+  Staff/project names are reserved; attempts are limited to five per account per ten minutes. Google names are never stored.
 - Link Xbox through the game: `POST /v1/me/xbox/link-code` (session + CSRF) returns `{code, expires_in: 600}`.
   Enter the code in Cinnabar; its authenticated game socket sends `{type: "account_link", code}`.
   The API uses the socket's signed Xbox identity, replies with `account_link_result` and pushes the library.

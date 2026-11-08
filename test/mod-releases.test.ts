@@ -68,7 +68,7 @@ describe("revision-aware mod releases", () => {
   });
 
   it("refuses official-slug submissions from ordinary creators before publication", async () => {
-    await market({ op: "signin", identity: { provider: "google", subject: "2535400000008000", display_name: "Creator", email: "2535400000008000@test.invalid", email_verified: true }, newSession: "creator-session", newCsrf: "creator-csrf" });
+    await market({ op: "signin", identity: { provider: "google", subject: "2535400000008000", email: "2535400000008000@test.invalid", email_verified: true }, newSession: "creator-session", newCsrf: "creator-csrf" });
     const response = await market({ op: "submit", session: "creator-session", csrf: "creator-csrf",
       body: { slug: "cinnabar-mod", name: "Impersonator", summary: "An impersonation attempt.", version: "1.0.0" },
       file: { sha256: HASH, bytes: BYTES.length, grants: {}, media: [] } });
@@ -171,7 +171,7 @@ describe("revision-aware mod releases", () => {
       await response.json();
     }
     const listing = (await market({ op: "mod", slug: "cinnabar-mod" })).body as { version_id: string };
-    await market({ op: "signin", identity: { provider: "google", subject: "2535400000009001", display_name: "Owner", email: "2535400000009001@test.invalid", email_verified: true }, newSession: "owner-session", newCsrf: "owner-csrf" });
+    await market({ op: "signin", identity: { provider: "google", subject: "2535400000009001", email: "2535400000009001@test.invalid", email_verified: true }, newSession: "owner-session", newCsrf: "owner-csrf" });
     expect((await market({ op: "pull", session: "owner-session", csrf: "owner-csrf", id: Number(listing.version_id), body: { reason: "Withdraw test release" } })).status).toBe(200);
     expect((await update()).status).toBe(204);
     expect(await hub().latestModRelease()).toBeNull();
@@ -231,7 +231,7 @@ describe("revision-aware mod releases", () => {
       "SELECT id FROM mod_versions WHERE slug = 'cinnabar-mod' AND version = '1.0.0'").one().id);
     const latest = (await market({ op: "mod", slug: "cinnabar-mod" })).body as { version_id: string };
     const session = await sha256Base64Url("owner-token");
-    await market({ op: "signin", identity: { provider: "google", subject: "2535400000009001", display_name: "Owner", email: "2535400000009001@test.invalid", email_verified: true }, newSession: session, newCsrf: "owner-csrf" });
+    await market({ op: "signin", identity: { provider: "google", subject: "2535400000009001", email: "2535400000009001@test.invalid", email_verified: true }, newSession: session, newCsrf: "owner-csrf" });
     const staffFile = () => exports.default.fetch(`https://api.test/v1/staff/versions/${latest.version_id}/file`,
       { headers: { Cookie: "__Host-cinnabar_session=owner-token" } });
     const inspected = await staffFile();
@@ -351,7 +351,7 @@ describe("revision-aware mod releases", () => {
     }
     // The caller's own revisions still control updates, independently of channel reports.
     expect(await (await update({ api_revisions: nightlyApi })).json()).toEqual(served(releases[3]!));
-    await market({ op: "signin", identity: { provider: "google", subject: "2535400000009001", display_name: "Owner", email: "2535400000009001@test.invalid", email_verified: true }, newSession: "owner-session", newCsrf: "owner-csrf" });
+    await market({ op: "signin", identity: { provider: "google", subject: "2535400000009001", email: "2535400000009001@test.invalid", email_verified: true }, newSession: "owner-session", newCsrf: "owner-csrf" });
     for (const version of ["1.10.0", "2.0.0"]) {
       const id = await runInDurableObject(hub(), (_, state) => state.storage.sql.exec<{ id: number }>(
         "SELECT id FROM mod_versions WHERE slug = 'cinnabar-mod' AND version = ?", version).one().id);

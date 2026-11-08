@@ -1526,12 +1526,16 @@
             },
             "account": {
               "type": "object",
+              "additionalProperties": false,
               "required": [
-                "display_name"
+                "username"
               ],
               "properties": {
-                "display_name": {
-                  "type": "string"
+                "username": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               }
             }
@@ -1565,9 +1569,10 @@
     },
     "CinnabarAccount": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "id",
-        "display_name",
+        "username",
         "email",
         "role",
         "suspended",
@@ -1577,8 +1582,11 @@
         "id": {
           "type": "string"
         },
-        "display_name": {
-          "type": "string"
+        "username": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "email": {
           "type": "string"
@@ -1619,7 +1627,7 @@
       }
     },
     "MeResponse": {
-      "description": "GET /v1/me. Account, selections and CSRF belong to the Cinnabar account; game_online requires a linked Xbox with a live authenticated socket.",
+      "description": "GET /v1/me and successful POST /v1/me/username. Account, selections and CSRF belong to the Cinnabar account; game_online requires a linked Xbox with a live authenticated socket.",
       "type": "object",
       "required": [
         "account",
