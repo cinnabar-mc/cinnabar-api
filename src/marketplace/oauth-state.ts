@@ -1,6 +1,6 @@
 import { decodeBase64, encodeBase64Url } from "../identity";
 
-/** How long a browser may take between starting a Microsoft sign-in and returning to the callback. */
+/** How long a browser may take between starting a provider sign-in and returning to the callback. */
 export const OAUTH_STATE_MS = 10 * 60_000;
 /** Longest `return_to` carried through sign-in; longer addresses fall back to the marketplace page so the cookie fits. */
 export const MAX_RETURN_TO = 2048;
@@ -8,8 +8,9 @@ export const MAX_RETURN_TO = 2048;
 const PURPOSE = new TextEncoder().encode("cinnabar oauth state v1");
 const IV_BYTES = 12;
 
-/** A pending Microsoft sign-in: the OAuth `state`, its PKCE verifier and where to send the browser afterwards. */
+/** A pending provider sign-in: the OAuth `state`, its PKCE verifier and where to send the browser afterwards. */
 export interface PendingSignIn {
+  provider: string;
   state: string;
   verifier: string;
   returnTo: string;
@@ -37,7 +38,7 @@ function stateKey(secret: string): Promise<CryptoKey> {
  */
 export async function sealSignIn(secret: string, pending: PendingSignIn, now: number): Promise<string> {
   const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
-  const plain = new TextEncoder().encode(JSON.stringify({ s: pending.state, v: pending.verifier, r: pending.returnTo, e: now + OAUTH_STATE_MS }));
+  const plain = new TextEncoder().encode(JSON.stringify({ p: pending.provider, s: pending.state, v: pending.verifier, r: pending.returnTo, e: now + OAUTH_STATE_MS }));
   const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: PURPOSE }, await stateKey(secret), plain));
   const out = new Uint8Array(IV_BYTES + sealed.length);
   out.set(iv);
@@ -60,7 +61,7 @@ export async function openSignIn(secret: string, cookie: string | undefined, now
   } catch {
     return null;
   }
-  const { s, v, r, e } = (value ?? {}) as Record<string, unknown>;
-  if (typeof s !== "string" || typeof v !== "string" || typeof r !== "string" || typeof e !== "number") return null;
-  return e > now ? { state: s, verifier: v, returnTo: r } : "expired";
+  const { p, s, v, r, e } = (value ?? {}) as Record<string, unknown>;
+  if (typeof p !== "string" || typeof s !== "string" || typeof v !== "string" || typeof r !== "string" || typeof e !== "number") return null;
+  return e > now ? { provider: p, state: s, verifier: v, returnTo: r } : "expired";
 }

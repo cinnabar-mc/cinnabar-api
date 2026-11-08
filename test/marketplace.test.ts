@@ -4,7 +4,8 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Hub } from "../src/hub";
 import contract from "../.generated/contract.json";
 import { MAX_EXECUTABLE_BYTES, readComponent } from "../src/marketplace/component";
-import { TOKEN_URL, XBOX_USER_URL, XSTS_URL } from "../src/marketplace/microsoft";
+import { TOKEN_URL, USERINFO_URL } from "../src/marketplace/google";
+import { normalizeLinkCode, sha256Base64Url } from "../src/marketplace/auth";
 import { approvalRule, canApprove, canSetRole, grantDiff, reachOf, validateListing, type Actor } from "../src/marketplace/policy";
 import { REVOCATION_BUDGET_BYTES, REVOCATION_MEMO_MS } from "../src/marketplace/revocations";
 import { marketplaceRoutes } from "../src/marketplace/routes";
@@ -20,11 +21,8 @@ const OWNER = "2535400000009001";
 const PUBLIC_KEY = "MCowBQYDK2VwAyEAlSb5YEqBeXmlmyc5Xg5zqHKLWklg3zlZbCj4GAVu/TQ=";
 const open: Client[] = [];
 
-/**
- * Fakes Microsoft and Xbox: the authorization code is `xuid:gamertag`, or `xerr:<code>` for an XSTS refusal.
- * Install after the fake issuer; other requests go to its implementation.
- */
-function installFakeXbox(): void {
+/** Fakes Google using synthetic subject:name codes, while retaining the signed game issuer mock. */
+function installFakeGoogle(): void {
   const spy = vi.mocked(globalThis.fetch);
   const previous = spy.getMockImplementation()!;
   spy.mockImplementation(async (input, init) => {
@@ -32,17 +30,13 @@ function installFakeXbox(): void {
     if (url === TOKEN_URL) {
       const form = new URLSearchParams(String(init?.body));
       expect(form.get("code_verifier")).toMatch(/^[A-Za-z0-9_-]{43}$/);
-      return Response.json({ access_token: `ms:${form.get("code")}` });
+      const code = form.get("code")!;
+      return code.startsWith("bad:") ? Response.json({}, { status: 400 }) : Response.json({ access_token: code });
     }
-    if (url === XBOX_USER_URL) {
-      const ticket = JSON.parse(String(init?.body)).Properties.RpsTicket as string;
-      return Response.json({ Token: ticket.replace("d=ms:", "") });
-    }
-    if (url === XSTS_URL) {
-      const code = JSON.parse(String(init?.body)).Properties.UserTokens[0] as string;
-      const [xuid, gamertag] = code.split(":");
-      if (xuid === "xerr") return Response.json({ XErr: Number(gamertag) }, { status: 401 });
-      return Response.json({ DisplayClaims: { xui: [{ xid: xuid, gtg: gamertag, uhs: "h" }] } });
+    if (url === USERINFO_URL) {
+      const code = new Headers(init?.headers).get("Authorization")!.slice(7);
+      const [sub, name] = code.split(":");
+      return Response.json({ sub, name, email: `${sub}@test.invalid`, email_verified: true });
     }
     return previous(input, init);
   });
@@ -50,7 +44,7 @@ function installFakeXbox(): void {
 
 beforeAll(() => {
   installFakeIssuer();
-  installFakeXbox();
+  installFakeGoogle();
   // These tests observe current Hub state after each change; test/edge-cache.test.ts covers the public cache path.
   vi.spyOn(caches, "open").mockRejectedValue(new Error("Edge cache disabled for marketplace state tests"));
 });
@@ -73,14 +67,14 @@ function cookieValue(response: Response, name: string): string {
   return header.split(";")[0]!.slice(name.length + 1);
 }
 
-/** Runs the whole Microsoft sign-in redirect dance for an Xbox identity and returns the signed-in browser. */
-async function signIn(xuid: string, gamertag: string, returnTo = `${SITE}/mods/#/staff`): Promise<Browser> {
-  const start = await api(`/auth/microsoft/start?return_to=${encodeURIComponent(returnTo)}`);
+/** Runs the whole Google sign-in redirect dance for an Xbox identity and returns the signed-in browser. */
+async function signIn(xuid: string, display_name: string, returnTo = `${SITE}/mods/#/staff`): Promise<Browser> {
+  const start = await api(`/auth/google/start?return_to=${encodeURIComponent(returnTo)}`);
   expect(start.status).toBe(302);
   const consent = new URL(start.headers.get("Location")!);
   const state = consent.searchParams.get("state")!;
   const oauth = cookieValue(start, "__Host-cinnabar_oauth");
-  const callback = await api(`/auth/microsoft/callback?code=${encodeURIComponent(`${xuid}:${gamertag}`)}&state=${state}`, {
+  const callback = await api(`/auth/google/callback?code=${encodeURIComponent(`${xuid}:${display_name}`)}&state=${state}`, {
     headers: { Cookie: `__Host-cinnabar_oauth=${oauth}` },
   });
   expect(callback.status).toBe(302);
@@ -95,6 +89,18 @@ async function signIn(xuid: string, gamertag: string, returnTo = `${SITE}/mods/#
       headers: { Cookie: cookie, Origin: SITE, "X-Cinnabar-CSRF": me.csrf, "Content-Type": "application/json" },
     }),
   };
+  // Existing behavior fixtures have an explicitly linked synthetic Xbox identity; account-link tests exercise
+  // the full authenticated game WebSocket exchange separately.
+  const account = (await (await browser.get("/me")).json() as { account: { xbox: unknown } }).account;
+  if (!account.xbox) {
+    const issued = await browser.post("/me/xbox/link-code");
+    const { code } = await issued.json() as { code: string };
+    const hash = await sha256Base64Url(normalizeLinkCode(code));
+    await runInDurableObject(hub(), (_: Hub, state) => {
+      const store = new MarketplaceStore(state.storage.sql, new Set([`${OWNER}@test.invalid`]));
+      expect(store.linkXbox(hash, xuid, display_name, Date.now()).ok).toBe(true);
+    });
+  }
   return browser;
 }
 
@@ -158,14 +164,14 @@ async function scanOne(extra: object = {}): Promise<Response> {
   return response;
 }
 
-/** The owner promotes `gamertag` to `role` (owners manage admins; admins manage moderators). */
-async function promote(by: Browser, gamertag: string, role: string): Promise<void> {
-  const res = await by.post("/staff/people/role", { gamertag, role, reason: "Test staff" });
+/** The owner promotes `display_name` to `role` (owners manage admins; admins manage moderators). */
+async function promote(by: Browser, display_name: string, role: string): Promise<void> {
+  const res = await by.post("/staff/people/role", { display_name, role, reason: "Test staff" });
   expect(res.status, await res.clone().text()).toBe(200);
 }
 
 describe("marketplace policy", () => {
-  const staff = (xuid: string, role: Actor["role"]): Actor => ({ xuid, role, suspended: false });
+  const staff = (id: string, role: Actor["role"]): Actor => ({ id, role, suspended: false });
 
   it("files mods by their furthest capability and gates approvals by reach", () => {
     expect(reachOf({ hud: true })).toBe(0);
@@ -176,7 +182,7 @@ describe("marketplace policy", () => {
     expect(reachOf({ commands: [] })).toBe(0);
     expect(() => reachOf({ fly: true })).toThrow(/Unknown capability/);
     expect(approvalRule(4)).toEqual({ count: 2, admin: true });
-    const network = { creator: "1", status: "submitted" as const, reach: 4 as const, approvals: [{ xuid: "2", admin: false }] };
+    const network = { creator: "1", status: "submitted" as const, reach: 4 as const, approvals: [{ id: "2", admin: false }] };
     expect(canApprove(staff("3", "moderator"), network)).toEqual({ ok: false, reason: "Network mods need an admin's approval." });
     expect(canApprove(staff("4", "admin"), network).ok).toBe(true);
     expect(canApprove(staff("1", "owner"), { ...network, approvals: [] })).toEqual({ ok: false, reason: "You can't review your own mod." });
@@ -211,36 +217,36 @@ describe("marketplace policy", () => {
   });
 });
 
-describe("Microsoft sign-in", () => {
-  it("starts with PKCE and a browser-bound state, then signs the Xbox identity in", async () => {
-    const start = await api(`/auth/microsoft/start?return_to=${encodeURIComponent("https://evil.test/")}`);
+describe("Google sign-in", () => {
+  it("starts with PKCE and a browser-bound state, then signs a Cinnabar account in", async () => {
+    const start = await api(`/auth/google/start?return_to=${encodeURIComponent("https://evil.test/")}`);
     const consent = new URL(start.headers.get("Location")!);
-    expect(consent.origin + consent.pathname).toBe("https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize");
-    expect(consent.searchParams.get("scope")).toBe("XboxLive.signin");
+    expect(consent.origin + consent.pathname).toBe("https://accounts.google.com/o/oauth2/v2/auth");
+    expect(consent.searchParams.get("scope")).toBe("openid email profile");
     expect(consent.searchParams.get("code_challenge_method")).toBe("S256");
-    expect(consent.searchParams.get("redirect_uri")).toBe("https://api.test/v1/auth/microsoft/callback");
+    expect(consent.searchParams.get("redirect_uri")).toBe("https://api.test/v1/auth/google/callback");
     expect(start.headers.getSetCookie()[0]).toMatch(/^__Host-cinnabar_oauth=.+; Max-Age=600; Path=\/; HttpOnly; Secure; SameSite=Lax$/);
 
     const browser = await signIn("2535400000001001", "Steve");
-    const me = await (await browser.get("/me")).json() as { account: { gamertag: string; role: string }; game_online: boolean };
-    expect(me.account).toMatchObject({ gamertag: "Steve", role: "player" });
+    const me = await (await browser.get("/me")).json() as { account: { display_name: string; role: string }; game_online: boolean };
+    expect(me.account).toMatchObject({ display_name: "Steve", role: "player" });
     expect(me.game_online).toBe(false);
   });
 
-  it("refuses a callback that didn't start in this browser and explains Xbox refusals", async () => {
-    const start = await api("/auth/microsoft/start");
+  it("refuses a callback that didn't start in this browser and handles Google exchange failures", async () => {
+    const start = await api("/auth/google/start");
     const state = new URL(start.headers.get("Location")!).searchParams.get("state")!;
-    expect((await api(`/auth/microsoft/callback?code=1:x&state=${state}`)).status).toBe(400);
+    expect((await api(`/auth/google/callback?code=1:x&state=${state}`)).status).toBe(302);
 
-    const again = await api("/auth/microsoft/start");
+    const again = await api("/auth/google/start");
     const next = new URL(again.headers.get("Location")!).searchParams.get("state")!;
     const oauth = cookieValue(again, "__Host-cinnabar_oauth");
-    const child = await api(`/auth/microsoft/callback?code=xerr:2148916238&state=${next}`, { headers: { Cookie: `__Host-cinnabar_oauth=${oauth}` } });
-    expect(child.headers.get("Location")).toBe(`${SITE}/mods/?signin_error=child_account`);
+    const child = await api(`/auth/google/callback?code=bad:denied&state=${next}`, { headers: { Cookie: `__Host-cinnabar_oauth=${oauth}` } });
+    expect(child.headers.get("Location")).toBe(`${SITE}/mods/?signin_error=failed`);
     expect(child.headers.getSetCookie().some((c) => c.startsWith("__Host-cinnabar_session="))).toBe(false);
     // The state is single-use: the callback clears it, so the browser can't present it again.
     expect(child.headers.getSetCookie()).toContainEqual(expect.stringMatching(/^__Host-cinnabar_oauth=; Max-Age=0; Path=\/; Secure/));
-    expect((await api(`/auth/microsoft/callback?code=1:x&state=${next}`)).status).toBe(400);
+    expect((await api(`/auth/google/callback?code=1:x&state=${next}`)).status).toBe(302);
   });
 
   it("allows credentials only for the website and checks CSRF on every write", async () => {
@@ -373,18 +379,18 @@ describe("submission, review and delivery", () => {
     const admin = await signIn("2535400000005001", "AdminTwo");
     const target = await signIn("2535400000005002", "Helper");
     await promote(owner, "AdminTwo", "admin");
-    expect((await admin.post("/staff/people/role", { gamertag: "Helper", role: "admin", reason: "x" })).status).toBe(403);
-    expect((await admin.post("/staff/people/role", { gamertag: "OreKeeper", role: "player", reason: "x" })).status).toBe(403);
-    expect((await admin.post("/staff/people/role", { gamertag: "helper", role: "moderator", reason: "" })).status).toBe(400);
+    expect((await admin.post("/staff/people/role", { display_name: "Helper", role: "admin", reason: "x" })).status).toBe(403);
+    expect((await admin.post("/staff/people/role", { display_name: "OreKeeper", role: "player", reason: "x" })).status).toBe(403);
+    expect((await admin.post("/staff/people/role", { display_name: "helper", role: "moderator", reason: "" })).status).toBe(400);
     await promote(admin, "helper", "moderator");
     expect((await target.get("/staff/queue")).status).toBe(200);
-    const people = await (await admin.get("/staff/people")).json() as { gamertag: string; role: string }[];
-    expect(people.map((p) => [p.gamertag, p.role])).toEqual(expect.arrayContaining([["OreKeeper", "owner"], ["Helper", "moderator"]]));
+    const people = await (await admin.get("/staff/people")).json() as { display_name: string; role: string }[];
+    expect(people.map((p) => [p.display_name, p.role])).toEqual(expect.arrayContaining([["OreKeeper", "owner"], ["Helper", "moderator"]]));
 
     await runInDurableObject(hub(), (_: Hub, state) => {
-      state.storage.sql.exec("UPDATE web_sessions SET created_at = created_at - 3600000 WHERE xuid = ?", "2535400000005001");
+      state.storage.sql.exec("UPDATE web_sessions SET created_at = created_at - 3600000 WHERE account_id = (SELECT account_id FROM identities WHERE provider = 'google' AND subject = ?)", "2535400000005001");
     });
-    const stale = await admin.post("/staff/people/role", { gamertag: "Helper", role: "player", reason: "Stepped down" });
+    const stale = await admin.post("/staff/people/role", { display_name: "Helper", role: "player", reason: "Stepped down" });
     expect(stale.status).toBe(401);
     await promote(await signIn("2535400000005001", "AdminTwo"), "Helper", "player");
     expect((await target.get("/staff/queue")).status).toBe(401);
@@ -396,12 +402,12 @@ describe("upload and publication pipeline", () => {
   /** Create an explicitly established project with one human-approved baseline. */
   async function established(slug: string, version = "1.0.0") {
     const owner = await signIn(OWNER, "OreKeeper");
-    const gamertag = `Creator${String(++creatorId).slice(-4)}`;
-    const creator = await signIn(String(creatorId), gamertag);
+    const display_name = `Creator${String(++creatorId).slice(-4)}`;
+    const creator = await signIn(String(creatorId), display_name);
     const initial = await (await submit(creator, slug, version, { hud: true })).json() as { id: string };
     expect((await owner.post(`/staff/versions/${initial.id}/decision`, { decision: "approve" })).status).toBe(200);
     expect((await owner.post(`/staff/mods/${slug}/trust`, { trusted: true, reason: "Established project reviewed by staff" })).status).toBe(200);
-    return { owner, creator, initial, gamertag };
+    return { owner, creator, initial, display_name };
   }
 
   it("persists original signed bytes across policy changes and store restarts", async () => {
@@ -413,7 +419,7 @@ describe("upload and publication pipeline", () => {
       expect(state.storage.sql.exec<{ statement: string }>("SELECT statement FROM mod_versions WHERE id = ?", Number(initial.id)).toArray()[0]!.statement).toBe(original.release.statement);
       // Model a release signed by an older server, then restart under today's contract/policy.
       state.storage.sql.exec("UPDATE mod_versions SET statement = ?, signature = ? WHERE id = ?", historical, signature, Number(initial.id));
-      const restored = new MarketplaceStore(state.storage.sql, new Set([OWNER]));
+      const restored = new MarketplaceStore(state.storage.sql, new Set([`${OWNER}@test.invalid`]));
       expect(restored.statement(Number(initial.id))).toBe(historical);
     });
     for (const path of ["/mods/historical-signature", `/mods/historical-signature/releases/${original.version}/${original.sha256}`]) {
@@ -427,7 +433,7 @@ describe("upload and publication pipeline", () => {
     await runInDurableObject(hub(), (_: Hub, state) => {
       state.storage.sql.exec("UPDATE mod_versions SET statement = NULL WHERE id = ?", Number(initial.id));
       state.storage.sql.exec("DELETE FROM market_schema WHERE version = 2");
-      new MarketplaceStore(state.storage.sql, new Set([OWNER]));
+      new MarketplaceStore(state.storage.sql, new Set([`${OWNER}@test.invalid`]));
       expect(state.storage.sql.exec("SELECT 1 FROM mod_approvals WHERE version_id = ?", Number(initial.id)).toArray()).toHaveLength(0);
     });
     expect((await api("/mods/missing-statement")).status).toBe(404);
@@ -450,9 +456,14 @@ describe("upload and publication pipeline", () => {
     }).library;
     const selected = (await read())[0]!;
     await runInDurableObject(hub(), (_: Hub, state) => {
-      state.storage.sql.exec("DELETE FROM mod_library_clock WHERE xuid = ?", "2535400000006292");
+      state.storage.sql.exec("DELETE FROM mod_library_clock WHERE account_id = (SELECT account_id FROM xbox_links WHERE xuid = ?)", "2535400000006292");
+      // Migration 3 predates opaque accounts: restore its historical column layout for this migration probe.
+      state.storage.sql.exec("ALTER TABLE mod_library RENAME COLUMN account_id TO xuid");
+      state.storage.sql.exec("ALTER TABLE mod_library_clock RENAME COLUMN account_id TO xuid");
       state.storage.sql.exec("DELETE FROM market_schema WHERE version = 3");
-      new MarketplaceStore(state.storage.sql, new Set([OWNER]));
+      new MarketplaceStore(state.storage.sql, new Set([`${OWNER}@test.invalid`]));
+      state.storage.sql.exec("ALTER TABLE mod_library RENAME COLUMN xuid TO account_id");
+      state.storage.sql.exec("ALTER TABLE mod_library_clock RENAME COLUMN xuid TO account_id");
     });
     const path = "/mods/browser-removal/remove";
     expect((await api(path, { method: "POST", headers: { Origin: SITE }, body: JSON.stringify(selected) })).status).toBe(401);
@@ -468,9 +479,9 @@ describe("upload and publication pipeline", () => {
     expect(await read()).toEqual([selected]);
     // A later send of the very same bytes is still a different selection.
     await runInDurableObject(hub(), (_: Hub, state) => {
-      const store = new MarketplaceStore(state.storage.sql, new Set([OWNER]));
+      const store = new MarketplaceStore(state.storage.sql, new Set([`${OWNER}@test.invalid`]));
       const now = Date.parse(selected.sent_at);
-      store.signIn("2535400000006292", "RemovalPlayer", "removal-fixture-session", "removal-fixture-csrf", now);
+      store.signIn({ provider: "google", subject: "2535400000006292", display_name: "RemovalPlayer", email: "2535400000006292@test.invalid", email_verified: true }, "removal-fixture-session", "removal-fixture-csrf", now);
       expect(store.send({ session: "removal-fixture-session", csrf: "removal-fixture-csrf" }, "browser-removal", now).status).toBe(200);
     });
     expect((await player.post(path, selected)).status).toBe(409);
@@ -478,9 +489,9 @@ describe("upload and publication pipeline", () => {
     expect(current.sent_at).not.toBe(selected.sent_at);
     expect((await player.post(path, { ...current, sha256: "0".repeat(64) })).status).toBe(409);
     await runInDurableObject(hub(), (_: Hub, state) => {
-      let store = new MarketplaceStore(state.storage.sql, new Set([OWNER]));
-      expect(store.removeLibrary("2535400000006292", current.slug, current.sha256, current.sent_at)).toBe(true);
-      store = new MarketplaceStore(state.storage.sql, new Set([OWNER]));
+      let store = new MarketplaceStore(state.storage.sql, new Set([`${OWNER}@test.invalid`]));
+      expect(store.removeLibrary(store.accountForXbox("2535400000006292")!, current.slug, current.sha256, current.sent_at)).toBe(true);
+      store = new MarketplaceStore(state.storage.sql, new Set([`${OWNER}@test.invalid`]));
       expect(store.send({ session: "removal-fixture-session", csrf: "removal-fixture-csrf" }, current.slug, Date.parse(current.sent_at)).status).toBe(200);
     });
     expect((await player.post(path, current)).status).toBe(409);
@@ -617,7 +628,7 @@ describe("upload and publication pipeline", () => {
   });
 
   it("rechecks revoked trust, open reports, suspension and the exact baseline at completion", async () => {
-    const { owner, creator, initial, gamertag } = await established("revoked-mod");
+    const { owner, creator, initial, display_name } = await established("revoked-mod");
     await submit(creator, "revoked-mod", "1.1.0", { hud: true }, {}, false);
     const job = await claim();
     await owner.post("/staff/mods/revoked-mod/trust", { trusted: false, reason: "Incident under review" });
@@ -630,7 +641,7 @@ describe("upload and publication pipeline", () => {
     expect(await (await scanner(`jobs/${nextJob.id}/complete`, report(nextJob), nextJob.lease)).json()).toMatchObject({ automatic: false });
     await owner.post(`/staff/versions/${initial.id}/pull`, { reason: "Withdrawn during investigation" });
     expect((await api("/mods/revoked-mod")).status).toBe(404);
-    await owner.post("/staff/people/suspend", { gamertag, suspended: true, reason: "Incident under review" });
+    await owner.post("/staff/people/suspend", { display_name, suspended: true, reason: "Incident under review" });
     expect((await submit(creator, "revoked-mod", "1.3.0", { hud: true })).status).toBe(403);
   });
 
@@ -688,7 +699,7 @@ describe("upload and publication pipeline", () => {
     const { creator } = await established("race-mod");
     const v = await (await submit(creator, "race-mod", "1.0.1", { hud: true }, {}, false)).json() as any;
     await runInDurableObject(hub(), (_: Hub, state) => {
-      const store = new MarketplaceStore(state.storage.sql, new Set([OWNER]));
+      const store = new MarketplaceStore(state.storage.sql, new Set([`${OWNER}@test.invalid`]));
       const job = (store.claimScan(Date.now()).body as any).job;
       expect(store.completeScan(job.id, job.lease, report(job), Date.now()).approved).toBe(Number(v.id));
       const candidate = store.publicationReady(Number(v.id), Date.now())!;
@@ -764,7 +775,7 @@ describe("upload and publication pipeline", () => {
       state.storage.sql.exec("DELETE FROM mod_pipeline WHERE version_id = ?", Number(v.id));
       state.storage.sql.exec("UPDATE mod_versions SET status = 'approved', signature = 'old-signature' WHERE id = ?", Number(v.id));
       state.storage.sql.exec("DELETE FROM market_schema WHERE version = 1");
-      new MarketplaceStore(state.storage.sql, new Set([OWNER]));
+      new MarketplaceStore(state.storage.sql, new Set([`${OWNER}@test.invalid`]));
     });
     expect((await api(`/mods/assets/${v.sha256}`)).status).toBe(404);
     const rescan = await owner.post(`/staff/versions/${v.id}/rescan`);
@@ -804,8 +815,8 @@ describe("marketplace revision-checked updates", () => {
   /** Publish a synthetic component through the real submission, scan and staff-signing paths. */
   async function project(slug: string, versions = ["1.1.0"], apiRevisions: Record<string, string | null> = {}) {
     const owner = await signIn(OWNER, "OreKeeper");
-    const gamertag = `Updater${String(++creatorId).slice(-4)}`;
-    const creator = await signIn(String(creatorId), gamertag);
+    const display_name = `Updater${String(++creatorId).slice(-4)}`;
+    const creator = await signIn(String(creatorId), display_name);
     const releases: { id: string; sha256: string }[] = [];
     for (const version of versions) {
       const response = await submit(creator, slug, version, { hud: true });
@@ -818,7 +829,7 @@ describe("marketplace revision-checked updates", () => {
       expect((await owner.post(`/staff/versions/${release.id}/decision`, { decision: "approve" })).status).toBe(200);
       releases.push(release);
     }
-    return { owner, creator, gamertag, releases };
+    return { owner, creator, display_name, releases };
   }
 
   it("returns the numerically newest compatible newer signed release anonymously", async () => {
@@ -868,7 +879,7 @@ describe("marketplace revision-checked updates", () => {
   });
 
   it("requires every publication gate and immediately applies pulls, hiding and creator suspension", async () => {
-    const { releases, owner, gamertag } = await project("update-gates", ["1.1.0", "1.2.0"]);
+    const { releases, owner, display_name } = await project("update-gates", ["1.1.0", "1.2.0"]);
     const newest = Number(releases[1]!.id);
     const url = updateUrl("update-gates", { current_version: "1.1.0" });
     expect((await api(url)).status).toBe(200);
@@ -899,9 +910,9 @@ describe("marketplace revision-checked updates", () => {
     expect(hidden.status).toBe(404);
     expect(hidden.headers.get("Cache-Control")).toBe("no-store");
     expect((await owner.post("/staff/mods/update-gates/hide", { hidden: false, reason: "Reviewed" })).status).toBe(200);
-    expect((await owner.post("/staff/people/suspend", { gamertag, suspended: true, reason: "Synthetic creator hold" })).status).toBe(200);
+    expect((await owner.post("/staff/people/suspend", { display_name, suspended: true, reason: "Synthetic creator hold" })).status).toBe(200);
     expect((await api(updateUrl("update-gates"))).status).toBe(404);
-    expect((await owner.post("/staff/people/suspend", { gamertag, suspended: false, reason: "Reviewed" })).status).toBe(200);
+    expect((await owner.post("/staff/people/suspend", { display_name, suspended: false, reason: "Reviewed" })).status).toBe(200);
     expect((await api(updateUrl("update-gates"))).status).toBe(200);
   });
 
@@ -919,8 +930,8 @@ describe("marketplace revision-checked updates", () => {
       sql.exec("DROP INDEX mod_versions_updates");
       sql.exec("ALTER TABLE mod_versions DROP COLUMN api_revision");
       sql.exec("DELETE FROM market_schema WHERE version = 6");
-      const restored = new MarketplaceStore(sql, new Set([OWNER]));
-      new MarketplaceStore(sql, new Set([OWNER])); // Reopening is idempotent.
+      const restored = new MarketplaceStore(sql, new Set([`${OWNER}@test.invalid`]));
+      new MarketplaceStore(sql, new Set([`${OWNER}@test.invalid`])); // Reopening is idempotent.
       expect(sql.exec<{ api_revision: string | null }>("SELECT api_revision FROM mod_versions WHERE id = ?", Number(releases[0]!.id)).one().api_revision).toBeNull();
       expect(restored.statement(Number(releases[0]!.id))).toBe(statement);
     });
@@ -963,7 +974,7 @@ describe("marketplace revision-checked updates", () => {
         cursors.push(cursor);
         return cursor;
       } } as unknown as SqlStorage;
-      const store = new MarketplaceStore(counting, new Set([OWNER]));
+      const store = new MarketplaceStore(counting, new Set([`${OWNER}@test.invalid`]));
       const rowsRead = () => {
         cursors.length = 0;
         expect(store.update("update-index", { api_revisions: revision(), host_revision: "a".repeat(40), current_version: "1.0.0", current_sha256: installedHash }).status).toBe(200);
@@ -1067,17 +1078,16 @@ describe("moderation input and targeting", () => {
     expect(await verifies(release.statement, release.signature)).toBe(true);
   });
 
-  it("refuses role changes and suspensions when several accounts share a gamertag", async () => {
+  it("refuses role changes and suspensions when several accounts share a display_name", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
     await signIn("2535400000007111", "Twin");
     await signIn("2535400000007112", "twin");
-    const role = await owner.post("/staff/people/role", { gamertag: "Twin", role: "moderator", reason: "Ambiguous target" });
+    const role = await owner.post("/staff/people/role", { display_name: "Twin", role: "moderator", reason: "Ambiguous target" });
     expect(role.status).toBe(409);
-    const suspend = await owner.post("/staff/people/suspend", { gamertag: "TWIN", suspended: true, reason: "Ambiguous target" });
+    const suspend = await owner.post("/staff/people/suspend", { display_name: "TWIN", suspended: true, reason: "Ambiguous target" });
     expect(suspend.status).toBe(409);
-    const people = await (await owner.get("/staff/people")).json() as { xuid: string }[];
-    expect(people.map((p) => p.xuid)).not.toEqual(expect.arrayContaining(["2535400000007111"]));
-    expect(people.map((p) => p.xuid)).not.toEqual(expect.arrayContaining(["2535400000007112"]));
+    const people = await (await owner.get("/staff/people")).json() as { display_name: string }[];
+    expect(people.map(p => p.display_name.toLowerCase())).not.toContain("twin");
   });
 
   it("refuses reports from suspended accounts and against hidden listings", async () => {
@@ -1085,7 +1095,7 @@ describe("moderation input and targeting", () => {
     await published(owner, "2535400000007121", "report-gates");
     const details = { reason: "broken", details: "The panel won't close with Escape." };
     const suspended = await signIn("2535400000007122", "SuspendedReporter");
-    expect((await owner.post("/staff/people/suspend", { gamertag: "SuspendedReporter", suspended: true, reason: "Spam reports" })).status).toBe(200);
+    expect((await owner.post("/staff/people/suspend", { display_name: "SuspendedReporter", suspended: true, reason: "Spam reports" })).status).toBe(200);
     expect((await suspended.post("/mods/report-gates/reports", details)).status).toBe(403);
     const reporter = await signIn("2535400000007123", "HiddenReporter");
     expect((await owner.post("/staff/mods/report-gates/hide", { hidden: true, reason: "Under review" })).status).toBe(200);
@@ -1175,7 +1185,7 @@ describe("staff conflicts, public load and revocation limits", () => {
     expect(await (await owner.get(`/staff/versions/${held.id}`)).json()).toMatchObject({ trust: { trusted: false } });
     await promote(owner, "TrustGranter", "admin");
     expect((await update("1.0.3")).automatic).toBe(true);
-    expect((await owner.post("/staff/people/suspend", { gamertag: "TrustGranter", suspended: true, reason: "Account compromised" })).status).toBe(200);
+    expect((await owner.post("/staff/people/suspend", { display_name: "TrustGranter", suspended: true, reason: "Account compromised" })).status).toBe(200);
     expect((await update("1.0.4")).automatic).toBe(false);
     expect(await (await api("/mods/granted-mod")).json()).toMatchObject({ version: "1.0.3" });
   });
@@ -1208,9 +1218,9 @@ describe("staff conflicts, public load and revocation limits", () => {
     expect(await status(first.image)).toBe(404);
     expect((await admin.post("/staff/mods/indexed-media/hide", { hidden: false, reason: "Media reviewed" })).status).toBe(200);
     expect(await status(first.image)).toBe(200);
-    expect((await owner.post("/staff/people/suspend", { gamertag: "MediaCreator", suspended: true, reason: "Media review" })).status).toBe(200);
+    expect((await owner.post("/staff/people/suspend", { display_name: "MediaCreator", suspended: true, reason: "Media review" })).status).toBe(200);
     expect(await status(first.image)).toBe(404);
-    expect((await owner.post("/staff/people/suspend", { gamertag: "MediaCreator", suspended: false, reason: "Media reviewed" })).status).toBe(200);
+    expect((await owner.post("/staff/people/suspend", { display_name: "MediaCreator", suspended: false, reason: "Media reviewed" })).status).toBe(200);
     expect(await status(first.image)).toBe(200);
 
     await runInDurableObject(hub(), (_: Hub, state) => {
@@ -1218,14 +1228,14 @@ describe("staff conflicts, public load and revocation limits", () => {
       // Releases stored before the index existed are backfilled once.
       sql.exec("DELETE FROM mod_media");
       sql.exec("DELETE FROM market_schema WHERE version = 4");
-      new MarketplaceStore(sql, new Set([OWNER]));
+      new MarketplaceStore(sql, new Set([`${OWNER}@test.invalid`]));
       const cursors: SqlStorageCursor<Record<string, SqlStorageValue>>[] = [];
       const counting = { exec: (query: string, ...bindings: SqlStorageValue[]) => {
         const cursor = sql.exec(query, ...bindings);
         cursors.push(cursor);
         return cursor;
       } } as unknown as SqlStorage;
-      const store = new MarketplaceStore(counting, new Set([OWNER]));
+      const store = new MarketplaceStore(counting, new Set([`${OWNER}@test.invalid`]));
       /** Rows the public checks for the first release read. */
       const rowsRead = () => {
         cursors.length = 0;
@@ -1247,7 +1257,7 @@ describe("staff conflicts, public load and revocation limits", () => {
           JSON.stringify([{ sha256: hash.replace(/b/g, "c"), bytes: 12, type: "image/png", caption: "Bulk" }]), `bulk-media-${i}`);
       }
       sql.exec("DELETE FROM market_schema WHERE version = 4");
-      new MarketplaceStore(sql, new Set([OWNER]));
+      new MarketplaceStore(sql, new Set([`${OWNER}@test.invalid`]));
       expect(store.mediaAllowed((7).toString(16).padStart(64, "b").replace(/b/g, "c"))).toBe(true);
       expect(rowsRead()).toBe(before);
       sql.exec("DELETE FROM mod_media WHERE version_id IN (SELECT id FROM mod_versions WHERE slug = 'bulk-media')");
@@ -1292,7 +1302,7 @@ describe("staff conflicts, public load and revocation limits", () => {
     const encoder = new TextEncoder();
     await runInDurableObject(hub(), (_: Hub, state) => {
       const sql = state.storage.sql;
-      const store = new MarketplaceStore(sql, new Set([OWNER]));
+      const store = new MarketplaceStore(sql, new Set([`${OWNER}@test.invalid`]));
       // Fill the list to within a few hundred bytes of the budget, tracking each appended entry's size.
       let size = encoder.encode(store.revocations(Date.now())).byteLength;
       for (let i = 0; size < REVOCATION_BUDGET_BYTES - 400; i++) {
@@ -1363,11 +1373,11 @@ function sizedComponent(total: number, sections: [string, number][] = []): Uint8
 }
 
 describe("anonymous load, sign-in state and moderation probes", () => {
-  const NOT_THIS_BROWSER = "This sign-in didn't start in this browser. Go back and try again.";
+  const NOT_THIS_BROWSER = `${SITE}/mods/?signin_error=failed`;
 
   it("starts sign-in without the Hub, sealing the pending sign-in in the browser's cookie", async () => {
     const returnTo = `${SITE}/mods/#/mine`;
-    const starts = await Promise.all(Array.from({ length: 20 }, () => withoutHub(`/auth/microsoft/start?return_to=${encodeURIComponent(returnTo)}`)));
+    const starts = await Promise.all(Array.from({ length: 20 }, () => withoutHub(`/auth/google/start?return_to=${encodeURIComponent(returnTo)}`)));
     for (const start of starts) expect(start.status).toBe(302);
     const start = starts[0]!;
     const state = new URL(start.headers.get("Location")!).searchParams.get("state")!;
@@ -1381,25 +1391,25 @@ describe("anonymous load, sign-in state and moderation probes", () => {
       expect(durable.storage.sql.exec("SELECT name FROM sqlite_master WHERE name = 'oauth_states'").toArray()).toEqual([]);
     });
 
-    const callback = await api(`/auth/microsoft/callback?code=${encodeURIComponent("2535400000009101:SealedStart")}&state=${state}`,
+    const callback = await api(`/auth/google/callback?code=${encodeURIComponent("2535400000009101:SealedStart")}&state=${state}`,
       { headers: { Cookie: `__Host-cinnabar_oauth=${oauth}` } });
     expect(callback.status).toBe(302);
     expect(callback.headers.get("Location")).toBe(returnTo);
     expect(callback.headers.getSetCookie()).toContainEqual(expect.stringMatching(/^__Host-cinnabar_oauth=; Max-Age=0;/));
     // Once the browser drops the cleared cookie, the same callback can't be presented again.
-    expect((await api(`/auth/microsoft/callback?code=${encodeURIComponent("2535400000009101:SealedStart")}&state=${state}`)).status).toBe(400);
+    expect((await api(`/auth/google/callback?code=${encodeURIComponent("2535400000009101:SealedStart")}&state=${state}`)).status).toBe(302);
   });
 
   it("refuses missing, altered, swapped, foreign, expired and replayed sign-in cookies", async () => {
-    const begin = async (path = "/auth/microsoft/start") => {
+    const begin = async (path = "/auth/google/start") => {
       const start = await api(path);
       return { state: new URL(start.headers.get("Location")!).searchParams.get("state")!, oauth: cookieValue(start, "__Host-cinnabar_oauth") };
     };
-    const callback = (state: string, oauth?: string) => api(`/auth/microsoft/callback?code=${encodeURIComponent("2535400000009102:SealedState")}&state=${state}`,
+    const callback = (state: string, oauth?: string) => api(`/auth/google/callback?code=${encodeURIComponent("2535400000009102:SealedState")}&state=${state}`,
       oauth === undefined ? undefined : { headers: { Cookie: `__Host-cinnabar_oauth=${oauth}` } });
     const refused = async (response: Response, text = NOT_THIS_BROWSER) => {
-      expect(response.status).toBe(400);
-      expect(await response.text()).toBe(text);
+      expect(response.status).toBe(302);
+      expect(response.headers.get("Location")).toBe(text);
       expect(response.headers.getSetCookie().some(c => c.startsWith("__Host-cinnabar_session="))).toBe(false);
     };
     const first = await begin();
@@ -1412,7 +1422,7 @@ describe("anonymous load, sign-in state and moderation probes", () => {
     await refused(await callback(first.state, second.oauth));
     // The bare state, as cookies held before sealing, and a cookie sealed under any other key.
     await refused(await callback(first.state, first.state));
-    const pending = { state: first.state, verifier: "v".repeat(43), returnTo: `${SITE}/mods/` };
+    const pending = { provider: "google", state: first.state, verifier: "v".repeat(43), returnTo: `${SITE}/mods/` };
     await refused(await callback(first.state, await sealSignIn("not-the-deployment-secret", pending, Date.now())));
     // Even a correctly sealed return address must still belong to the website.
     await refused(await callback(first.state, await sealSignIn(env.MARKETPLACE_SIGNING_KEY!, { ...pending, returnTo: "https://evil.test/" }, Date.now())));
@@ -1422,7 +1432,7 @@ describe("anonymous load, sign-in state and moderation probes", () => {
     try {
       const timed = await begin();
       clock.mockReturnValue(now + OAUTH_STATE_MS);
-      await refused(await callback(timed.state, timed.oauth), "This sign-in link expired. Go back and try again.");
+      await refused(await callback(timed.state, timed.oauth), `${SITE}/mods/?signin_error=failed`);
       clock.mockReturnValue(now + OAUTH_STATE_MS - 1);
       expect((await callback(timed.state, timed.oauth)).status).toBe(302);
     } finally {
@@ -1430,7 +1440,7 @@ describe("anonymous load, sign-in state and moderation probes", () => {
     }
 
     // A return address too long to carry in the cookie falls back to the marketplace page.
-    const long = await begin(`/auth/microsoft/start?return_to=${encodeURIComponent(`${SITE}/mods/?${"a".repeat(3000)}`)}`);
+    const long = await begin(`/auth/google/start?return_to=${encodeURIComponent(`${SITE}/mods/?${"a".repeat(3000)}`)}`);
     expect((await callback(long.state, long.oauth)).headers.get("Location")).toBe(`${SITE}/mods/`);
   });
 
@@ -1460,8 +1470,8 @@ describe("anonymous load, sign-in state and moderation probes", () => {
       ["/staff/versions/1/pull", json("POST"), "pull"], ["/staff/reports/1/resolve", json("POST", { note: "Probe" }), "resolve"],
       ["/staff/mods/anonymous-probe/hide", json("POST", { hidden: true, reason: "Probe" }), "hide"],
       ["/staff/mods/anonymous-probe/trust", json("POST", { trusted: true, reason: "Probe" }), "trust"],
-      ["/staff/people/role", json("POST", { gamertag: "OreKeeper", role: "player", reason: "Probe" }), "role"],
-      ["/staff/people/suspend", json("POST", { gamertag: "OreKeeper", suspended: true, reason: "Probe" }), "suspend"],
+      ["/staff/people/role", json("POST", { display_name: "OreKeeper", role: "player", reason: "Probe" }), "role"],
+      ["/staff/people/suspend", json("POST", { display_name: "OreKeeper", suspended: true, reason: "Probe" }), "suspend"],
       ["/mods/anonymous-probe/send", { method: "POST" }, "send"],
       ["/mods/anonymous-probe/remove", json("POST", { sha256: "a".repeat(64), sent_at: new Date(0).toISOString() }), "remove"],
       ["/mods/anonymous-probe/reports", json("POST", { reason: "broken", details: "An anonymous report probe." }), "report"],
@@ -1476,15 +1486,15 @@ describe("anonymous load, sign-in state and moderation probes", () => {
     }
     // Through the whole Worker, an anonymous browser still sees the signed-out shape the website expects.
     expect(await (await api("/me")).json()).toEqual({ account: null, library: [], csrf: null, game_online: false });
-    expect(await (await api("/staff/queue")).json()).toEqual({ error: "Sign in with Microsoft first." });
+    expect(await (await api("/staff/queue")).json()).toEqual({ error: "Sign in to Cinnabar first." });
   });
 
   it("requires an explicit suspended value and refuses role and suspension probes before looking anyone up", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
     await signIn("2535400000009201", "SuspendTarget");
-    const suspend = (body: object) => owner.post("/staff/people/suspend", { gamertag: "SuspendTarget", reason: "Explicit value fixture", ...body });
-    const suspended = async () => (await (await owner.get("/staff/people")).json() as { gamertag: string; suspended: boolean }[])
-      .find(p => p.gamertag === "SuspendTarget")?.suspended ?? false;
+    const suspend = (body: object) => owner.post("/staff/people/suspend", { display_name: "SuspendTarget", reason: "Explicit value fixture", ...body });
+    const suspended = async () => (await (await owner.get("/staff/people")).json() as { display_name: string; suspended: boolean }[])
+      .find(p => p.display_name === "SuspendTarget")?.suspended ?? false;
     expect((await suspend({ suspended: true })).status).toBe(200);
     for (const body of [{}, { suspended: "false" }, { suspended: 0 }, { suspended: null }]) {
       const response = await suspend(body);
@@ -1500,21 +1510,21 @@ describe("anonymous load, sign-in state and moderation probes", () => {
     await promote(owner, "ModProber", "moderator");
     await signIn("2535400000009204", "ProbeTwin");
     await signIn("2535400000009205", "probetwin");
-    // Existing, unknown and ambiguous gamertags all get the same refusal, so nobody learns which exist.
-    for (const gamertag of ["SuspendTarget", "NobodyHasThisTag", "ProbeTwin"]) {
+    // Existing, unknown and ambiguous display_names all get the same refusal, so nobody learns which exist.
+    for (const display_name of ["SuspendTarget", "NobodyHasThisTag", "ProbeTwin"]) {
       for (const [by, role, suspension] of [[player, "Only admins manage staff.", "Staff only."],
         [moderator, "Only admins manage staff.", "Only admins can suspend accounts."]] as const) {
-        const roleChange = await by.post("/staff/people/role", { gamertag, role: "moderator", reason: "Probe" });
-        expect(roleChange.status, gamertag).toBe(403);
+        const roleChange = await by.post("/staff/people/role", { display_name, role: "moderator", reason: "Probe" });
+        expect(roleChange.status, display_name).toBe(403);
         expect(await roleChange.json()).toEqual({ error: role });
-        const suspensionChange = await by.post("/staff/people/suspend", { gamertag, suspended: true, reason: "Probe" });
-        expect(suspensionChange.status, gamertag).toBe(403);
+        const suspensionChange = await by.post("/staff/people/suspend", { display_name, suspended: true, reason: "Probe" });
+        expect(suspensionChange.status, display_name).toBe(403);
         expect(await suspensionChange.json()).toEqual({ error: suspension });
       }
     }
     // Admins still get the precise answer.
-    expect((await owner.post("/staff/people/role", { gamertag: "NobodyHasThisTag", role: "moderator", reason: "Probe" })).status).toBe(404);
-    expect((await owner.post("/staff/people/role", { gamertag: "ProbeTwin", role: "moderator", reason: "Probe" })).status).toBe(409);
+    expect((await owner.post("/staff/people/role", { display_name: "NobodyHasThisTag", role: "moderator", reason: "Probe" })).status).toBe(404);
+    expect((await owner.post("/staff/people/role", { display_name: "ProbeTwin", role: "moderator", reason: "Probe" })).status).toBe(409);
   });
 
   it("refuses components whose executable bytes exceed the pinned client's ceiling", async () => {

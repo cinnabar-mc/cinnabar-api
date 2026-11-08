@@ -76,6 +76,13 @@ jobs:
           node scripts/marketplace-signing.mjs check
           printf '%s' "$MARKETPLACE_SIGNING_KEY" | pnpm exec wrangler secret put MARKETPLACE_SIGNING_KEY
       - if: steps.head.outputs.current == 'true'
+        name: Configure Google sign-in
+        env:
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: |
+          : "${GOOGLE_CLIENT_SECRET:?Missing GOOGLE_CLIENT_SECRET; configure the production environment secret before deploying}"
+          printf '%s' "$GOOGLE_CLIENT_SECRET" | pnpm exec wrangler secret put GOOGLE_CLIENT_SECRET
+      - if: steps.head.outputs.current == 'true'
         name: Configure private presence access
         env:
           PRESENCE_READ_SECRET: ${{ secrets.PRESENCE_READ_SECRET }}

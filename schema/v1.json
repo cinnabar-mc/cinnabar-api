@@ -46,6 +46,12 @@
     },
     {
       "$ref": "#/$defs/ModUpdateQuery"
+    },
+    {
+      "$ref": "#/$defs/MeResponse"
+    },
+    {
+      "$ref": "#/$defs/XboxLinkCodeResponse"
     }
   ],
   "$defs": {
@@ -180,6 +186,9 @@
         },
         {
           "$ref": "#/$defs/ModLibraryRemove"
+        },
+        {
+          "$ref": "#/$defs/AccountLink"
         }
       ]
     },
@@ -314,6 +323,9 @@
         },
         {
           "$ref": "#/$defs/ModLibrary"
+        },
+        {
+          "$ref": "#/$defs/AccountLinkResult"
         }
       ]
     },
@@ -1475,6 +1487,185 @@
         },
         "mods": {
           "$ref": "#/$defs/ModLibraryEntries"
+        }
+      }
+    },
+    "AccountLink": {
+      "description": "Authenticated game request: redeem a website link code using only the connection’s verified XUID and gamertag. At most ten attempts per connection; case, spaces and hyphens are ignored.",
+      "type": "object",
+      "required": [
+        "type",
+        "code"
+      ],
+      "properties": {
+        "type": {
+          "const": "account_link"
+        },
+        "code": {
+          "type": "string",
+          "maxLength": 64
+        }
+      }
+    },
+    "AccountLinkResult": {
+      "description": "Link result, followed on success by mod_library. Codes are single-use, valid ten minutes. Unlink on the website before relinking.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "ok",
+            "account"
+          ],
+          "properties": {
+            "type": {
+              "const": "account_link_result"
+            },
+            "ok": {
+              "const": true
+            },
+            "account": {
+              "type": "object",
+              "required": [
+                "display_name"
+              ],
+              "properties": {
+                "display_name": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "ok",
+            "error"
+          ],
+          "properties": {
+            "type": {
+              "const": "account_link_result"
+            },
+            "ok": {
+              "const": false
+            },
+            "error": {
+              "enum": [
+                "invalid",
+                "expired",
+                "already_linked",
+                "rate_limited"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "CinnabarAccount": {
+      "type": "object",
+      "required": [
+        "id",
+        "display_name",
+        "email",
+        "role",
+        "suspended",
+        "xbox"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "email": {
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "player",
+            "moderator",
+            "admin",
+            "owner"
+          ]
+        },
+        "suspended": {
+          "type": "boolean"
+        },
+        "xbox": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "required": [
+                "xuid",
+                "gamertag"
+              ],
+              "properties": {
+                "xuid": {
+                  "$ref": "#/$defs/Xuid"
+                },
+                "gamertag": {
+                  "type": "string"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "MeResponse": {
+      "description": "GET /v1/me. Account, selections and CSRF belong to the Cinnabar account; game_online requires a linked Xbox with a live authenticated socket.",
+      "type": "object",
+      "required": [
+        "account",
+        "library",
+        "csrf",
+        "game_online"
+      ],
+      "properties": {
+        "account": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/CinnabarAccount"
+            }
+          ]
+        },
+        "library": {
+          "$ref": "#/$defs/ModLibraryEntries"
+        },
+        "csrf": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "game_online": {
+          "type": "boolean"
+        }
+      }
+    },
+    "XboxLinkCodeResponse": {
+      "description": "POST /v1/me/xbox/link-code, session + CSRF. Five issues per account per ten minutes; replaces the previous code. POST /v1/me/xbox/unlink uses session + CSRF and returns empty 204.",
+      "type": "object",
+      "required": [
+        "code",
+        "expires_in"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$"
+        },
+        "expires_in": {
+          "const": 600
         }
       }
     }

@@ -84,25 +84,38 @@ Players browse, send and report Cinnabar mods; creators submit them; staff revie
 `MARKETPLACE_ORIGIN` is the only browser origin allowed to call these routes with credentials. The catalogue,
 mod pages, files and revocations are public.
 
-**Accounts are Xbox identities.**
-- `GET /v1/auth/microsoft/start?return_to=` runs Microsoft OAuth with PKCE (`XboxLive.signin`, personal accounts).
-  The pending state, verifier and return address travel only in an encrypted ten-minute
-  `__Host-cinnabar_oauth` cookie, so starting a sign-in writes nothing to the Hub.
-- `GET /v1/auth/microsoft/callback` exchanges the code for an Xbox user token and then an XSTS token, keeps
-  only the XUID and gamertag, and discards every token.
-- It sets a `__Host-cinnabar_session` cookie (HttpOnly, Secure, SameSite=Lax). Only its SHA-256 is stored.
-- The game's `/v1/connect` login proves the same XUID, so web and game accounts need no linking.
-- Writes need the website `Origin` and the `X-Cinnabar-CSRF` token from `GET /v1/me`.
-- Requests to signed-in routes without a session cookie get their signed-out answer from the Worker
-  without reaching the Hub.
+**Cinnabar accounts use Google sign-in.**
+- `GET /v1/auth/google/start?return_to=` starts authorization code sign-in with PKCE and scopes
+  `openid email profile`. Return URLs must belong to `MARKETPLACE_ORIGIN`.
+- The state, provider, verifier and return address travel in an encrypted ten-minute
+  `__Host-cinnabar_oauth` cookie, so starting sign-in writes nothing to the Hub.
+- `GET /v1/auth/google/callback` exchanges the code server-side and reads identity claims from
+  Google's HTTPS OpenID userinfo endpoint. Tokens are discarded. Accounts have random opaque IDs;
+  provider identities are keyed by `(provider, subject)` for future providers.
+- A new identity joins an existing account only when the provider's email is verified and matches
+  one unambiguous verified account email (trimmed and case-insensitive). Unverified emails never
+  merge accounts; returning identities keep their original account regardless of email changes.
+- Sign-in sets a `__Host-cinnabar_session` cookie (HttpOnly, Secure, SameSite=Lax); only its SHA-256
+  is stored. Failed callbacks redirect with `signin_error=failed|cancelled` and never write to the Hub.
+- Writes need the website `Origin` and the session's `X-Cinnabar-CSRF` from `GET /v1/me`.
+  Anonymous session routes are answered by the Worker without reaching the Hub.
 - Sessions last 30 days, or 12 hours for staff. A role change needs a sign-in from the last 10 minutes.
-- XSTS refusals return to the site with `signin_error=no_xbox_profile|child_account|xbox_unavailable|cancelled`.
+- `GET /v1/me` returns `{account: {id, display_name, email, role, suspended, xbox: {xuid, gamertag} | null} | null,
+  library, csrf, game_online}`. Marketplace roles, submissions and libraries belong to account IDs.
+- Link Xbox through the game: `POST /v1/me/xbox/link-code` (session + CSRF) returns `{code, expires_in: 600}`.
+  Enter the code in Cinnabar; its authenticated game socket sends `{type: "account_link", code}`.
+  The API uses the socket's signed Xbox identity, replies with `account_link_result` and pushes the library.
+  Codes are single-use, stored hashed, replace the previous code and expire after ten minutes. Issuance is limited
+  to five per account per ten minutes; redemption to ten attempts per connection.
+- `POST /v1/me/xbox/unlink` (session + CSRF) returns 204, clears pending codes and clears delivery to that Xbox.
+  An Xbox and a Cinnabar account each have at most one link. Unlink on the website before relinking.
+  Library selections stay on the Cinnabar account across unlink/relink.
 
 **Roles.**
 - Players can submit, send and report.
 - Moderators review and resolve reports.
 - Admins also approve Acts and Network mods, pull versions, suspend accounts and manage moderators.
-- Owners come only from `OWNER_XUIDS` and manage admins.
+- Owners come only from verified account emails in `OWNER_EMAILS` and manage admins.
 - Nobody reviews their own mod or changes their own role.
 - Every staff action is written to `staff_audit`.
 
@@ -152,8 +165,9 @@ Acts and Network listings must link their GitHub source.
 - Pulled versions appear in `GET /v1/mods/revocations`, signed in `X-Cinnabar-Signature`.
 
 **Send to game.**
-- `POST /v1/mods/:slug/send` adds the current version to the player's library.
-- It pushes `mod_library` to the player's live sockets, and `welcome` carries the library on every login.
+- `POST /v1/mods/:slug/send` adds the current version to the account's library. Without a linked Xbox it returns
+  409 `{ "error": "Link your Xbox account in Cinnabar first." }`.
+- It resolves the linked XUID and pushes `mod_library` to that Xbox's live sockets; `welcome` carries the linked account's library on every game login.
 - Pulling a version pushes it again with `pulled: true` and staff's `pull_reason`.
 
 | Route | Who |
@@ -166,7 +180,7 @@ Acts and Network listings must link their GitHub source.
 | `POST /v1/staff/versions/:id/decision` `{decision: approve, changes or reject, note}` | staff |
 | `POST /v1/staff/reports/:id/resolve`, `POST /v1/staff/mods/:slug/hide` `{hidden, reason}` | staff, never for their own mod; restoring (`hidden: false`) needs an admin |
 | `POST /v1/staff/versions/:id/pull`, `POST /v1/staff/people/suspend` | admin |
-| `POST /v1/staff/people/role` `{gamertag, role, reason}` | admin (moderators) or owner (admins) |
+| `POST /v1/staff/people/role` `{account_id, role, reason}` | admin (moderators) or owner (admins) |
 
 Before enabling it in production:
 
@@ -174,13 +188,14 @@ Before enabling it in production:
 pnpm exec wrangler r2 bucket create cinnabar-mods
 pnpm exec wrangler secret put MARKETPLACE_SIGNING_KEY   # base64 PKCS#8 Ed25519 private key
 pnpm exec wrangler secret put MARKETPLACE_SCANNER_TOKEN # separate random scanner credential
-pnpm exec wrangler secret put MICROSOFT_CLIENT_SECRET   # only for a confidential Entra app
+pnpm exec wrangler secret put GOOGLE_CLIENT_SECRET      # Google web OAuth client secret
 ```
 
-Then set the `MARKETPLACE_ORIGIN`, `MICROSOFT_CLIENT_ID` and `OWNER_XUIDS` variables.
-- Register the Entra app for personal Microsoft accounts with the redirect URI
-  `https://api.cinnabar.gg/v1/auth/microsoft/callback`.
-- Sign-in answers 503 until the origin, client ID and `MARKETPLACE_SIGNING_KEY` are set; the pending
+Then set the `MARKETPLACE_ORIGIN`, `GOOGLE_CLIENT_ID` and `OWNER_EMAILS` variables.
+- Replace the checked-in `REPLACE_WITH_GOOGLE_CLIENT_ID` placeholder before enabling sign-in.
+- Create a Google OAuth web application with authorized redirect URI
+  `https://api.cinnabar.gg/v1/auth/google/callback`.
+- Sign-in answers 503 until the origin, real client ID, `GOOGLE_CLIENT_SECRET` and `MARKETPLACE_SIGNING_KEY` are set; the pending
   sign-in cookie's encryption key is derived from that secret.
 - The session cookie only reaches the API when the website shares its registrable domain (for example
   `cinnabar.gg`), so the site must leave `*.workers.dev` before sign-in works there.
@@ -262,15 +277,16 @@ keep its matching credential in a release environment restricted to release refs
   or payloads. Counts are aggregated per invocation; failed metric writes are dropped without
   affecting admission or cleanup. Workers observability remains off so invocation logs do not
   record request metadata.
-- Signing in to the marketplace stores the account's XUID, gamertag, role and last sign-in time.
-  Sessions are stored as the SHA-256 of their cookie, with a CSRF token and creation time. Microsoft
-  and Xbox tokens are never stored. A pending sign-in's random state, PKCE verifier and return address
+- Signing in to the marketplace stores an opaque account ID, display name, email and verification status,
+  role, suspension flag and creation time, plus provider subjects and email verification claims. Linking stores
+  the XUID, signed gamertag and link time separately. Sessions store only a SHA-256 cookie hash, account ID,
+  CSRF token and creation time. Google tokens are never stored or logged. A pending sign-in's random state, PKCE verifier and return address
   are kept only in the browser's encrypted cookie, for at most ten minutes.
 - The marketplace also keeps:
   - each player's sent mods
-  - the reports they file, with their XUID and text
+  - the reports they file, with their account ID and text
   - creators' listings and uploaded components
-  - the staff audit log, which names the acting XUID
+  - the staff audit log, which names the acting account ID
 
 ## Shared emotes
 

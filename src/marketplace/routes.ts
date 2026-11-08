@@ -5,7 +5,8 @@ import { hubFor } from "../routing";
 import { downloadModAsset } from "../mod-assets";
 import { MAX_COMPONENT_BYTES, readComponent } from "./component";
 import { clip, malformedText, type Grants } from "./policy";
-import { SignInFailure, authorizeUrl, randomToken, sha256Base64Url, xboxIdentity } from "./microsoft";
+import { linkCode, normalizeLinkCode, randomToken, sha256Base64Url } from "./auth";
+import { authorizeUrl, googleIdentity } from "./google";
 import { MAX_RETURN_TO, OAUTH_STATE_MS, openSignIn, sealSignIn } from "./oauth-state";
 import { PLAYER_SESSION_MS, anonymousResult, type Caller, type MarketCall, type MarketResult, type MediaFile } from "./store";
 import { BodyLimitError, MAX_IMAGES, MAX_UPLOAD_BYTES, imageType, readLimited, sha256 } from "./uploads";
@@ -50,7 +51,7 @@ async function call(c: Ctx, request: MarketCall): Promise<MarketResult> {
 
 function reply(c: Ctx, result: MarketResult, cache = "no-store"): Response {
   c.header("Cache-Control", cache);
-  return c.json(result.body as object, result.status as 200);
+  return result.status === 204 ? c.body(null, 204) : c.json(result.body as object, result.status as 200);
 }
 
 /** Answers with the store's result for `request` made as the signed-in caller. */
@@ -88,7 +89,7 @@ async function readJson(c: Ctx): Promise<unknown | null> {
 }
 
 const id = (value: string): number | null => (/^[0-9]{1,12}$/.test(value) ? Number(value) : null);
-const callbackUrl = (c: Ctx) => new URL("/v1/auth/microsoft/callback", c.req.url).toString();
+const callbackUrl = (c: Ctx) => new URL("/v1/auth/google/callback", c.req.url).toString();
 
 /** Marketplace and web sign-in routes, mounted under `/v1`. */
 export const marketplaceRoutes = new Hono<{ Bindings: Env }>();
@@ -122,10 +123,11 @@ const cors = async (c: Ctx, next: () => Promise<void>) => {
 // Only marketplace paths, so the cached presence routes keep their own headers.
 for (const path of ["/auth/*", "/me", "/me/*", "/mods", "/mods/*", "/submissions", "/staff/*"]) marketplaceRoutes.use(path, cors);
 
-marketplaceRoutes.get("/auth/microsoft/start", async (c) => {
+marketplaceRoutes.get("/auth/google/start", async (c) => {
+  c.header("Cache-Control", "no-store");
   const site = siteOrigin(c.env);
   const secret = c.env.MARKETPLACE_SIGNING_KEY;
-  if (!site || !c.env.MICROSOFT_CLIENT_ID || !secret) return c.json({ error: "Sign-in isn't configured yet." }, 503);
+  if (!site || !c.env.GOOGLE_CLIENT_ID || c.env.GOOGLE_CLIENT_ID.startsWith("REPLACE_") || !c.env.GOOGLE_CLIENT_SECRET || !secret) return c.json({ error: "Sign-in isn't configured yet." }, 503);
   let returnTo = `${site}/mods/`;
   const requested = c.req.query("return_to");
   if (requested) {
@@ -140,25 +142,25 @@ marketplaceRoutes.get("/auth/microsoft/start", async (c) => {
   const verifier = randomToken();
   // The pending sign-in lives only in this browser's sealed cookie, which also binds it to this browser, so a link
   // can't sign someone into another person's account and anonymous starts never write to the Hub.
-  setCookie(c, OAUTH_COOKIE, await sealSignIn(secret, { state, verifier, returnTo }, Date.now()),
+  setCookie(c, OAUTH_COOKIE, await sealSignIn(secret, { provider: "google", state, verifier, returnTo }, Date.now()),
     { prefix: "host", httpOnly: true, sameSite: "Lax", maxAge: OAUTH_STATE_MS / 1000 });
-  c.header("Cache-Control", "no-store");
-  return c.redirect(authorizeUrl(c.env.MICROSOFT_CLIENT_ID, callbackUrl(c), state, await sha256Base64Url(verifier)), 302);
+  return c.redirect(authorizeUrl(c.env.GOOGLE_CLIENT_ID, callbackUrl(c), state, await sha256Base64Url(verifier)), 302);
 });
 
-marketplaceRoutes.get("/auth/microsoft/callback", async (c) => {
+marketplaceRoutes.get("/auth/google/callback", async (c) => {
   c.header("Cache-Control", "no-store");
   const site = siteOrigin(c.env);
   const secret = c.env.MARKETPLACE_SIGNING_KEY;
-  if (!site || !c.env.MICROSOFT_CLIENT_ID || !secret) return c.json({ error: "Sign-in isn't configured yet." }, 503);
+  if (!site || !c.env.GOOGLE_CLIENT_ID || c.env.GOOGLE_CLIENT_ID.startsWith("REPLACE_") || !c.env.GOOGLE_CLIENT_SECRET || !secret) return c.json({ error: "Sign-in isn't configured yet." }, 503);
   const state = c.req.query("state") ?? "";
   const pending = await openSignIn(secret, getCookie(c, OAUTH_COOKIE, "host"), Date.now());
-  // Clearing the cookie makes the pending sign-in single-use in this browser; Microsoft redeems each code only once.
+  // Clearing the cookie makes the pending sign-in single-use in this browser; Google redeems each code only once.
   deleteCookie(c, OAUTH_COOKIE, { prefix: "host" });
-  if (pending === "expired") return c.text("This sign-in link expired. Go back and try again.", 400);
-  if (!pending || !state || state !== pending.state
+  const failed = () => c.redirect(`${site}/mods/?signin_error=failed`, 302);
+  if (pending === "expired") return failed();
+  if (!pending || pending.provider !== "google" || !state || state !== pending.state
     || !URL.canParse(pending.returnTo) || new URL(pending.returnTo).origin !== site) {
-    return c.text("This sign-in didn't start in this browser. Go back and try again.", 400);
+    return failed();
   }
   const { verifier, returnTo } = pending;
   const back = (error?: string) => {
@@ -168,17 +170,18 @@ marketplaceRoutes.get("/auth/microsoft/callback", async (c) => {
   };
   const code = c.req.query("code");
   if (!code) return back(c.req.query("error") === "access_denied" ? "cancelled" : "failed");
-  let identity: { xuid: string; gamertag: string };
+  let identity;
   try {
-    identity = await xboxIdentity({
-      clientId: c.env.MICROSOFT_CLIENT_ID, clientSecret: c.env.MICROSOFT_CLIENT_SECRET,
+    identity = await googleIdentity({
+      clientId: c.env.GOOGLE_CLIENT_ID, clientSecret: c.env.GOOGLE_CLIENT_SECRET,
       redirectUri: callbackUrl(c), code, verifier,
     });
-  } catch (error) {
-    return back(error instanceof SignInFailure ? error.code : "failed");
+  } catch {
+    return back("failed");
   }
   const token = randomToken();
-  await call(c, { op: "signin", ...identity, newSession: await sha256Base64Url(token), newCsrf: randomToken(24) });
+  const signedIn = await call(c, { op: "signin", identity, newSession: await sha256Base64Url(token), newCsrf: randomToken(24) });
+  if (signedIn.status !== 200) return back("failed");
   setCookie(c, SESSION_COOKIE, token, { prefix: "host", httpOnly: true, sameSite: "Lax", maxAge: PLAYER_SESSION_MS / 1000 });
   return back();
 });
@@ -190,6 +193,12 @@ marketplaceRoutes.post("/auth/signout", async (c) => {
 });
 
 marketplaceRoutes.get("/me", (c) => forward(c, { op: "me" }));
+marketplaceRoutes.post("/me/xbox/link-code", async c => {
+  const code = linkCode();
+  const result = await call(c, { op: "link-code", ...(await caller(c)), codeHash: await sha256Base64Url(normalizeLinkCode(code)) });
+  return reply(c, result.status === 200 ? { ...result, body: { code, expires_in: 600 } } : result);
+});
+marketplaceRoutes.post("/me/xbox/unlink", c => forward(c, { op: "unlink" }));
 marketplaceRoutes.get("/me/mods", (c) => forward(c, { op: "mine" }));
 marketplaceRoutes.get("/mods", publicCache(CATALOGUE_CACHE), async (c) => {
   const cache = await hubFor(c.env).hasOfficialMod() ? "no-store" : CATALOGUE_CACHE;

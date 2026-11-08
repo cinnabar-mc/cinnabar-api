@@ -1,9 +1,82 @@
 # Marketplace API
 
-Free mod releases use Microsoft/Xbox identity, private uploads, immutable release
+Free mod releases use Cinnabar accounts with Google sign-in, private uploads, immutable release
 snapshots, a durable scanner outbox and Ed25519 publication. The website and client
 must still enable their live integration and verify manifests and revocations.
 AI findings assist moderation; they are not a safety certification.
+
+## Accounts and Xbox delivery
+
+Google sign-in uses server-side authorization code + S256 PKCE with `openid email profile`.
+The server exchanges the code at `https://oauth2.googleapis.com/token` using the client secret
+and verifier, then reads `sub`, `email`, `email_verified` and `name` directly from Google's
+HTTPS OpenID userinfo endpoint, `https://openidconnect.googleapis.com/v1/userinfo`. This uses
+the newly issued server-side bearer token instead of parsing an untrusted browser ID token,
+and avoids a separate local JWKS cache and signature/claim validation path. Tokens are discarded.
+See [Google's OpenID Connect documentation](https://developers.google.com/identity/openid-connect/openid-connect).
+
+Account resolution is provider-generic. `(provider, subject)` is the stable identity key.
+A returning identity reuses its account even if its provider email changes. A new identity
+may join an existing account only when its provider reports `email_verified: true` and the
+trimmed, lowercased email matches exactly one account whose email is also verified. Unverified
+or ambiguous matches create separate accounts. Email alone never authenticates an existing
+identity. Future Discord, GitHub or password adapters must provide verified claims through
+the same store rule; no such adapters are exposed yet. Owners are derived from a verified
+account email in `OWNER_EMAILS`; a stored role cannot grant owner.
+
+`GET /v1/me` returns:
+
+```json
+{"account":{"id":"opaque-account-id","display_name":"Player","email":"player@example.com","role":"player","suspended":false,"xbox":null},"library":[],"csrf":"session-csrf","game_online":false}
+```
+
+Signed-out callers receive `account: null`, an empty library, `csrf: null`, and
+`game_online: false`. A linked account instead has `xbox: {xuid, gamertag}`. Online means a
+currently authenticated socket for that linked XUID. All creator, approval, report, role,
+suspension, trust/granter, audit, session, CSRF and library references use the Cinnabar account ID.
+Staff role/suspension writes accept `{account_id, role|suspended, reason}`; existing forms can
+also supply an unambiguous `display_name` (legacy `gamertag` is accepted as a display-name alias).
+Use IDs because display names need not be unique. Audit role/suspension targets use account IDs.
+
+`POST /v1/me/xbox/link-code` needs the session and `X-Cinnabar-CSRF`; it returns 200
+`{code: "ABCD-2345", expires_in: 600}`. Codes contain eight random characters (40 bits) from
+an alphabet excluding I, O, 0 and 1. Only the SHA-256 is stored. Each account has one live code;
+issuing another replaces it. The limit is five issues/account per ten minutes, returning 429
+when exhausted. Already linked accounts get 409 and must unlink first. Suspended accounts
+cannot issue codes. `POST /v1/me/xbox/unlink` uses the same session and CSRF checks and returns
+empty 204; it removes the binding and pending code, and pushes an empty library to the old Xbox.
+Unlinking retains account-owned selections, so a newly linked Xbox receives them.
+
+Enter the code in Cinnabar. On the existing authenticated `/v1/connect` socket the client sends
+`{type: "account_link", code: string}` (at most 64 characters; case, spaces and hyphens are ignored).
+The Hub uses only the connection's verified XUID and gamertag, never values in the message.
+It replies `{type: "account_link_result", ok: true, account: {display_name: string}}` or
+`{type: "account_link_result", ok: false, error: "invalid"|"expired"|"already_linked"|"rate_limited"}`.
+Success consumes the code atomically with linking and immediately pushes `mod_library` to that
+Xbox's connections. Replay returns `invalid`. Expired codes return `expired`; a valid code
+cannot bind an already-linked Xbox or account (`already_linked`) until the website unlinks it.
+Failed bindings do not consume the code. Ten attempts per connection are allowed; subsequent
+attempts return `rate_limited`. The counter survives hibernation and ordinary frame flood
+limits still apply. Schema v1 declares both messages and the website response shapes.
+
+Game `welcome`, `mod_library`, game removals and pushes resolve account IDs through `xbox_links`.
+Unlinked games have no library. `POST /v1/mods/<slug>/send` without a link returns 409
+`{"error":"Link your Xbox account in Cinnabar first."}`. Xbox linking does not grant cosmetic
+entitlements; those remain in the separate XUID-keyed entitlement table.
+
+Additive marketplace migration 8 creates `accounts(id, display_name, email, email_verified,
+role, suspended, created_at)`, `identities(provider, subject, account_id, email, email_verified)`
+with unique `(provider, subject)`, `xbox_links(xuid, account_id, gamertag, linked_at)` with
+unique XUID and account ID, `account_link_codes(code_hash, account_id, expires_at)` with unique
+hash and account ID, and a bounded-time `account_link_attempts(account_id, at)` issuance ledger.
+Legacy rows, if present, are mapped to random opaque IDs, their verified Xbox bindings preserved,
+and every stored account reference re-keyed; `system:official` remains reserved. Legacy emails
+start empty/unverified and legacy owner roles are demoted, since owner now requires a verified
+configured email. The deprecated `market_accounts` table is retained for rollback diagnostics
+and is never read by runtime authorization. Existing signed statements and asset URLs remain
+byte-identical; their historical approver values are not rewritten. Startup migration and
+multi-statement marketplace writes run in synchronous SQLite transactions. There was no
+production web account data before this migration.
 
 ## Upload and release contract
 
@@ -97,7 +170,7 @@ release. No network call must succeed to enqueue work. Independent consumers pol
 
 These routes require `Authorization: Bearer <MARKETPLACE_SCANNER_TOKEN>`. This
 credential cannot authenticate as staff or sign a release. Keep it separate from
-Microsoft credentials, production deployment credentials and the release key.
+Google credentials, production deployment credentials and the release key.
 Only trusted scanner processes receive it; a compromised scanner is a security
 incident requiring credential rotation, trust revocation and release review.
 
@@ -163,7 +236,7 @@ Staff cannot hide or restore their own listing or resolve reports about their ow
 Any staff member can hide a listing; only admins can restore one. The hide route's
 `hidden` field and the suspend route's `suspended` field must be booleans; anything
 else is a 422 and changes nothing. Role and suspension requests from callers who can't
-make them are refused with 403 before the gamertag is looked up, so they reveal
+make them are refused with 403 before the account ID is looked up, so they reveal
 nothing about which accounts exist.
 
 Automatic publication additionally requires a clear AI response, reach below Acts,
@@ -211,7 +284,7 @@ accepted scan of a still-pending version can establish its compatibility.
 ## Official Mod publication and shipped clients
 
 The reserved slug `cinnabar-mod` belongs to `system:official`, a system identity
-outside the Xbox XUID namespace, displayed as Cinnabar. Creators cannot claim it,
+outside the random user-account namespace, displayed as Cinnabar. Creators cannot claim it,
 even before its first release. It appears in the normal catalogue and supports
 normal send, update, exact-release, signed revocation and administrative pull routes.
 Its listing does not reveal the private publishing repository. Embedded license
@@ -314,18 +387,29 @@ that a production artifact matches the pinned reader or client ABI.
 
 The API deploys only from `main` through its existing `production` environment.
 Create the private `MOD_FILES` R2 bucket before merging. Configure `MARKETPLACE_ORIGIN`,
-`MICROSOFT_CLIENT_ID`, `OWNER_XUIDS`, the Microsoft app callback and Worker secrets
-`MARKETPLACE_SIGNING_KEY`, optional `MICROSOFT_CLIENT_SECRET`, and
-`MARKETPLACE_SCANNER_TOKEN`. Never place credentials in this repository.
+replace `GOOGLE_CLIENT_ID`'s `REPLACE_WITH_GOOGLE_CLIENT_ID` placeholder with the real Google
+OAuth web client ID, and set `OWNER_EMAILS` to comma-separated owner emails (trimmed and
+case-insensitive; only verified account emails qualify). Google requires authorized redirect URI
+`https://api.cinnabar.gg/v1/auth/google/callback`. For another API origin, register its identical
+callback path too: the callback URI is derived from the API request origin.
+Set Worker secrets `MARKETPLACE_SIGNING_KEY`, `GOOGLE_CLIENT_SECRET` and
+`MARKETPLACE_SCANNER_TOKEN`. Never place credentials in this repository. The production
+GitHub environment must contain `GOOGLE_CLIENT_SECRET`: deployment installs it with
+`wrangler secret put`, just like the signer. An empty secret fails deployment loudly rather
+than silently retaining an unknown old credential or deploying broken sign-in. Pull requests
+never receive these secrets. Missing configuration (including the client-ID placeholder)
+returns 503 from both Google auth endpoints.
 
-Web sign-in keeps no server state until Microsoft returns the browser. The start route
-seals the OAuth state, PKCE verifier and validated return address with AES-256-GCM in a
+Web sign-in keeps no server state until Google returns the browser. The start route
+seals the provider, OAuth state, PKCE verifier and validated return address with AES-256-GCM in a
 ten-minute `__Host-cinnabar_oauth` cookie (HttpOnly, Secure, SameSite=Lax). Its key is
 derived from `MARKETPLACE_SIGNING_KEY` with HKDF-SHA256 under a fixed purpose label, so
 sign-in needs that secret and rotating it voids sign-ins in progress. The callback
-clears the cookie and refuses one that is missing, altered, expired or for another
-state; Microsoft redeems each authorization code once. Signed-in routes called without a
-session cookie get their signed-out answer from the Worker without reaching the Hub.
+clears the cookie and refuses one that is missing, altered, expired, for another provider or
+another state. Google redeems each authorization code once. Failed state validation redirects
+to the configured site's `/mods/?signin_error=failed`; other failures return to the sealed
+`return_to` with `signin_error=failed` or `cancelled` (consent denied). None write to the Hub.
+Signed-in routes called without a session cookie get their signed-out answer from the Worker.
 
 For the initial signer, run `node scripts/marketplace-signing.mjs provision /path/to/client-checkout`.
 It generates Ed25519 material in memory, sends the PKCS#8 private half on stdin to
