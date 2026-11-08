@@ -129,10 +129,21 @@ Acts and Network listings must link their GitHub source.
   no added permissions or commands, and no suspension, withdrawal or open-report hold.
   Acts and Network releases always need human approval. See [the pipeline contract](docs/marketplace.md).
 - An approved version is signed with the Ed25519 `MARKETPLACE_SIGNING_KEY` over a canonical statement
-  `{approved_at, approvers, bytes, grants, sha256, slug, version, metadata, media, policy, client_revision, scan_job, publication}`,
+  `{approved_at, approvers, bytes, grants, sha256, slug, version, metadata, media, policy, client_revision, scan_job, publication, api_revision}`,
   returned as `release` on `GET /v1/mods/:slug`. `metadata` is the immutable listing snapshot, `media` the gallery
   descriptors, `policy` and `client_revision` the scan policy and pinned client revision, `scan_job` the scan job ID
-  and `publication` `manual` or `automatic`.
+  and `publication` `manual` or `automatic`. `api_revision` is the last (newest) stable API revision in the pinned
+  client's `crates/mod-api/compatibility-revisions.json`, derived by `pnpm source:fetch` and recorded per version
+  at submission and scan completion. Older versions without this stored revision retain their original statements
+  and are excluded from automatic update selection.
+- `GET /v1/mods/:slug/update?api_revisions=<comma-separated revisions>&host_revision=<40-hex>&current_version=<version>&current_sha256=<64-hex>`
+  anonymously returns `{release: {statement, signature}}` for the highest published version strictly newer than
+  the installed stable version, with a different digest and a stored `api_revision` in the supplied list (1–32
+  full lowercase 40-hex revisions). The host revision is required identity, not an equality constraint on the scan
+  client's pin. No match returns 204, malformed queries 400, unknown/hidden listings or suspended creators 404.
+  Pulled, unsigned or incompletely scanned releases never match. Responses use `Cache-Control: no-store` so pulls
+  and visibility changes apply on the next check; there is no compatibility fallback. The official `/v1/mod/update`
+  endpoint keeps its existing contract.
 - Pulled versions appear in `GET /v1/mods/revocations`, signed in `X-Cinnabar-Signature`.
 
 **Send to game.**
@@ -143,7 +154,7 @@ Acts and Network listings must link their GitHub source.
 | Route | Who |
 | --- | --- |
 | `GET /v1/me`, `POST /v1/auth/signout` | anyone; returns `{account, library, csrf, game_online}` |
-| `GET /v1/mods`, `GET /v1/mods/:slug`, `GET /v1/mods/assets/:sha256`, `GET /v1/mods/revocations` | public |
+| `GET /v1/mods`, `GET /v1/mods/:slug`, `GET /v1/mods/:slug/update`, `GET /v1/mods/assets/:sha256`, `GET /v1/mods/revocations` | public |
 | `POST /v1/mods/:slug/send`, `POST /v1/mods/:slug/reports`, `GET /v1/me/mods` | signed in |
 | `POST /v1/submissions` (multipart `listing` JSON and `file`) | signed in; five pending versions at most |
 | `GET /v1/staff/queue`, `/reports`, `/people`, `/audit`, `/versions/:id`, `/versions/:id/file` | staff |

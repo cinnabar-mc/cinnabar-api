@@ -1347,6 +1347,31 @@
         }
       }
     },
+    "MarketplaceUpdateQuery": {
+      "description": "GET /v1/mods/{slug}/update: full host identity, up to 32 supported stable API revisions, installed stable version and component digest. No compatibility fallback.",
+      "type": "object",
+      "required": [
+        "host_revision",
+        "current_version",
+        "current_sha256",
+        "api_revisions"
+      ],
+      "properties": {
+        "host_revision": {
+          "$ref": "#/$defs/GitRevision"
+        },
+        "current_version": {
+          "$ref": "#/$defs/StableModVersion"
+        },
+        "current_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "api_revisions": {
+          "$ref": "#/$defs/ModUpdateQuery/properties/api_revisions"
+        }
+      }
+    },
     "DownloadCountResponse": {
       "description": "GET /v1/downloads/count: installer and update-package downloads on published versioned releases and the current nightly. Counts repeat downloads; excludes metadata and support files. Deleted assets cannot be reconstructed.",
       "type": "object",

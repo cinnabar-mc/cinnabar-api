@@ -1,5 +1,6 @@
 /** Derive capabilities, versioned host imports and public trust roots from immutable client files. */
 export function deriveContract(inputs, revision) {
+  const apiRevision = newestApiRevision(inputs.compatibilityRevisions);
   const block = inputs.grants.split('grants! {')[1]?.split('\n}')[0];
   if (!block) throw new Error('Client grants declaration changed.');
   const capabilities = [...block.matchAll(/#\[permission\("([^"]+)", (true|false)(?:, (true|false))?\)\]\s+pub (\w+): (bool|Vec<String>),/g)]
@@ -20,7 +21,21 @@ export function deriveContract(inputs, revision) {
     typeof key !== 'string' || Buffer.from(key, 'base64').length !== 32 || Buffer.from(key, 'base64').toString('base64') !== key)) {
     throw new Error('Pin the client Ed25519 public keys before provisioning the marketplace signer.');
   }
-  return { revision, capabilities, interfaces, signingKeys, component: componentLimits(inputs) };
+  return { revision, api_revision: apiRevision, capabilities, interfaces, signingKeys, component: componentLimits(inputs) };
+}
+
+/** Requires the client's nonempty oldest-to-newest array of full revisions; its last entry is the scanned API. */
+export function newestApiRevision(input) {
+  let revisions;
+  try {
+    revisions = JSON.parse(input);
+  } catch {
+    throw new Error('Client compatibility revisions must be a nonempty JSON array of full 40-hex revisions.');
+  }
+  if (!Array.isArray(revisions) || !revisions.length || revisions.some(value => typeof value !== 'string' || !/^[0-9a-f]{40}$/.test(value))) {
+    throw new Error('Client compatibility revisions must be a nonempty JSON array of full 40-hex revisions.');
+  }
+  return revisions.at(-1);
 }
 
 /**

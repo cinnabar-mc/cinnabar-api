@@ -8,6 +8,7 @@ import { SignInFailure, authorizeUrl, randomToken, sha256Base64Url, xboxIdentity
 import { MAX_RETURN_TO, OAUTH_STATE_MS, openSignIn, sealSignIn } from "./oauth-state";
 import { PLAYER_SESSION_MS, anonymousResult, type Caller, type MarketCall, type MarketResult, type MediaFile } from "./store";
 import { BodyLimitError, MAX_IMAGES, MAX_UPLOAD_BYTES, imageType, readLimited, sha256 } from "./uploads";
+import { isMarketplaceUpdateQuery } from "./updates";
 
 const SESSION_COOKIE = "cinnabar_session";
 const OAUTH_COOKIE = "cinnabar_oauth";
@@ -218,6 +219,15 @@ marketplaceRoutes.get("/mods/:slug", publicCache(CATALOGUE_CACHE), async (c) => 
 marketplaceRoutes.get("/mods/:slug/releases/:version/:sha256", async c => {
   const hash = c.req.param("sha256");
   return SHA256.test(hash) ? reply(c, await call(c, { op: "release", slug: c.req.param("slug"), version: c.req.param("version"), sha256: hash })) : c.notFound();
+});
+marketplaceRoutes.get("/mods/:slug/update", async c => {
+  // Selection depends on every query identity, and pulls/visibility changes must apply on the next check.
+  c.header("Cache-Control", "no-store");
+  const query = { api_revisions: c.req.query("api_revisions") ?? "", host_revision: c.req.query("host_revision") ?? "",
+    current_version: c.req.query("current_version") ?? "", current_sha256: c.req.query("current_sha256") ?? "" };
+  if (!isMarketplaceUpdateQuery(query)) return c.body(null, 400);
+  const result = await call(c, { op: "update", slug: c.req.param("slug"), query });
+  return result.status === 204 ? c.body(null, 204) : reply(c, result);
 });
 
 marketplaceRoutes.post("/mods/:slug/send", (c) => forward(c, { op: "send", slug: c.req.param("slug") }));

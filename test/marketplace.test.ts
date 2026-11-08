@@ -791,6 +791,223 @@ describe("upload and publication pipeline", () => {
   });
 });
 
+describe("marketplace revision-checked updates", () => {
+  const revision = () => contract.api_revision;
+  const unknownRevision = "f".repeat(40);
+  const installedHash = "0".repeat(64);
+  /** Build the complete anonymous update URL; overrides exercise the schema at the HTTP boundary. */
+  function updateUrl(slug: string, overrides: Record<string, string> = {}) {
+    return `/mods/${slug}/update?${new URLSearchParams({ api_revisions: revision(), host_revision: "a".repeat(40),
+      current_version: "1.0.0", current_sha256: installedHash, ...overrides })}`;
+  }
+  let creatorId = 2535400000008500n;
+  /** Publish a synthetic component through the real submission, scan and staff-signing paths. */
+  async function project(slug: string, versions = ["1.1.0"], apiRevisions: Record<string, string | null> = {}) {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const gamertag = `Updater${String(++creatorId).slice(-4)}`;
+    const creator = await signIn(String(creatorId), gamertag);
+    const releases: { id: string; sha256: string }[] = [];
+    for (const version of versions) {
+      const response = await submit(creator, slug, version, { hud: true });
+      expect(response.status).toBe(200);
+      const release = await response.json() as { id: string; sha256: string };
+      // Model releases validated under historical client pins, before building their signed statements.
+      if (Object.hasOwn(apiRevisions, version)) await runInDurableObject(hub(), (_: Hub, state) => {
+        state.storage.sql.exec("UPDATE mod_versions SET api_revision = ? WHERE id = ?", apiRevisions[version]!, Number(release.id));
+      });
+      expect((await owner.post(`/staff/versions/${release.id}/decision`, { decision: "approve" })).status).toBe(200);
+      releases.push(release);
+    }
+    return { owner, creator, gamertag, releases };
+  }
+
+  it("returns the numerically newest compatible newer signed release anonymously", async () => {
+    const { releases } = await project("update-selection", ["1.2.0", "1.10.0", "1.9.0"]);
+    const response = await api(updateUrl("update-selection"));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    const body = await response.json() as any;
+    expect(Object.keys(body)).toEqual(["release"]);
+    expect(Object.keys(body.release)).toEqual(["statement", "signature"]);
+    expect(Object.keys(JSON.parse(body.release.statement))).toEqual(["approved_at", "approvers", "bytes", "grants", "sha256",
+      "slug", "version", "metadata", "media", "policy", "client_revision", "scan_job", "publication", "api_revision"]);
+    expect(await verifies(body.release.statement, body.release.signature)).toBe(true);
+    expect(JSON.parse(body.release.statement)).toMatchObject({ slug: "update-selection", version: "1.10.0",
+      sha256: releases[1]!.sha256, api_revision: revision() });
+    expect(revision()).toMatch(/^[0-9a-f]{40}$/);
+    const exact = await (await api(`/mods/update-selection/releases/1.10.0/${releases[1]!.sha256}`)).json();
+    expect(body).toEqual(exact);
+  });
+
+  it("returns no update without a supported API, newer version and different digest", async () => {
+    const { releases } = await project("update-no-fallback");
+    const cases: Record<string, string>[] = [{ api_revisions: unknownRevision }, { current_version: "1.1.0" },
+      { current_version: "9.0.0" }, { current_sha256: releases[0]!.sha256 }];
+    for (const overrides of cases) {
+      const response = await api(updateUrl("update-no-fallback", overrides));
+      expect(response.status).toBe(204);
+      expect(await response.text()).toBe("");
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+    }
+    const response = await api(updateUrl("update-no-fallback", { api_revisions: `${unknownRevision},${revision()}` }));
+    expect(response.status).toBe(200);
+  });
+
+  it("skips a higher incompatible release and excludes versions without stored API revisions", async () => {
+    await project("update-generations", ["1.1.0", "2.0.0", "3.0.0"], { "2.0.0": unknownRevision, "3.0.0": null });
+    const response = await api(updateUrl("update-generations"));
+    expect(response.status).toBe(200);
+    const body = await response.json() as any;
+    expect(JSON.parse(body.release.statement)).toMatchObject({ version: "1.1.0", api_revision: revision() });
+    expect(await verifies(body.release.statement, body.release.signature)).toBe(true);
+    expect((await api(updateUrl("update-generations", { current_version: "2.0.0" }))).status).toBe(204);
+    const both = await (await api(updateUrl("update-generations", { api_revisions: `${revision()},${unknownRevision}` }))).json() as any;
+    expect(JSON.parse(both.release.statement).version).toBe("2.0.0");
+    expect((await api(updateUrl("update-generations", { api_revisions: "e".repeat(40) }))).status).toBe(204);
+  });
+
+  it("requires every publication gate and immediately applies pulls, hiding and creator suspension", async () => {
+    const { releases, owner, gamertag } = await project("update-gates", ["1.1.0", "1.2.0"]);
+    const newest = Number(releases[1]!.id);
+    const url = updateUrl("update-gates", { current_version: "1.1.0" });
+    expect((await api(url)).status).toBe(200);
+    const gates = [
+      ["UPDATE mod_versions SET status = 'submitted' WHERE id = ?", "UPDATE mod_versions SET status = 'approved' WHERE id = ?"],
+      ["UPDATE mod_versions SET signature = NULL WHERE id = ?", ""],
+      ["UPDATE mod_versions SET statement = NULL WHERE id = ?", ""],
+      ...["queued", "running", "failed"].map(value => [`UPDATE mod_pipeline SET state = '${value}' WHERE version_id = ?`, "UPDATE mod_pipeline SET state = 'complete' WHERE version_id = ?"]),
+    ];
+    const original = await (await api(`/mods/update-gates/releases/1.2.0/${releases[1]!.sha256}`)).json() as any;
+    for (const [disable, restore] of gates) {
+      await runInDurableObject(hub(), (_: Hub, state) => { state.storage.sql.exec(disable!, newest); });
+      const response = await api(url);
+      expect(response.status, disable).toBe(204);
+      expect(await response.text()).toBe("");
+      await runInDurableObject(hub(), (_: Hub, state) => {
+        if (restore) state.storage.sql.exec(restore, newest);
+        else state.storage.sql.exec("UPDATE mod_versions SET statement = ?, signature = ? WHERE id = ?", original.release.statement, original.release.signature, newest);
+      });
+      expect((await api(url)).status).toBe(200);
+    }
+    expect((await owner.post(`/staff/versions/${newest}/pull`, { reason: "Synthetic update pull" })).status).toBe(200);
+    expect((await api(url)).status).toBe(204);
+    const fallback = await (await api(updateUrl("update-gates"))).json() as any;
+    expect(JSON.parse(fallback.release.statement).version).toBe("1.1.0");
+    expect((await owner.post("/staff/mods/update-gates/hide", { hidden: true, reason: "Synthetic visibility hold" })).status).toBe(200);
+    const hidden = await api(updateUrl("update-gates"));
+    expect(hidden.status).toBe(404);
+    expect(hidden.headers.get("Cache-Control")).toBe("no-store");
+    expect((await owner.post("/staff/mods/update-gates/hide", { hidden: false, reason: "Reviewed" })).status).toBe(200);
+    expect((await owner.post("/staff/people/suspend", { gamertag, suspended: true, reason: "Synthetic creator hold" })).status).toBe(200);
+    expect((await api(updateUrl("update-gates"))).status).toBe(404);
+    expect((await owner.post("/staff/people/suspend", { gamertag, suspended: false, reason: "Reviewed" })).status).toBe(200);
+    expect((await api(updateUrl("update-gates"))).status).toBe(200);
+  });
+
+  it("keeps legacy statements byte-identical through the additive migration without inventing compatibility", async () => {
+    const { releases } = await project("update-legacy");
+    const exactUrl = `/mods/update-legacy/releases/1.1.0/${releases[0]!.sha256}`;
+    const original = await (await api(exactUrl)).json() as any;
+    const oldFields = JSON.parse(original.release.statement);
+    delete oldFields.api_revision;
+    const statement = JSON.stringify(oldFields);
+    const signature = await signText(env.MARKETPLACE_SIGNING_KEY!, statement);
+    await runInDurableObject(hub(), (_: Hub, state) => {
+      const sql = state.storage.sql;
+      sql.exec("UPDATE mod_versions SET statement = ?, signature = ? WHERE id = ?", statement, signature, Number(releases[0]!.id));
+      sql.exec("DROP INDEX mod_versions_updates");
+      sql.exec("ALTER TABLE mod_versions DROP COLUMN api_revision");
+      sql.exec("DELETE FROM market_schema WHERE version = 6");
+      const restored = new MarketplaceStore(sql, new Set([OWNER]));
+      new MarketplaceStore(sql, new Set([OWNER])); // Reopening is idempotent.
+      expect(sql.exec<{ api_revision: string | null }>("SELECT api_revision FROM mod_versions WHERE id = ?", Number(releases[0]!.id)).one().api_revision).toBeNull();
+      expect(restored.statement(Number(releases[0]!.id))).toBe(statement);
+    });
+    expect(await (await api(exactUrl)).json()).toEqual({ release: { statement, signature } });
+    expect(await verifies(statement, signature)).toBe(true);
+    expect((await api(updateUrl("update-legacy"))).status).toBe(204);
+  });
+
+  it("records submission compatibility and refreshes it only when a current scan completes", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const creator = await signIn(String(++creatorId), "PendingUpdater");
+    const submitted = await submit(creator, "update-scan-pin", "1.1.0", { hud: true }, {}, false);
+    expect(submitted.status).toBe(200);
+    const { id } = await submitted.json() as { id: string };
+    await runInDurableObject(hub(), (_: Hub, state) => {
+      const sql = state.storage.sql;
+      expect(sql.exec<{ api_revision: string }>("SELECT api_revision FROM mod_versions WHERE id = ?", Number(id)).one().api_revision).toBe(revision());
+      sql.exec("UPDATE mod_versions SET api_revision = ? WHERE id = ?", unknownRevision, Number(id));
+    });
+    expect((await api(updateUrl("update-scan-pin"))).status).toBe(204);
+    const job = await claim();
+    expect((await scanner(`jobs/${job.id}/complete`, report(job, { client_revision: unknownRevision }), job.lease)).status).toBe(422);
+    await runInDurableObject(hub(), (_: Hub, state) => {
+      expect(state.storage.sql.exec<{ api_revision: string }>("SELECT api_revision FROM mod_versions WHERE id = ?", Number(id)).one().api_revision).toBe(unknownRevision);
+    });
+    expect((await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).status).toBe(200);
+    expect((await owner.post(`/staff/versions/${id}/decision`, { decision: "approve" })).status).toBe(200);
+    const selected = await (await api(updateUrl("update-scan-pin"))).json() as any;
+    expect(JSON.parse(selected.release.statement).api_revision).toBe(revision());
+    expect(await verifies(selected.release.statement, selected.release.signature)).toBe(true);
+  });
+
+  it("uses the slug/revision index without reading unrelated releases", async () => {
+    await project("update-index");
+    await runInDurableObject(hub(), (_: Hub, state) => {
+      const sql = state.storage.sql;
+      const cursors: SqlStorageCursor<Record<string, SqlStorageValue>>[] = [];
+      const counting = { exec: (query: string, ...bindings: SqlStorageValue[]) => {
+        const cursor = sql.exec(query, ...bindings);
+        cursors.push(cursor);
+        return cursor;
+      } } as unknown as SqlStorage;
+      const store = new MarketplaceStore(counting, new Set([OWNER]));
+      const rowsRead = () => {
+        cursors.length = 0;
+        expect(store.update("update-index", { api_revisions: revision(), host_revision: "a".repeat(40), current_version: "1.0.0", current_sha256: installedHash }).status).toBe(200);
+        return cursors.reduce((total, cursor) => total + cursor.rowsRead, 0);
+      };
+      const before = rowsRead();
+      sql.exec(`INSERT INTO mod_listings (slug, creator, name, summary, description, source, created_at)
+        SELECT 'update-unrelated', creator, name, summary, description, source, created_at FROM mod_listings WHERE slug = 'update-index'`);
+      for (let i = 0; i < 200; i++) {
+        const id = sql.exec<{ id: number }>(`INSERT INTO mod_versions (slug, version, sha256, bytes, grants, reach, status,
+          submitted_at, signature, statement, api_revision) VALUES ('update-unrelated', ?, ?, 1, '{}', 0, 'approved', 0, 'fixture', 'fixture', ?) RETURNING id`,
+          `0.0.${i}`, i.toString(16).padStart(64, "b"), revision()).one().id;
+        sql.exec("INSERT INTO mod_pipeline (version_id, metadata, job_id, state) VALUES (?, '{}', ?, 'complete')", id, `update-unrelated-${i}`);
+      }
+      expect(rowsRead()).toBe(before);
+      expect(sql.exec<{ detail: string }>("EXPLAIN QUERY PLAN SELECT * FROM mod_versions WHERE slug = ? AND api_revision IN (?)", "update-index", revision()).toArray()
+        .some(row => row.detail.includes("mod_versions_updates"))).toBe(true);
+    });
+  });
+
+  it("rejects malformed queries and distinguishes missing listings from no update", async () => {
+    const valid = { api_revisions: "b".repeat(40), host_revision: "a".repeat(40), current_version: "1.0.0", current_sha256: installedHash };
+    const bad: Record<string, string>[] = [];
+    for (const key of Object.keys(valid)) {
+      const missing: Record<string, string> = { ...valid };
+      delete missing[key];
+      bad.push(missing, { ...valid, [key]: "" });
+    }
+    for (const extra of [{ host_revision: "a".repeat(39) }, { host_revision: "A".repeat(40) },
+      { api_revisions: "b".repeat(39) }, { api_revisions: `${"b".repeat(40)},` },
+      { api_revisions: Array(33).fill("b".repeat(40)).join(",") }, { api_revisions: "B".repeat(40) },
+      { current_version: "1.0.0-beta" }, { current_version: "01.0.0" }, { current_version: "1.0" },
+      { current_sha256: "a".repeat(63) }, { current_sha256: "A".repeat(64) }]) bad.push({ ...valid, ...extra });
+    for (const query of bad) {
+      const response = await api(`/mods/update-missing/update?${new URLSearchParams(query)}`);
+      expect(response.status, JSON.stringify(query)).toBe(400);
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+    }
+    const response = await api(updateUrl("update-missing", { api_revisions: Array(32).fill("b".repeat(40)).join(",") }));
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+  });
+});
+
 /** Publishes `slug` from a fresh creator with one owner approval. */
 async function published(owner: Browser, creatorXuid: string, slug: string) {
   const creator = await signIn(creatorXuid, `Maker${creatorXuid.slice(-4)}`);
