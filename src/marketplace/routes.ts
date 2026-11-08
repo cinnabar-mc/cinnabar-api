@@ -176,12 +176,16 @@ marketplaceRoutes.get("/auth/google/callback", async (c) => {
       clientId: c.env.GOOGLE_CLIENT_ID, clientSecret: c.env.GOOGLE_CLIENT_SECRET,
       redirectUri: callbackUrl(c), code, verifier,
     });
-  } catch {
+  } catch (error) {
+    console.error("Google sign-in failed:", error instanceof Error ? error.message : "unknown error");
     return back("failed");
   }
   const token = randomToken();
   const signedIn = await call(c, { op: "signin", identity, newSession: await sha256Base64Url(token), newCsrf: randomToken(24) });
-  if (signedIn.status !== 200) return back("failed");
+  if (signedIn.status !== 200) {
+    console.error("Google sign-in was refused by the store:", signedIn.status);
+    return back("failed");
+  }
   setCookie(c, SESSION_COOKIE, token, { prefix: "host", httpOnly: true, sameSite: "Lax", maxAge: PLAYER_SESSION_MS / 1000 });
   return back();
 });
