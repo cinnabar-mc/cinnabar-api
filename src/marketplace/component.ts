@@ -1,5 +1,6 @@
 import contract from "../../.generated/contract.json";
 import { malformedText, requestedCapabilities, type Grants } from "./policy";
+import { ICON_SECTION, iconError } from "./icon";
 
 /** Maximum accepted component size; every body reader enforces this independently of Content-Length. */
 export const MAX_COMPONENT_BYTES = 16 * 1024 * 1024;
@@ -13,6 +14,7 @@ const ASSET_SECTIONS: ReadonlySet<string> = new Set(contract.component.asset_sec
 interface ComponentDeclarations {
   name: string; description: string; version: string; authors: string; licenses: string;
   grants: Grants | null; grantsDeclared: boolean;
+  icon: Uint8Array | null; iconError: string | null;
 }
 /** Read a u32 LEB without crossing its containing section or overflowing. */
 function leb(bytes: Uint8Array, offset: number, end: number): [number, number] {
@@ -52,6 +54,7 @@ function parseGrants(value: string): Grants {
  * Read strictly framed top-level declarations. Full component/type/code validation
  * additionally runs in the scanner; this reader never executes an upload. Trusted official publication may
  * supply its existing 32 MiB transport ceiling; creator submissions retain the default 16 MiB ceiling.
+ * Invalid optional icons yield null and a private diagnostic; they never reject otherwise valid framing.
  */
 export function readComponent(bytes: Uint8Array, maxBytes = MAX_COMPONENT_BYTES): ComponentDeclarations {
   if (bytes.length > maxBytes) throw new Error(`The file is over ${maxBytes / 1048576} MiB.`);
@@ -60,7 +63,8 @@ export function readComponent(bytes: Uint8Array, maxBytes = MAX_COMPONENT_BYTES)
   if (layer([1, 0, 0, 0])) throw new Error("This is a core module. Package it as a component first.");
   if (!layer([13, 0, 1, 0])) throw new Error("Invalid component header.");
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
-  const found: ComponentDeclarations = { name: "", description: "", version: "", authors: "", licenses: "", grants: null, grantsDeclared: false };
+  const found: ComponentDeclarations = { name: "", description: "", version: "", authors: "", licenses: "", grants: null, grantsDeclared: false,
+    icon: null, iconError: null };
   const seen = new Set<string>();
   let offset = 8;
   let assetBytes = 0;
@@ -81,6 +85,16 @@ export function readComponent(bytes: Uint8Array, maxBytes = MAX_COMPONENT_BYTES)
       if (recognized && seen.has(name)) throw new Error("Duplicate metadata section: " + name);
       if (recognized) seen.add(name);
       const data = bytes.subarray(nameEnd, end);
+      if (name === ICON_SECTION) {
+        if (seen.has(name)) {
+          found.icon = null;
+          found.iconError = "Duplicate icon sections.";
+        } else {
+          found.iconError = iconError(data);
+          found.icon = found.iconError === null ? data : null;
+        }
+        seen.add(name);
+      }
       if (["description", "version", "authors", "licenses"].includes(name)) {
         if (data.length > 65536) throw new Error("Metadata section is too large.");
         found[name as "description" | "version" | "authors" | "licenses"] = decoder.decode(data);

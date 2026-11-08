@@ -32,7 +32,7 @@ export function parseScanReport(input: unknown, sha256: string, media: string[] 
   if (v.sha256 !== sha256 || v.policy !== SCAN_POLICY || v.validator !== VALIDATOR || v.client_revision !== CLIENT_REVISION
     || !["pass", "block", "error"].includes(String(v.deterministic))
     || !strings(v.imports, 256, 256) || !strings(v.exports, 256, 256) || !strings(v.findings, 32, 1000)
-    || !strings(v.media, 4, 64) || JSON.stringify(v.media) !== JSON.stringify(media)) return null;
+    || !strings(v.media, 5, 64) || JSON.stringify(v.media) !== JSON.stringify(media)) return null;
   const ai = v.ai as Record<string, unknown> | null;
   if (!ai || typeof ai !== "object" || !["clear", "flag", "error"].includes(String(ai.verdict))
     || typeof ai.model !== "string" || !ai.model || ai.model.length > 128 || ai.prompt !== PROMPT_VERSION

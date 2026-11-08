@@ -37,6 +37,14 @@ export async function sha256(bytes: Uint8Array): Promise<string> {
   return [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
+/** Stores a structurally validated component icon as hash-addressed PNG media; null means no usable icon. */
+export async function storeComponentIcon(bucket: R2Bucket, bytes: Uint8Array | null): Promise<MediaFile | null> {
+  if (bytes === null) return null;
+  const hash = await sha256(bytes);
+  await bucket.put(`media/${hash}`, bytes, { httpMetadata: { contentType: "image/png" } });
+  return { sha256: hash, bytes: bytes.length, type: "image/png", caption: "", role: "icon" };
+}
+
 /** Accept passive raster formats only. The scanner fully decodes them before publication. */
 export function imageType(bytes: Uint8Array): MediaFile["type"] {
   if (bytes.length > MAX_IMAGE_BYTES || bytes.length < 12) throw new Error("Each image must be at most 1 MiB.");

@@ -137,6 +137,15 @@ A source link is optional for every listing.
 - Components (at most 16 MiB, of which at most the pinned client's 4 MiB may be executable code) and up to four raster images (1 MiB each) enter private
   `MOD_FILES` storage under server-computed SHA-256 keys. An authenticated,
   byte-bounded multipart request creates an immutable metadata snapshot and durable scan job.
+- Listing summaries and details include `icon: string | null`, a hash-addressed
+  `/v1/mods/media/<sha256>` URL extracted from the approved component's optional
+  `cinnabar:extension/icon@1` PNG section. Creators do not upload a separate icon;
+  screenshots remain optional gallery images. Icons must be unique, at most 256 KiB,
+  and 1–256 pixels per side. Invalid icons use the placeholder without rejecting the
+  upload; creator/staff version views include a private preview `icon` URL and an
+  `icon_error` diagnostic. Pending versions never replace the public icon.
+  The Worker checks PNG structure and CRCs; the client also decodes pixels. See
+  [icon validation and media](docs/marketplace.md#upload-and-release-contract).
 - A separate scanner validates full component structure/types/core bytecode, host imports
   and image decoding without executing uploaded code. Workers AI assists staff with bounded,
   schema-validated findings. Missing, failed or expired checks prevent publication.
@@ -147,7 +156,7 @@ A source link is optional for every listing.
 - An approved version is signed with the Ed25519 `MARKETPLACE_SIGNING_KEY` over a canonical statement
   `{approved_at, approvers, bytes, grants, sha256, slug, version, metadata, media, policy, client_revision, scan_job, publication, api_revision}`,
   returned as `release` on `GET /v1/mods/:slug`. `metadata` is the immutable listing snapshot, `media` the gallery
-  descriptors, `policy` and `client_revision` the scan policy and pinned client revision, `scan_job` the scan job ID
+  and component icon descriptors (icons carry `role: "icon"`), `policy` and `client_revision` the scan policy and pinned client revision, `scan_job` the scan job ID
   and `publication` `manual`, `automatic` or `official`. Official statements retain the manifest’s host and API
   revisions and identify their separate authenticated-hook validation policy. For creator uploads, `api_revision`
   is the last (newest) stable API revision in the pinned

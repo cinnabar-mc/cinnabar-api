@@ -4,6 +4,7 @@ import { catalog, admitLoadout } from "./cosmetics";
 import { loadCatalog, type Catalog } from "./catalog-store";
 import { ModReleases, type ModRelease, type ModUpdateQuery } from "./mod-releases";
 import { readComponent } from "./marketplace/component";
+import { storeComponentIcon } from "./marketplace/uploads";
 import { modAssetKey, MAX_MOD_ASSET_BYTES } from "./mod-assets";
 import { DurableObject } from "cloudflare:workers";
 import { MarketplaceStore, handle, type MarketCall, type MarketResult } from "./marketplace/store";
@@ -259,8 +260,10 @@ export class Hub extends DurableObject<Env> {
     let declarations: ReturnType<typeof readComponent>;
     try { declarations = readComponent(bytes, MAX_MOD_ASSET_BYTES); } catch { return false; }
     if (declarations.version && declarations.version !== release.manifest.version) return false;
+    const icon = await storeComponentIcon(this.env.MOD_FILES, declarations.icon);
     const id = this.ctx.storage.transactionSync(() => this.mods.matches(release)
-      ? this.market.officialRelease(release, declarations.grants ?? {}, declarations.licenses, Date.now()) : null);
+      ? this.market.officialRelease(release, declarations.grants ?? {}, declarations.licenses, Date.now(),
+        { media: icon ? [icon] : [], iconError: declarations.iconError }) : null);
     return id !== null && (this.market.officialSigned(id) || await this.publishMod(id) || this.market.officialSigned(id));
   }
 

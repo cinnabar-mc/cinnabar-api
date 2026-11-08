@@ -94,7 +94,8 @@ function targetsClientWorld(bytes: Uint8Array, world: "extension" | "packet-mod"
 
 /** Build bounded evidence from bytes, independently checking declarations against the claimed job. */
 export async function analyze(job: ScanJob, bytes: Uint8Array, media: Uint8Array[]) {
-  const declarations = readComponent(bytes);
+  // Binary presentation data is media, never text evidence for the AI reviewer.
+  const { icon: _icon, iconError: _iconError, ...declarations } = readComponent(bytes);
   if (JSON.stringify(declarations.grants ?? {}) !== JSON.stringify(job.grants)) throw new Error("Grant attestation mismatch.");
   const component = await validateComponent(bytes);
   if (component.imports.length > 256 || component.exports.length > 256) throw new Error("Too many component interfaces.");
