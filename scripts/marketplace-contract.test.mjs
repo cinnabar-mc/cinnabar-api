@@ -5,6 +5,7 @@ import { deriveContract } from './marketplace-contract.mjs';
 /** Synthetic public inputs exercise declaration extraction without downloading client code. */
 function inputs(type = 'bool') {
   return {
+    compatibilityRevisions: JSON.stringify(['1'.repeat(40), '2'.repeat(40)]),
     grants: `grants! {\n    #[permission("HUD", false)]\n    pub hud: bool,\n    #[permission("Packets", true, true)]\n    pub packets: ${type},\n}`,
     wit: 'package cinnabar:extension@0.1.0;\ninterface clock {\n}\nworld extension { import cinnabar:world-draw/drawing@0.2.0; }',
     drawing: 'package cinnabar:world-draw@0.2.0;\ninterface drawing {\n}',
@@ -41,4 +42,16 @@ test('derives the executable component ceiling and the asset sections the client
     { modApi: base.modApi.replace('[&str; 2]', '[&str; 3]') },
     { modApi: base.modApi.replace('pub const ICON_SECTION', 'const ICON') },
   ]) assert.throws(() => deriveContract({ ...base, ...changed }, 'a'.repeat(40)), /Client component/);
+});
+
+test('derives the newest stable API revision from the ordered compatibility history', () => {
+  assert.equal(deriveContract(inputs(), 'a'.repeat(40)).api_revision, '2'.repeat(40));
+  assert.equal(deriveContract({ ...inputs(), compatibilityRevisions: JSON.stringify(['3'.repeat(40)]) }, 'a'.repeat(40)).api_revision, '3'.repeat(40));
+});
+
+test('refuses missing, empty or changed API compatibility history shapes', () => {
+  for (const compatibilityRevisions of [undefined, '', '{}', 'null', '[]', '[42]',
+    JSON.stringify(['a'.repeat(40), 'bad']), JSON.stringify(['A'.repeat(40)]), JSON.stringify(['a'.repeat(39)])]) {
+    assert.throws(() => deriveContract({ ...inputs(), compatibilityRevisions }, 'a'.repeat(40)), /compatibility revisions/i);
+  }
 });

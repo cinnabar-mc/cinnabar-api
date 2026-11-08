@@ -1,11 +1,12 @@
-import type { ModLibraryEntry } from "../protocol";
+import { compareVersions, type ModLibraryEntry } from "../protocol";
+import type { MarketplaceUpdateQuery } from "./updates";
 import {
   ROLES, STAFF_MANAGERS_ONLY, approvalRule, approvalsComplete, atLeast, canApprove, canReview, canSetRole, clip, fieldsOf, grantDiff,
   malformedText, managesStaff, reachOf, requestedCapabilities, trimmed, validateListing, type Actor, type Grants, type ListingFields,
   type Reach, type ReviewState, type Role,
 } from "./policy";
 import { revocationBody, withinRevocationBudget, type RevokedRow } from "./revocations";
-import { CLIENT_REVISION, MAX_SCAN_ATTEMPTS, SCAN_LEASE_MS, SCAN_MAX_AGE_MS, SCAN_POLICY, parseScanReport, scanReady, type ScanReport } from "./scanning";
+import { API_REVISION, CLIENT_REVISION, MAX_SCAN_ATTEMPTS, SCAN_LEASE_MS, SCAN_MAX_AGE_MS, SCAN_POLICY, parseScanReport, scanReady, type ScanReport } from "./scanning";
 
 export const PLAYER_SESSION_MS = 30 * 24 * 3_600_000;
 const STAFF_SESSION_MS = 12 * 3_600_000;
@@ -58,6 +59,7 @@ type VersionRow = {
   pull_reason: string;
   signature: string | null;
   statement: string | null;
+  api_revision: string | null;
   creator: string;
 };
 type ListingRow = {
@@ -170,6 +172,9 @@ export class MarketplaceStore {
       WHERE json_type(m.value, '$.sha256') = 'text'`);
     // Pending sign-ins now live in sealed browser cookies; drop the table anonymous sign-in starts used to fill.
     migrate(5, "DROP TABLE IF EXISTS oauth_states");
+    // Never infer compatibility for existing versions or rewrite their signed statements.
+    migrate(6, "ALTER TABLE mod_versions ADD COLUMN api_revision TEXT",
+      "CREATE INDEX mod_versions_updates ON mod_versions (slug, api_revision)");
   }
 
   /** Increases whenever the set of pulled versions changes, so callers can tell a memoized revocation list is stale. */
@@ -358,7 +363,8 @@ export class MarketplaceStore {
     const p = this.pipeline(v.id)!;
     return JSON.stringify({ approved_at: v.decided_at, approvers, bytes: v.bytes, grants: parseWellFormed(v.grants), sha256: v.sha256,
       slug: v.slug, version: v.version, metadata: parseWellFormed(p.metadata), media: parseWellFormed(p.media),
-      policy: SCAN_POLICY, client_revision: CLIENT_REVISION, scan_job: p.job_id, publication: p.publish_mode });
+      policy: SCAN_POLICY, client_revision: CLIENT_REVISION, scan_job: p.job_id, publication: p.publish_mode,
+      ...(v.api_revision === null ? {} : { api_revision: v.api_revision }) });
   }
 
   /** Returns exact signed metadata for a still-public digest, including an older library selection. */
@@ -367,6 +373,21 @@ export class MarketplaceStore {
     const v = this.versions(`v.slug = ? AND v.version = ? AND v.sha256 = ? AND ${PUBLISHED}`, slug, version, sha256)[0];
     if (!listing || listing.hidden || this.account(listing.creator)?.suspended || !v) return fail(404, "No such release.");
     return ok({ release: { statement: v.statement, signature: v.signature } });
+  }
+
+  /** Selects the highest newer public version for this slug and supported API list, without any compatibility fallback. */
+  update(slug: string, query: MarketplaceUpdateQuery): MarketResult {
+    const listing = this.listing(slug);
+    if (!listing || listing.hidden || this.account(listing.creator)?.suspended) return fail(404, "No such mod.");
+    const revisions = query.api_revisions.split(",");
+    const candidates = this.versions(`v.slug = ? AND v.api_revision IN (${revisions.map(() => "?").join(",")})
+      AND v.sha256 != ? AND ${PUBLISHED}`, slug, ...revisions, query.current_sha256);
+    let best: VersionRow | undefined;
+    for (const v of candidates) {
+      if (compareVersions(v.version, query.current_version) <= 0) continue;
+      if (!best || compareVersions(v.version, best.version) > 0) best = v;
+    }
+    return best ? ok({ release: { statement: best.statement, signature: best.signature } }) : { status: 204, body: null };
   }
 
   /** Atomically exposes a signed release after rechecking every gate following external I/O. */
@@ -496,9 +517,9 @@ export class MarketplaceStore {
     this.sql.exec(`INSERT INTO mod_listings (slug, creator, name, summary, description, source, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (slug) DO NOTHING`,
       fields.slug, session.account.xuid, fields.name, fields.summary, fields.description, fields.source, now);
-    const id = this.sql.exec<{ id: number }>(`INSERT INTO mod_versions (slug, version, sha256, bytes, grants, reach, status, submitted_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'submitted', ?) RETURNING id`,
-      fields.slug, fields.version, file.sha256, file.bytes, JSON.stringify(grants), reach, now).one().id;
+    const id = this.sql.exec<{ id: number }>(`INSERT INTO mod_versions (slug, version, sha256, bytes, grants, reach, status, submitted_at, api_revision)
+        VALUES (?, ?, ?, ?, ?, ?, 'submitted', ?, ?) RETURNING id`,
+      fields.slug, fields.version, file.sha256, file.bytes, JSON.stringify(grants), reach, now, API_REVISION).one().id;
     const baseline = this.liveVersion(fields.slug)?.id ?? null;
     this.sql.exec(`INSERT INTO mod_pipeline (version_id, metadata, media, baseline, job_id) VALUES (?, ?, ?, ?, ?)`,
       id, JSON.stringify(fields), JSON.stringify(file.media), baseline, crypto.randomUUID());
@@ -598,6 +619,8 @@ export class MarketplaceStore {
     const failed = report.deterministic === "error" || report.ai.verdict === "error";
     this.sql.exec("UPDATE mod_pipeline SET state = ?, report = ?, completed_at = ? WHERE version_id = ?",
       failed ? "failed" : "complete", JSON.stringify(report), now, v.id);
+    // Pending releases can cross deployments; the accepted report attests to the current pinned scanner client.
+    this.sql.exec("UPDATE mod_versions SET api_revision = ? WHERE id = ?", API_REVISION, v.id);
     if (this.automaticAllowed(v, now)) {
       this.sql.exec("UPDATE mod_pipeline SET publish_mode = 'automatic' WHERE version_id = ?", v.id);
       this.sql.exec("UPDATE mod_versions SET decided_at = ?, note = 'Established creator; checks passed' WHERE id = ?", now, v.id);
@@ -922,6 +945,7 @@ export class MarketplaceStore {
 /** One marketplace request from the Worker, carrying the caller's session hash and CSRF header. */
 export type MarketCall = Caller & (
   | { op: "release"; slug: string; version: string; sha256: string }
+  | { op: "update"; slug: string; query: MarketplaceUpdateQuery }
   | { op: "me" } | { op: "mods" } | { op: "mod"; slug: string } | { op: "mine" } | { op: "queue" } | { op: "reports" }
   | { op: "people" } | { op: "audit" } | { op: "signout" }
   | { op: "send"; slug: string } | { op: "remove"; slug: string; body: unknown } | { op: "report"; slug: string; body: unknown }
@@ -963,6 +987,7 @@ export function handle(store: MarketplaceStore, call: MarketCall, now: number): 
     case "mods": return store.mods();
     case "mod": return store.mod(call.slug);
     case "release": return store.release(call.slug, call.version, call.sha256);
+    case "update": return store.update(call.slug, call.query);
     case "mine": return store.mine(call, now);
     case "queue": return store.queue(call, now);
     case "reports": return store.reports(call, now);

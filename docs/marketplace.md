@@ -183,6 +183,30 @@ Unsigned or interrupted releases stay private. Cron retries committed publicatio
 decisions; a missing key or file returns 503 and leaves a recoverable decision.
 Public listing, download and send-to-game paths all require an actual signature.
 
+`GET /v1/mods/<slug>/update` is an anonymous, uncached compatibility check. Supply
+`api_revisions` (1–32 comma-separated full lowercase 40-hex supported stable API
+revisions), `host_revision` (full lowercase 40-hex), `current_version` (stable
+`major.minor.patch`) and `current_sha256` (full lowercase 64-hex). It returns
+`{release: {statement, signature}}` for the numerically highest newer published
+version whose digest differs and whose stored API revision is supported, or an
+empty 204. Malformed queries receive 400; missing/hidden listings and suspended
+creators receive 404. `Cache-Control: no-store` applies to all these responses,
+so publication, pulls and visibility changes apply on the next request. The host
+commit identifies the caller; selection uses supported API revisions rather than
+requiring an equal client build pin. No account, cookie or compatibility fallback
+is involved. The first-party `/v1/mod/update` route is unchanged.
+
+`source.json` fetches the pinned client's `crates/mod-api/compatibility-revisions.json`.
+Contract derivation requires a nonempty JSON array of full lowercase 40-hex
+revisions, ordered oldest to newest, and takes the last entry as `api_revision`.
+Submission records that value; completion of an accepted scan refreshes it to the
+scanner's current pinned client API. The signed release statement appends this
+field after `publication`. Existing stored statements remain byte-identical.
+Marketplace schema migration 6 adds nullable `mod_versions.api_revision` and the
+`mod_versions_updates (slug, api_revision)` index without backfilling compatibility;
+legacy versions with no stored revision never match update queries. Only a new
+accepted scan of a still-pending version can establish its compatibility.
+
 ## Deployment and recovery
 
 The API deploys only from `main` through its existing `production` environment.

@@ -1,5 +1,7 @@
 import contract from "../../.generated/contract.json";
 export const CLIENT_REVISION = contract.revision;
+/** Newest stable mod API of the pinned client whose interfaces the scanner validates. */
+export const API_REVISION = contract.api_revision;
 /** Increment when the validator, evidence or publication policy changes; older reports cannot publish. */
 export const SCAN_POLICY = "cinnabar-marketplace-2026-11-08-v4";
 export const VALIDATOR = "jco-0.20.0+wasm-tools-1.245.1";

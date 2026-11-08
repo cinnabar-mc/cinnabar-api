@@ -9,6 +9,7 @@
     "serverExperience": "crates/experience-sdk/wit/client/deps/server-experience/capabilities.wit",
     "marketplaceKeys": "crates/launcher-host/data/marketplace-keys.json",
     "modHost": "crates/mod-host/src/lib.rs",
-    "modApi": "crates/mod-api/src/lib.rs"
+    "modApi": "crates/mod-api/src/lib.rs",
+    "compatibilityRevisions": "crates/mod-api/compatibility-revisions.json"
   }
 }
