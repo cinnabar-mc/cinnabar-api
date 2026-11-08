@@ -50,10 +50,11 @@ function parseGrants(value: string): Grants {
 
 /**
  * Read strictly framed top-level declarations. Full component/type/code validation
- * additionally runs in the trusted worker; this reader never executes an upload.
+ * additionally runs in the scanner; this reader never executes an upload. Trusted official publication may
+ * supply its existing 32 MiB transport ceiling; creator submissions retain the default 16 MiB ceiling.
  */
-export function readComponent(bytes: Uint8Array): ComponentDeclarations {
-  if (bytes.length > MAX_COMPONENT_BYTES) throw new Error("The file is over 16 MiB.");
+export function readComponent(bytes: Uint8Array, maxBytes = MAX_COMPONENT_BYTES): ComponentDeclarations {
+  if (bytes.length > maxBytes) throw new Error(`The file is over ${maxBytes / 1048576} MiB.`);
   const layer = (expected: number[]) => expected.every((v, i) => bytes[i + 4] === v);
   if (bytes.length < 8 || [0, 97, 115, 109].some((v, i) => bytes[i] !== v)) throw new Error("This isn't a WebAssembly file.");
   if (layer([1, 0, 0, 0])) throw new Error("This is a core module. Package it as a component first.");

@@ -17,7 +17,7 @@ before reading the body. Five pending releases per creator are allowed.
 Listing fields are `slug`, `name`, `summary`, `description` (40,000 characters),
 `version`, optional GitHub `source`, category, license (128 characters) and release
 notes (4,000 characters). Acts/Network releases require source. Slugs that are
-fixed path segments under `/v1/mods/` (`revocations`, `assets`, `media`) are refused.
+fixed path segments under `/v1/mods/` (`revocations`, `assets`, `media`) and the system-owned `cinnabar-mod` are refused.
 If the component declares a version it must match the listing version. The API
 reads grants itself, rejects ambiguous/duplicate declarations, and hashes actual
 bytes. Maximums are 16 MiB per component, four 1 MiB images, and 20 MiB + 256 KiB
@@ -48,7 +48,7 @@ The code change removes the old binding; it does not delete the old bucket or da
 - `status`: `submitted`, `approved`, `changes` or `rejected`;
 - `scan`: `state` (`queued`, `running`, `complete`, `failed`), attempts, job ID,
   completion/expiry time, authoritative `review_ready`, deterministic findings and structured AI evidence;
-- `publication`: `manual`, `automatic` or null;
+- `publication`: `manual`, `automatic`, `official` or null;
 - immutable description and `gallery` descriptors `{sha256, bytes, type, caption, alt}`.
 
 Public component/media URLs are `/v1/mods/assets/<sha256>` and
@@ -194,7 +194,8 @@ creators receive 404. `Cache-Control: no-store` applies to all these responses,
 so publication, pulls and visibility changes apply on the next request. The host
 commit identifies the caller; selection uses supported API revisions rather than
 requiring an equal client build pin. No account, cookie or compatibility fallback
-is involved. The first-party `/v1/mod/update` route is unchanged.
+is involved. The first-party `/v1/mod/update` response contract is unchanged; it now
+selects official marketplace versions and unshadowed legacy releases as described below.
 
 `source.json` fetches the pinned client's `crates/mod-api/compatibility-revisions.json`.
 Contract derivation requires a nonempty JSON array of full lowercase 40-hex
@@ -206,6 +207,108 @@ Marketplace schema migration 6 adds nullable `mod_versions.api_revision` and the
 `mod_versions_updates (slug, api_revision)` index without backfilling compatibility;
 legacy versions with no stored revision never match update queries. Only a new
 accepted scan of a still-pending version can establish its compatibility.
+
+## Official Mod publication and shipped clients
+
+The reserved slug `cinnabar-mod` belongs to `system:official`, a system identity
+outside the Xbox XUID namespace, displayed as Cinnabar. Creators cannot claim it,
+even before its first release. It appears in the normal catalogue and supports
+normal send, update, exact-release, signed revocation and administrative pull routes.
+Its listing does not reveal the private publishing repository. Embedded license
+text is retained in its immutable listing snapshot.
+
+Existing CI continues to upload through `PUT /v1/mod/assets/<sha256>` and publish
+`{manifest, download_url}` through `POST /v1/mod/releases`, using the dedicated
+`MOD_RELEASE_HOOK_SECRET`. The native `POST /v1/releases` hook is unchanged and
+accepts only its `{channel, version, build}` body. The mod hook runs
+`publisherAllows`: package, host repository, publishing repository and immutable
+GitHub version/filename URL must match the configured values. It never fetches
+that GitHub URL. Mod hook bodies retain their 16 KiB limit; native notification
+bodies retain their 1 KiB limit. Upload authorization is unchanged.
+
+Authenticated official CI is the approval authority. It uses publication mode
+`official` and policy `cinnabar-official-hook-2026-11-08-v1`, rather than claiming a
+normal scanner or AI review. Before recording approval, the API reads the stored
+object, verifies its actual SHA-256 and size against the manifest, and runs the
+shared deterministic component framing/declaration/grants reader. This rejects
+malformed or duplicate declarations, unknown grants, mismatching declared versions,
+and executable content beyond the pinned host ceiling. The existing 32 MiB
+transport limit remains. This is not full component/type/core-bytecode validation;
+the trusted official build pipeline remains responsible for producing a valid ABI.
+It deliberately does not require the current marketplace scanner's API generation,
+so official releases can still target older supported generations.
+
+A completed official pipeline row has separate recorded validation evidence in
+`mod_official_releases.validation`, exposed to staff as `official_validation`.
+Its scanner report remains null; no AI result is invented. Publication requires
+that evidence, the reserved listing/creator, the object and a signature. The signed
+statement uses exactly the existing fields: `api_revision` comes from the original
+manifest, `client_revision` from its host build revision, `approvers` is
+`["system:official"]`, and `policy`/`publication` identify official approval. The
+original manifest, including package, mod revision, host repository/revisions,
+artifact filename/size/digest and normalized legacy download URL, is retained
+verbatim after the same unknown-field canonicalization as the old hook. Identical
+retries do not change timestamps, evidence or signatures; changed metadata returns
+409. Byte validation failures return 409 before a decision is recorded. Missing
+signing or publication-time storage resources return 409 with a private, durable
+publication decision; retrying or cron recovers it. Pulling never gets undone by
+a hook retry. Official pending decisions cannot be converted to scanner jobs.
+
+Marketplace schema migration 7 adds only `mod_official_releases(version_id,
+release, validation)`. An additive `mod_releases_digest` expression index keeps
+legacy digest authorization indexed. No destructive catalogue migration or asset
+backfill runs: existing legacy releases have no reliable full scanner evidence,
+and the old publisher accepted only a component header. Shipped clients therefore
+read a union of their original `mod_releases` rows and published official marketplace
+versions. A committed marketplace release permanently shadows the same legacy
+version, including while hidden or pulled, preventing resurrection through fallback.
+An interrupted migration leaves its already-public legacy release available until
+the marketplace signature commits; new unsigned versions remain private.
+Replaying an unchanged legacy manifest through the hook validates and migrates
+that version; changed legacy metadata remains a conflict.
+
+The old routes keep their URLs, bodies and status codes, without redirects:
+
+- `GET /v1/mod/update` returns the original `{manifest, download_url}` for the
+  numerically highest newer compatible official release, or empty 204. Full host
+  and installed revision identities, supported API list, current version and
+  different mod revision retain their old checks. There is no API fallback.
+- `GET /v1/mod/download` streams the newest eligible official component with its
+  original filename, or 404. Optional query parameter `channel` accepts `stable`,
+  `beta` or `nightly`, defaults to `beta`, and returns 400 for any other value.
+  Selection uses only that channel's latest reported host API revisions across
+  the legacy/marketplace union above, with the same visibility and pull rules.
+  If the selected channel has never reported, selection falls back to the union
+  of all channels' reported revisions; if no channel has reported, no revision
+  is excluded. Once the selected channel has reported, an empty report excludes
+  every version even if other channels support them. Responses remain `no-store`.
+- `GET /v1/mod/assets/<sha256>` streams the same original bytes, or 404. It and
+  all official public downloads now use `no-store` so new requests observe pulls.
+  Previously cached immutable responses cannot be recalled from existing caches.
+- `GET /v1/mods/cinnabar-mod/update` uses the normal signed marketplace update
+  contract; exact signed releases and send-to-game work normally. Pulls exclude
+  the version and its digest from both legacy and marketplace selection/downloads,
+  even when another official version or legacy row references identical bytes.
+
+Official objects stay only in `MOD_ASSETS` at `mod-releases/<sha256>` (currently the
+`cinnabar-cosmetics` bucket). Marketplace signing and download routes select that
+object directly; they never copy it into `MOD_FILES`. Creator uploads continue to
+use `MOD_FILES` at `mods/<sha256>` unchanged. Staff can inspect unpulled official
+objects through the existing authenticated version-file route. Official detail
+pages and the catalogue after first official publication bypass edge caching,
+including when pulled/hidden, so official signed metadata is never placed in the
+edge cache. A catalogue cached before first official publication can omit the new
+listing for up to the existing thirty-second lifetime.
+The signed revocation endpoint retains its existing bounded cache lifetime.
+
+Deployment needs the existing marketplace signer (with its client public-key pin)
+and access to the existing `MOD_ASSETS` binding; no new secret or bucket is needed.
+Keep the existing official package, repository, host repository, download base URL
+and dedicated publisher credential. No Official Mod repository or CI change is
+required. Legacy rows can be migrated individually by replaying their original
+manifests after confirming their assets pass the new validation. Test staging
+with a real official artifact before deployment; synthetic tests do not establish
+that a production artifact matches the pinned reader or client ABI.
 
 ## Deployment and recovery
 

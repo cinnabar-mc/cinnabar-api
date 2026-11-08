@@ -1,6 +1,6 @@
 import { Validator, type Schema } from "@cfworker/json-schema";
 import schema from "../schema/v1.json";
-import { compareVersions } from "./protocol";
+import { compareVersions, type Channel } from "./protocol";
 
 export interface ModRelease {
   manifest: {
@@ -62,7 +62,7 @@ export function isModUpdateQuery(value: unknown): value is ModUpdateQuery {
 }
 
 /** Removes unknown fields and orders fields so equivalent publication retries are identical. */
-function canonicalRelease(release: ModRelease): ModRelease {
+export function canonicalRelease(release: ModRelease): ModRelease {
   const { manifest: m } = release;
   return {
     manifest: {
@@ -86,6 +86,7 @@ export class ModReleases {
       PRIMARY KEY (package, repository, revision, version)
     )`);
     sql.exec("CREATE TABLE IF NOT EXISTS mod_release_assets (sha256 TEXT PRIMARY KEY, size INTEGER NOT NULL)");
+    sql.exec("CREATE INDEX IF NOT EXISTS mod_releases_digest ON mod_releases (json_extract(release, '$.manifest.artifact.sha256'))");
     sql.exec(`CREATE TABLE IF NOT EXISTS released_mod_apis (
       channel TEXT NOT NULL, revision TEXT NOT NULL,
       PRIMARY KEY (channel, revision)
@@ -110,18 +111,19 @@ export class ModReleases {
     return true;
   }
 
-  /** Selects the highest newer stable version supporting this API generation, without a fallback. */
-  update(query: ModUpdateQuery & { package: string; host_repository: string }): ModRelease | null {
+  /** Selects the highest compatible newer version from the legacy catalogue or an explicitly authorized union. */
+  update(query: ModUpdateQuery & { package: string; host_repository: string }, candidates?: ModRelease[]): ModRelease | null {
     const revisions = query.api_revisions.split(",");
     const placeholders = revisions.map(() => "?").join(",");
-    const rows = this.sql.exec<{ release: string }>(`SELECT r.release FROM mod_releases r
+    candidates ??= this.sql.exec<{ release: string }>(`SELECT r.release FROM mod_releases r
       JOIN mod_release_apis h ON h.package = r.package AND h.version = r.version
       WHERE h.package = ? AND h.repository = ? AND h.revision IN (${placeholders})`,
-    query.package, query.host_repository, ...revisions);
+    query.package, query.host_repository, ...revisions).toArray().map(row => JSON.parse(row.release) as ModRelease);
     let best: ModRelease | null = null;
-    for (const row of rows) {
-      const candidate = JSON.parse(row.release) as ModRelease;
+    for (const candidate of candidates) {
       const m = candidate.manifest;
+      if (m.package !== query.package || m.host.repository !== query.host_repository
+        || !revisions.includes(m.host.api_revision)) continue;
       if (m.revision === query.current_revision || compareVersions(m.version, query.current_version) <= 0) continue;
       if (!best || compareVersions(m.version, best.manifest.version) > 0) best = candidate;
     }
@@ -138,22 +140,24 @@ export class ModReleases {
   }
 
   /**
-   * Selects the highest stable version for a first installation that a published host build can
-   * load. A catalogue release may need a host that is not out yet, and only updates, which name
-   * their host's revisions, can match it. Until any build has reported its revisions, none is
-   * excluded, so that the download survives deployment; after that, an empty report excludes all.
+   * Selects the highest version for a first installation supported by the selected channel.
+   * A channel that has never reported falls back to the union of all reported channels; until
+   * any channel has reported, no revision is excluded. A selected channel's empty report excludes
+   * all versions, even if other channels support them.
    */
-  latest(packageName: string, hostRepository: string): ModRelease | null {
+  latest(packageName: string, hostRepository: string, channel: Channel = "beta", candidates?: ModRelease[]): ModRelease | null {
+    const channelReported = this.sql.exec("SELECT 1 FROM released_mod_api_channels WHERE channel = ?", channel).toArray().length > 0;
     const reported = this.sql.exec("SELECT 1 FROM released_mod_api_channels LIMIT 1").toArray().length > 0;
-    const released = new Set(this.sql.exec<{ revision: string }>("SELECT revision FROM released_mod_apis").toArray()
-      .map((row) => row.revision));
-    const rows = this.sql.exec<{ release: string }>(
+    const rows = channelReported
+      ? this.sql.exec<{ revision: string }>("SELECT revision FROM released_mod_apis WHERE channel = ?", channel)
+      : this.sql.exec<{ revision: string }>("SELECT revision FROM released_mod_apis");
+    const released = new Set(rows.toArray().map((row) => row.revision));
+    candidates ??= this.sql.exec<{ release: string }>(
       "SELECT release FROM mod_releases WHERE package = ?", packageName,
-    );
+    ).toArray().map(row => JSON.parse(row.release) as ModRelease);
     let best: ModRelease | null = null;
-    for (const row of rows) {
-      const candidate = JSON.parse(row.release) as ModRelease;
-      if (candidate.manifest.host.repository !== hostRepository) continue;
+    for (const candidate of candidates) {
+      if (candidate.manifest.package !== packageName || candidate.manifest.host.repository !== hostRepository) continue;
       if (reported && !released.has(candidate.manifest.host.api_revision)) continue;
       if (!best || compareVersions(candidate.manifest.version, best.manifest.version) > 0) best = candidate;
     }
@@ -163,5 +167,19 @@ export class ModReleases {
   /** Authorizes public reads only after release publication committed successfully. */
   assetSize(hash: string): number | null {
     return this.sql.exec<{ size: number }>("SELECT size FROM mod_release_assets WHERE sha256 = ?", hash).toArray()[0]?.size ?? null;
+  }
+
+  /** Original legacy records, used to exclude marketplace-managed versions from fallback authorization. */
+  all(hash?: string): ModRelease[] {
+    const rows = hash === undefined ? this.sql.exec<{ release: string }>("SELECT release FROM mod_releases")
+      : this.sql.exec<{ release: string }>("SELECT release FROM mod_releases WHERE json_extract(release, '$.manifest.artifact.sha256') = ?", hash);
+    return rows.toArray().map(row => JSON.parse(row.release) as ModRelease);
+  }
+
+  /** Checks immutable legacy metadata before migrating the same version through the release hook. */
+  matches(input: ModRelease): boolean {
+    const row = this.sql.exec<{ release: string }>("SELECT release FROM mod_releases WHERE package = ? AND version = ?",
+      input.manifest.package, input.manifest.version).toArray()[0];
+    return !row || row.release === JSON.stringify(canonicalRelease(input));
   }
 }
