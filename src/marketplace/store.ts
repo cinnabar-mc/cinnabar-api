@@ -689,7 +689,7 @@ export class MarketplaceStore {
     const pending = this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM mod_versions v JOIN mod_listings l ON l.slug = v.slug
       WHERE l.creator = ? AND v.status = 'submitted'`, session.account.id).one().n;
     if (pending >= MAX_PENDING_SUBMISSIONS) return fail(429, "You have five versions waiting for review. Wait for a decision first.");
-    const { fields, errors } = validateListing(listingInput, 0);
+    const { fields, errors } = validateListing(listingInput);
     if (Object.keys(errors).length) return fail(422, "Check the highlighted fields.", errors);
     const existing = this.listing(fields.slug);
     if (existing && existing.creator !== session.account.id) {
@@ -707,7 +707,7 @@ export class MarketplaceStore {
     if ("status" in session) return session;
     const grants = file.grants ?? {};
     const reach = reachOf(grants);
-    const { fields, errors } = validateListing(listingInput, reach);
+    const { fields, errors } = validateListing(listingInput);
     if (Object.keys(errors).length) return fail(422, "Check the highlighted fields.", errors);
     // Durable Object storage commits the synchronous writes of one turn atomically.
     this.sql.exec(`INSERT INTO mod_listings (slug, creator, name, summary, description, source, created_at)

@@ -173,18 +173,27 @@ export interface ListingFields {
   notes: string;
 }
 
-/** Normalises and validates listing fields, returning per-field messages for anything wrong. */
-export function validateListing(input: unknown, reach: Reach): { fields: ListingFields; errors: Record<string, string> } {
+/** Turns free text into a listing address: lowercase ASCII letters and digits joined by single dashes, at most 40 characters. */
+export function slugFrom(text: string): string {
+  return text.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-+/, "").slice(0, 40).replace(/-+$/, "");
+}
+
+/**
+ * Normalises and validates listing fields, returning per-field messages for anything wrong.
+ * The address is optional: any case or spacing is converted, and a blank one comes from the name.
+ */
+export function validateListing(input: unknown): { fields: ListingFields; errors: Record<string, string> } {
   const raw = fieldsOf(input);
   const text = (key: string) => trimmed(raw[key]);
   const fields: ListingFields = {
-    slug: text("slug"), name: text("name"), summary: text("summary"), description: text("description"),
+    slug: slugFrom(text("slug") || text("name")), name: text("name"), summary: text("summary"), description: text("description"),
     version: text("version"), source: text("source").replace(/\/$/, ""),
     category: text("category"), license: text("license"), notes: text("notes"),
   };
   const errors: Record<string, string> = {};
   for (const key of Object.keys(fields)) if (malformedText(raw[key])) errors[key] = "Use valid Unicode text.";
-  if (!/^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])$/.test(fields.slug)) errors.slug = "Use 3–40 lowercase letters, numbers and dashes.";
+  if (fields.slug.length < 3) errors.slug = "Use at least 3 letters or numbers in the project address.";
   else if (RESERVED_SLUGS.includes(fields.slug)) errors.slug = "That name is reserved. Choose another.";
   if (!fields.name || fields.name.length > 64) errors.name = "Name it in 64 characters or fewer.";
   if (fields.summary.length < 10 || fields.summary.length > 140) errors.summary = "Summarise it in 10–140 characters.";
@@ -198,7 +207,6 @@ export function validateListing(input: unknown, reach: Reach): { fields: Listing
   if (fields.source && !/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+$/.test(fields.source)) {
     errors.source = "Link the GitHub repository, like https://github.com/you/mod.";
   }
-  if (reach >= 3 && !fields.source) errors.source = "Mods that act for players or touch the network must link their source.";
   return { fields, errors };
 }
 

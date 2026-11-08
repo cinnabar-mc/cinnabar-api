@@ -128,7 +128,7 @@ highest reach it touches. Reach sets the review rule:
 | Acts | camera, controls, keys, item use, movement, attack reach, inventory, commands | an admin |
 | Network | packet delay, session packets, WASI | two staff, one an admin |
 
-Acts and Network listings must link their GitHub source.
+A source link is optional for every listing.
 
 **Files and trust.**
 - Components (at most 16 MiB, of which at most the pinned client's 4 MiB may be executable code) and up to four raster images (1 MiB each) enter private

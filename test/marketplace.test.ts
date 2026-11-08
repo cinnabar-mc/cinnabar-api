@@ -337,11 +337,10 @@ describe("submission, review and delivery", () => {
     await promote(owner, "ModOne", "moderator");
     await promote(owner, "ModTwo", "moderator");
 
+    // A source link is optional even for network mods.
     const noSource = await submit(creator, "party-sync", "0.3.0", { packets: true });
-    expect(noSource.status).toBe(422);
-    expect(((await noSource.json()) as { fields: Record<string, string> }).fields.source).toMatch(/source/);
-    const { id } = await (await submit(creator, "party-sync", "0.3.0", { packets: true },
-      { source: "https://github.com/quartzqueue/party-sync" })).json() as { id: string };
+    expect(noSource.status).toBe(200);
+    const { id } = await noSource.json() as { id: string };
 
     expect(((await (await first.post(`/staff/versions/${id}/decision`, { decision: "approve" })).json()) as { status: string }).status).toBe("submitted");
     const blocked = await second.post(`/staff/versions/${id}/decision`, { decision: "approve" });
@@ -1164,7 +1163,7 @@ describe("staff conflicts, public load and revocation limits", () => {
     const fixed = new Set(marketplaceRoutes.routes.flatMap(route => /^\/mods\/([^/:*]+)/.exec(route.path)?.[1] ?? []));
     expect(fixed).toContain("revocations");
     for (const slug of fixed) {
-      expect(validateListing({ slug, name: slug, summary: "A reserved slug fixture.", version: "1.0.0" }, 0).errors.slug, slug).toBeTruthy();
+      expect(validateListing({ slug, name: slug, summary: "A reserved slug fixture.", version: "1.0.0" }).errors.slug, slug).toBeTruthy();
     }
     const creator = await signIn("2535400000008011", "ReservedCreator");
     const refused = await submit(creator, "revocations", "1.0.0", { hud: true }, {}, false);
@@ -1555,5 +1554,29 @@ describe("anonymous load, sign-in state and moderation probes", () => {
     const withAssets = await send("asset-heavy", sizedComponent(MAX_EXECUTABLE_BYTES + sectionSize(notices, asset), [[notices, asset]]));
     expect(withAssets.status, await withAssets.clone().text()).toBe(200);
     await scanOne();
+  });
+});
+
+describe("listing addresses", () => {
+  const listing = (fields: Record<string, string>) => validateListing({ summary: "A listing address fixture.", version: "1.0.0", ...fields });
+
+  it("converts any case and spacing, and derives a blank address from the name", () => {
+    expect(listing({ name: "Cinnaroids", slug: "None" }).fields.slug).toBe("none");
+    expect(listing({ name: "Cinnaroids", slug: "Cinnaroids Mod" }).fields.slug).toBe("cinnaroids-mod");
+    expect(listing({ name: "Steroids for Cinnabar", slug: "" }).fields.slug).toBe("steroids-for-cinnabar");
+    expect(listing({ name: "Café  Déjà–Vu!", slug: "" }).fields.slug).toBe("cafe-deja-vu");
+    expect(listing({ name: "x".repeat(50) }).fields.slug).toHaveLength(40);
+    expect(listing({ name: "Steroids for Cinnabar", slug: "" }).errors.slug).toBeUndefined();
+  });
+
+  it("asks for an address only when nothing usable is left", () => {
+    expect(listing({ name: "🔥🔥", slug: "" }).errors.slug).toMatch(/at least 3/);
+    expect(listing({ name: "Fine name", slug: "ab" }).errors.slug).toMatch(/at least 3/);
+  });
+
+  it("never requires a source link, but checks one that is given", () => {
+    expect(listing({ name: "No source" }).errors.source).toBeUndefined();
+    expect(listing({ name: "Bad source", source: "None" }).errors.source).toBeTruthy();
+    expect(listing({ name: "Good source", source: "https://github.com/RestartFU/cinnaroids" }).errors.source).toBeUndefined();
   });
 });
