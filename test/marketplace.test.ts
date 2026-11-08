@@ -2,14 +2,16 @@ import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Hub } from "../src/hub";
-import { readComponent } from "../src/marketplace/component";
+import contract from "../.generated/contract.json";
+import { MAX_EXECUTABLE_BYTES, readComponent } from "../src/marketplace/component";
 import { TOKEN_URL, XBOX_USER_URL, XSTS_URL } from "../src/marketplace/microsoft";
 import { approvalRule, canApprove, canSetRole, grantDiff, reachOf, validateListing, type Actor } from "../src/marketplace/policy";
 import { REVOCATION_BUDGET_BYTES, REVOCATION_MEMO_MS } from "../src/marketplace/revocations";
 import { marketplaceRoutes } from "../src/marketplace/routes";
 import { CLIENT_REVISION, SCAN_POLICY, VALIDATOR, PROMPT_VERSION, SCAN_LEASE_MS } from "../src/marketplace/scanning";
 import { BodyLimitError, readLimited } from "../src/marketplace/uploads";
-import { MarketplaceStore } from "../src/marketplace/store";
+import { OAUTH_STATE_MS, sealSignIn } from "../src/marketplace/oauth-state";
+import { MarketplaceStore, SESSION_OPS, anonymousResult, type MarketCall } from "../src/marketplace/store";
 import { signText } from "../src/marketplace/signing";
 import { hub, installFakeIssuer, login, type Client } from "./helpers";
 
@@ -236,8 +238,9 @@ describe("Microsoft sign-in", () => {
     const child = await api(`/auth/microsoft/callback?code=xerr:2148916238&state=${next}`, { headers: { Cookie: `__Host-cinnabar_oauth=${oauth}` } });
     expect(child.headers.get("Location")).toBe(`${SITE}/mods/?signin_error=child_account`);
     expect(child.headers.getSetCookie().some((c) => c.startsWith("__Host-cinnabar_session="))).toBe(false);
-    // The state is single-use.
-    expect((await api(`/auth/microsoft/callback?code=1:x&state=${next}`, { headers: { Cookie: `__Host-cinnabar_oauth=${oauth}` } })).status).toBe(400);
+    // The state is single-use: the callback clears it, so the browser can't present it again.
+    expect(child.headers.getSetCookie()).toContainEqual(expect.stringMatching(/^__Host-cinnabar_oauth=; Max-Age=0; Path=\/; Secure/));
+    expect((await api(`/auth/microsoft/callback?code=1:x&state=${next}`)).status).toBe(400);
   });
 
   it("allows credentials only for the website and checks CSRF on every write", async () => {
@@ -1100,5 +1103,226 @@ describe("staff conflicts, public load and revocation limits", () => {
     } finally {
       await runInDurableObject(hub(), (_: Hub, state) => { state.storage.sql.exec("DELETE FROM mod_versions WHERE slug = 'budget-filler'"); });
     }
+  });
+});
+
+/** The Worker's bindings with a Hub that throws, so a route that reaches the Hub fails instead of answering. */
+const noHub = { ...env, HUB: { idFromName() { throw new Error("The Hub was called."); }, get() { throw new Error("The Hub was called."); } } } as unknown as Env;
+/** Calls the marketplace routes, which the Worker mounts under `/v1`, with every Hub call failing. */
+const withoutHub = (path: string, init?: RequestInit) => marketplaceRoutes.request(`https://api.test${path}`, { redirect: "manual", ...init }, noHub);
+
+/** Unsigned LEB128, as WebAssembly section and name lengths use. */
+function leb(value: number): number[] {
+  const out: number[] = [];
+  do {
+    const byte = value & 0x7f;
+    value >>>= 7;
+    out.push(value ? byte | 0x80 : byte);
+  } while (value);
+  return out;
+}
+
+/** The encoded size of a top-level custom section named `name` holding `data` bytes. */
+function sectionSize(name: string, data: number): number {
+  const payload = leb(name.length).length + name.length + data;
+  return 1 + leb(payload).length + payload;
+}
+
+/** A component of `sections` (name and byte count, filled with spaces) followed by a `padding` section bringing it to `total` bytes. */
+function sizedComponent(total: number, sections: [string, number][] = []): Uint8Array {
+  const used = 8 + sections.reduce((sum, [name, size]) => sum + sectionSize(name, size), 0);
+  let padding = total - used - sectionSize("padding", 0);
+  while (used + sectionSize("padding", padding) > total) padding--;
+  const out = new Uint8Array(total).fill(0x20);
+  out.set([0, 0x61, 0x73, 0x6d, 0x0d, 0, 1, 0]);
+  let at = 8;
+  for (const [name, size] of [...sections, ["padding", padding] as [string, number]]) {
+    const header = [0, ...leb(leb(name.length).length + name.length + size), ...leb(name.length), ...new TextEncoder().encode(name)];
+    out.set(header, at);
+    at += header.length + size;
+  }
+  expect(at).toBe(total);
+  return out;
+}
+
+describe("anonymous load, sign-in state and moderation probes", () => {
+  const NOT_THIS_BROWSER = "This sign-in didn't start in this browser. Go back and try again.";
+
+  it("starts sign-in without the Hub, sealing the pending sign-in in the browser's cookie", async () => {
+    const returnTo = `${SITE}/mods/#/mine`;
+    const starts = await Promise.all(Array.from({ length: 20 }, () => withoutHub(`/auth/microsoft/start?return_to=${encodeURIComponent(returnTo)}`)));
+    for (const start of starts) expect(start.status).toBe(302);
+    const start = starts[0]!;
+    const state = new URL(start.headers.get("Location")!).searchParams.get("state")!;
+    const oauth = cookieValue(start, "__Host-cinnabar_oauth");
+    expect(start.headers.getSetCookie()[0]).toMatch(/^__Host-cinnabar_oauth=.+; Max-Age=600; Path=\/; HttpOnly; Secure; SameSite=Lax$/);
+    // Encrypted: neither the state nor the return address is readable in the cookie.
+    const plain = atob(oauth.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(oauth.length / 4) * 4, "="));
+    expect(oauth).not.toContain(state);
+    expect(plain).not.toContain("site.test");
+    await runInDurableObject(hub(), (_: Hub, durable) => {
+      expect(durable.storage.sql.exec("SELECT name FROM sqlite_master WHERE name = 'oauth_states'").toArray()).toEqual([]);
+    });
+
+    const callback = await api(`/auth/microsoft/callback?code=${encodeURIComponent("2535400000009101:SealedStart")}&state=${state}`,
+      { headers: { Cookie: `__Host-cinnabar_oauth=${oauth}` } });
+    expect(callback.status).toBe(302);
+    expect(callback.headers.get("Location")).toBe(returnTo);
+    expect(callback.headers.getSetCookie()).toContainEqual(expect.stringMatching(/^__Host-cinnabar_oauth=; Max-Age=0;/));
+    // Once the browser drops the cleared cookie, the same callback can't be presented again.
+    expect((await api(`/auth/microsoft/callback?code=${encodeURIComponent("2535400000009101:SealedStart")}&state=${state}`)).status).toBe(400);
+  });
+
+  it("refuses missing, altered, swapped, foreign, expired and replayed sign-in cookies", async () => {
+    const begin = async (path = "/auth/microsoft/start") => {
+      const start = await api(path);
+      return { state: new URL(start.headers.get("Location")!).searchParams.get("state")!, oauth: cookieValue(start, "__Host-cinnabar_oauth") };
+    };
+    const callback = (state: string, oauth?: string) => api(`/auth/microsoft/callback?code=${encodeURIComponent("2535400000009102:SealedState")}&state=${state}`,
+      oauth === undefined ? undefined : { headers: { Cookie: `__Host-cinnabar_oauth=${oauth}` } });
+    const refused = async (response: Response, text = NOT_THIS_BROWSER) => {
+      expect(response.status).toBe(400);
+      expect(await response.text()).toBe(text);
+      expect(response.headers.getSetCookie().some(c => c.startsWith("__Host-cinnabar_session="))).toBe(false);
+    };
+    const first = await begin();
+    const second = await begin();
+    await refused(await callback(first.state));
+    await refused(await callback(first.state, ""));
+    const middle = Math.floor(first.oauth.length / 2);
+    await refused(await callback(first.state, first.oauth.slice(0, middle) + (first.oauth[middle] === "A" ? "B" : "A") + first.oauth.slice(middle + 1)));
+    await refused(await callback(first.state, first.oauth.slice(0, -4)));
+    await refused(await callback(first.state, second.oauth));
+    // The bare state, as cookies held before sealing, and a cookie sealed under any other key.
+    await refused(await callback(first.state, first.state));
+    const pending = { state: first.state, verifier: "v".repeat(43), returnTo: `${SITE}/mods/` };
+    await refused(await callback(first.state, await sealSignIn("not-the-deployment-secret", pending, Date.now())));
+    // Even a correctly sealed return address must still belong to the website.
+    await refused(await callback(first.state, await sealSignIn(env.MARKETPLACE_SIGNING_KEY!, { ...pending, returnTo: "https://evil.test/" }, Date.now())));
+
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const timed = await begin();
+      clock.mockReturnValue(now + OAUTH_STATE_MS);
+      await refused(await callback(timed.state, timed.oauth), "This sign-in link expired. Go back and try again.");
+      clock.mockReturnValue(now + OAUTH_STATE_MS - 1);
+      expect((await callback(timed.state, timed.oauth)).status).toBe(302);
+    } finally {
+      clock.mockRestore();
+    }
+
+    // A return address too long to carry in the cookie falls back to the marketplace page.
+    const long = await begin(`/auth/microsoft/start?return_to=${encodeURIComponent(`${SITE}/mods/?${"a".repeat(3000)}`)}`);
+    expect((await callback(long.state, long.oauth)).headers.get("Location")).toBe(`${SITE}/mods/`);
+  });
+
+  it("answers every session-only operation exactly as the Hub would for a caller without a session", async () => {
+    const digest = "0".repeat(64);
+    for (const op of SESSION_OPS) {
+      const call = { op, id: 1, slug: "anonymous-probe", version: "1.0.0", sha256: digest, body: {},
+        file: { sha256: digest, bytes: 1, grants: null, media: [] } } as unknown as MarketCall;
+      expect(await hub().marketplace(call), op).toEqual(anonymousResult(op));
+    }
+    expect(anonymousResult("mods")).toBeNull();
+    expect(anonymousResult("me")).toEqual({ status: 200, body: { account: null, library: [], csrf: null, game_online: false } });
+  });
+
+  it("answers anonymous session-only routes without calling the Hub", async () => {
+    const json = (method: string, body: unknown = { reason: "Anonymous probe" }) =>
+      ({ method, body: JSON.stringify(body), headers: { "Content-Type": "application/json" } });
+    const form = new FormData();
+    form.set("listing", JSON.stringify({ slug: "anonymous-upload", name: "Anonymous", summary: "An anonymous upload probe.", version: "1.0.0" }));
+    form.set("file", new File([component([])], "anonymous.wasm"));
+    const routes: [string, RequestInit | undefined, MarketCall["op"]][] = [
+      ["/me", undefined, "me"], ["/me/mods", undefined, "mine"], [`/me/mods/1/media/${"a".repeat(64)}`, undefined, "private-media"],
+      ["/auth/signout", { method: "POST" }, "signout"],
+      ["/staff/queue", undefined, "queue"], ["/staff/reports", undefined, "reports"], ["/staff/people", undefined, "people"],
+      ["/staff/audit", undefined, "audit"], ["/staff/versions/1", undefined, "version"], ["/staff/versions/1/file", undefined, "version"],
+      ["/staff/versions/1/rescan", { method: "POST" }, "rescan"], ["/staff/versions/1/decision", json("POST", { decision: "approve" }), "decide"],
+      ["/staff/versions/1/pull", json("POST"), "pull"], ["/staff/reports/1/resolve", json("POST", { note: "Probe" }), "resolve"],
+      ["/staff/mods/anonymous-probe/hide", json("POST", { hidden: true, reason: "Probe" }), "hide"],
+      ["/staff/mods/anonymous-probe/trust", json("POST", { trusted: true, reason: "Probe" }), "trust"],
+      ["/staff/people/role", json("POST", { gamertag: "OreKeeper", role: "player", reason: "Probe" }), "role"],
+      ["/staff/people/suspend", json("POST", { gamertag: "OreKeeper", suspended: true, reason: "Probe" }), "suspend"],
+      ["/mods/anonymous-probe/send", { method: "POST" }, "send"],
+      ["/mods/anonymous-probe/remove", json("POST", { sha256: "a".repeat(64), sent_at: new Date(0).toISOString() }), "remove"],
+      ["/mods/anonymous-probe/reports", json("POST", { reason: "broken", details: "An anonymous report probe." }), "report"],
+      ["/submissions", { method: "POST", body: form }, "upload-auth"],
+    ];
+    for (const [path, init, op] of routes) {
+      const expected = anonymousResult(op)!;
+      const answered = await withoutHub(path, init);
+      expect(answered.status, path).toBe(expected.status);
+      expect(await answered.json(), path).toEqual(expected.body);
+      expect(answered.headers.get("Cache-Control"), path).toMatch(/no-store/);
+    }
+    // Through the whole Worker, an anonymous browser still sees the signed-out shape the website expects.
+    expect(await (await api("/me")).json()).toEqual({ account: null, library: [], csrf: null, game_online: false });
+    expect(await (await api("/staff/queue")).json()).toEqual({ error: "Sign in with Microsoft first." });
+  });
+
+  it("requires an explicit suspended value and refuses role and suspension probes before looking anyone up", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    await signIn("2535400000009201", "SuspendTarget");
+    const suspend = (body: object) => owner.post("/staff/people/suspend", { gamertag: "SuspendTarget", reason: "Explicit value fixture", ...body });
+    const suspended = async () => (await (await owner.get("/staff/people")).json() as { gamertag: string; suspended: boolean }[])
+      .find(p => p.gamertag === "SuspendTarget")?.suspended ?? false;
+    expect((await suspend({ suspended: true })).status).toBe(200);
+    for (const body of [{}, { suspended: "false" }, { suspended: 0 }, { suspended: null }]) {
+      const response = await suspend(body);
+      expect(response.status, JSON.stringify(body)).toBe(422);
+      expect(await response.json()).toEqual({ error: "Supply suspended as true or false." });
+    }
+    expect(await suspended()).toBe(true);
+    expect((await suspend({ suspended: false })).status).toBe(200);
+    expect(await suspended()).toBe(false);
+
+    const player = await signIn("2535400000009202", "RoleProber");
+    const moderator = await signIn("2535400000009203", "ModProber");
+    await promote(owner, "ModProber", "moderator");
+    await signIn("2535400000009204", "ProbeTwin");
+    await signIn("2535400000009205", "probetwin");
+    // Existing, unknown and ambiguous gamertags all get the same refusal, so nobody learns which exist.
+    for (const gamertag of ["SuspendTarget", "NobodyHasThisTag", "ProbeTwin"]) {
+      for (const [by, role, suspension] of [[player, "Only admins manage staff.", "Staff only."],
+        [moderator, "Only admins manage staff.", "Only admins can suspend accounts."]] as const) {
+        const roleChange = await by.post("/staff/people/role", { gamertag, role: "moderator", reason: "Probe" });
+        expect(roleChange.status, gamertag).toBe(403);
+        expect(await roleChange.json()).toEqual({ error: role });
+        const suspensionChange = await by.post("/staff/people/suspend", { gamertag, suspended: true, reason: "Probe" });
+        expect(suspensionChange.status, gamertag).toBe(403);
+        expect(await suspensionChange.json()).toEqual({ error: suspension });
+      }
+    }
+    // Admins still get the precise answer.
+    expect((await owner.post("/staff/people/role", { gamertag: "NobodyHasThisTag", role: "moderator", reason: "Probe" })).status).toBe(404);
+    expect((await owner.post("/staff/people/role", { gamertag: "ProbeTwin", role: "moderator", reason: "Probe" })).status).toBe(409);
+  });
+
+  it("refuses components whose executable bytes exceed the pinned client's ceiling", async () => {
+    expect(MAX_EXECUTABLE_BYTES).toBe(contract.component.executable_bytes);
+    expect(() => readComponent(sizedComponent(MAX_EXECUTABLE_BYTES))).not.toThrow();
+    expect(() => readComponent(sizedComponent(MAX_EXECUTABLE_BYTES + 1))).toThrow(/code is over 4 MiB/);
+    // The client strips its presentation asset sections before applying the ceiling, so those bytes don't count.
+    const notices = contract.component.asset_sections.find(name => name.includes("notices"))!;
+    const asset = 1024 * 1024;
+    expect(() => readComponent(sizedComponent(MAX_EXECUTABLE_BYTES + sectionSize(notices, asset), [[notices, asset]]))).not.toThrow();
+    expect(() => readComponent(sizedComponent(MAX_EXECUTABLE_BYTES + sectionSize(notices, asset) + 1, [[notices, asset]]))).toThrow(/code is over/);
+
+    const creator = await signIn("2535400000009301", "OversizedCreator");
+    const send = (slug: string, bytes: Uint8Array) => {
+      const form = new FormData();
+      form.set("listing", JSON.stringify({ slug, name: slug, summary: "An executable size fixture.", version: "1.0.0" }));
+      form.set("file", new File([bytes], `${slug}.wasm`));
+      return upload(creator, form);
+    };
+    const oversized = await send("oversized-code", sizedComponent(MAX_EXECUTABLE_BYTES + 1));
+    expect(oversized.status).toBe(422);
+    expect(await oversized.json()).toMatchObject({ error: expect.stringContaining("more than Cinnabar can load"), fields: { file: expect.any(String) } });
+    expect(await (await creator.get("/me/mods")).json()).toEqual([]);
+    const withAssets = await send("asset-heavy", sizedComponent(MAX_EXECUTABLE_BYTES + sectionSize(notices, asset), [[notices, asset]]));
+    expect(withAssets.status, await withAssets.clone().text()).toBe(200);
+    await scanOne();
   });
 });

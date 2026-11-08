@@ -1,7 +1,15 @@
+import contract from "../../.generated/contract.json";
 import { malformedText, requestedCapabilities, type Grants } from "./policy";
 
 /** Maximum accepted component size; every body reader enforces this independently of Content-Length. */
 export const MAX_COMPONENT_BYTES = 16 * 1024 * 1024;
+/**
+ * The pinned client's executable ceiling: the most bytes it loads once its presentation asset sections are removed.
+ * A larger component could be approved and signed yet fail to load on every client.
+ */
+export const MAX_EXECUTABLE_BYTES: number = contract.component.executable_bytes;
+/** Top-level custom sections the client strips before applying {@link MAX_EXECUTABLE_BYTES}. */
+const ASSET_SECTIONS: ReadonlySet<string> = new Set(contract.component.asset_sections);
 interface ComponentDeclarations {
   name: string; description: string; version: string; authors: string; licenses: string;
   grants: Grants | null; grantsDeclared: boolean;
@@ -54,7 +62,9 @@ export function readComponent(bytes: Uint8Array): ComponentDeclarations {
   const found: ComponentDeclarations = { name: "", description: "", version: "", authors: "", licenses: "", grants: null, grantsDeclared: false };
   const seen = new Set<string>();
   let offset = 8;
+  let assetBytes = 0;
   while (offset < bytes.length) {
+    const sectionStart = offset;
     const id = bytes[offset++]!;
     if (id > 11) throw new Error("Unknown component section.");
     const [size, start] = leb(bytes, offset, bytes.length);
@@ -65,6 +75,7 @@ export function readComponent(bytes: Uint8Array): ComponentDeclarations {
       const nameEnd = nameStart + length;
       if (nameEnd > end) throw new Error("Truncated section name.");
       const name = decoder.decode(bytes.subarray(nameStart, nameEnd));
+      if (ASSET_SECTIONS.has(name)) assetBytes += end - sectionStart;
       const recognized = ["component-name", "description", "version", "authors", "licenses", "cinnabar:grants"].includes(name);
       if (recognized && seen.has(name)) throw new Error("Duplicate metadata section: " + name);
       if (recognized) seen.add(name);
@@ -98,6 +109,9 @@ export function readComponent(bytes: Uint8Array): ComponentDeclarations {
       }
     }
     offset = end;
+  }
+  if (bytes.length - assetBytes > MAX_EXECUTABLE_BYTES) {
+    throw new Error(`The component's code is over ${MAX_EXECUTABLE_BYTES / 1048576} MiB, more than Cinnabar can load.`);
   }
   return found;
 }

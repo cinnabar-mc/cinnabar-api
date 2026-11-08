@@ -85,11 +85,15 @@ mod pages, files and revocations are public.
 
 **Accounts are Xbox identities.**
 - `GET /v1/auth/microsoft/start?return_to=` runs Microsoft OAuth with PKCE (`XboxLive.signin`, personal accounts).
+  The pending state, verifier and return address travel only in an encrypted ten-minute
+  `__Host-cinnabar_oauth` cookie, so starting a sign-in writes nothing to the Hub.
 - `GET /v1/auth/microsoft/callback` exchanges the code for an Xbox user token and then an XSTS token, keeps
   only the XUID and gamertag, and discards every token.
 - It sets a `__Host-cinnabar_session` cookie (HttpOnly, Secure, SameSite=Lax). Only its SHA-256 is stored.
 - The game's `/v1/connect` login proves the same XUID, so web and game accounts need no linking.
 - Writes need the website `Origin` and the `X-Cinnabar-CSRF` token from `GET /v1/me`.
+- Requests to signed-in routes without a session cookie get their signed-out answer from the Worker
+  without reaching the Hub.
 - Sessions last 30 days, or 12 hours for staff. A role change needs a sign-in from the last 10 minutes.
 - XSTS refusals return to the site with `signin_error=no_xbox_profile|child_account|xbox_unavailable|cancelled`.
 
@@ -113,7 +117,7 @@ highest reach it touches. Reach sets the review rule:
 Acts and Network listings must link their GitHub source.
 
 **Files and trust.**
-- Components (at most 16 MiB) and up to four raster images (1 MiB each) enter private
+- Components (at most 16 MiB, of which at most the pinned client's 4 MiB may be executable code) and up to four raster images (1 MiB each) enter private
   `MOD_FILES` storage under server-computed SHA-256 keys. An authenticated,
   byte-bounded multipart request creates an immutable metadata snapshot and durable scan job.
 - A separate scanner validates full component structure/types/core bytecode, host imports
@@ -159,7 +163,8 @@ pnpm exec wrangler secret put MICROSOFT_CLIENT_SECRET   # only for a confidentia
 Then set the `MARKETPLACE_ORIGIN`, `MICROSOFT_CLIENT_ID` and `OWNER_XUIDS` variables.
 - Register the Entra app for personal Microsoft accounts with the redirect URI
   `https://api.cinnabar.gg/v1/auth/microsoft/callback`.
-- Sign-in answers 503 until the origin and client ID are set.
+- Sign-in answers 503 until the origin, client ID and `MARKETPLACE_SIGNING_KEY` are set; the pending
+  sign-in cookie's encryption key is derived from that secret.
 - The session cookie only reaches the API when the website shares its registrable domain (for example
   `cinnabar.gg`), so the site must leave `*.workers.dev` before sign-in works there.
 - Keep the marketplace R2 bucket private with no public domains. Run the separate scanner with its
@@ -236,8 +241,8 @@ keep its matching credential in a release environment restricted to release refs
   record request metadata.
 - Signing in to the marketplace stores the account's XUID, gamertag, role and last sign-in time.
   Sessions are stored as the SHA-256 of their cookie, with a CSRF token and creation time. Microsoft
-  and Xbox tokens are never stored. Pending sign-ins keep a random state and PKCE verifier for at most
-  ten minutes.
+  and Xbox tokens are never stored. A pending sign-in's random state, PKCE verifier and return address
+  are kept only in the browser's encrypted cookie, for at most ten minutes.
 - The marketplace also keeps:
   - each player's sent mods
   - the reports they file, with their XUID and text

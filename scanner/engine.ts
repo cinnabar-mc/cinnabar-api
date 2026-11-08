@@ -9,6 +9,47 @@ import { CLIENT_REVISION, PROMPT_VERSION, SCAN_POLICY, VALIDATOR } from "../src/
 
 const IMAGE_FORMATS: Record<string, string> = { png: "image/png", jpeg: "image/jpeg", webp: "image/webp" };
 
+/**
+ * Code-point budgets for creator-controlled evidence text, so the AI packet stays within the model's context however
+ * long the listing or component metadata is. Fields longer than their budget keep their start plus a truncation marker.
+ */
+export const EVIDENCE_BUDGET = {
+  /** The listing description, which accepts up to 40,000 characters. */
+  description: 6000,
+  /** Release notes and the component's own description, authors and licenses. */
+  long: 2000,
+  /** Every other listing or declaration string, such as names, versions and the source URL. */
+  short: 256,
+  /** Each import or export list, counting every name in it. */
+  names: 2048,
+} as const;
+
+/** `text` clipped to `budget` code points, with a marker saying how much was kept when anything was dropped. */
+export function boundedText(text: string, budget: number): string {
+  const points = [...text];
+  return points.length <= budget ? text : `${points.slice(0, budget).join("")}… [truncated: ${budget} of ${points.length} code points]`;
+}
+
+/** Leading interface names that fit `budget` code points together, each clipped, with a marker counting the rest. */
+export function boundedNames(names: string[], budget: number): string[] {
+  const kept: string[] = [];
+  let used = 0;
+  for (const name of names) {
+    const item = boundedText(name, EVIDENCE_BUDGET.short);
+    const size = [...item].length;
+    if (used + size > budget) break;
+    kept.push(item);
+    used += size;
+  }
+  return kept.length === names.length ? kept : [...kept, `… [truncated: ${names.length - kept.length} more names]`];
+}
+
+/** Clips every string in `fields` to `budgets[key]`, or the short budget for keys it doesn't name; other values pass through. */
+function boundedFields<T extends object>(fields: T, budgets: Record<string, number>): T {
+  return Object.fromEntries(Object.entries(fields).map(([key, value]) =>
+    [key, typeof value === "string" ? boundedText(value, budgets[key] ?? EVIDENCE_BUDGET.short) : value])) as T;
+}
+
 export interface ScanJob {
   id: string; lease: string; sha256: string; bytes: number; policy: string; grants: Grants;
   listing: ListingFields; media: { sha256: string; type: string; bytes: number; caption: string }[];
@@ -63,8 +104,11 @@ export async function analyze(job: ScanJob, bytes: Uint8Array, media: Uint8Array
   const strings = new TextDecoder().decode(bytes).match(/[\x20-\x7e]{8,256}/g)?.slice(0, 64).join("\n").slice(0, 8192) ?? "";
   return { deterministic: findings.length ? "block" : "pass", imports: component.imports, exports: component.exports,
     findings: findings.slice(0, 32), evidence: { sha256: job.sha256, policy: SCAN_POLICY, client_revision: CLIENT_REVISION,
-      grants: job.grants, diff: grantDiff(job.previous?.grants ?? {}, job.grants), imports: component.imports,
-      exports: component.exports, listing: job.listing, declarations, strings,
+      grants: job.grants, diff: grantDiff(job.previous?.grants ?? {}, job.grants),
+      imports: boundedNames(component.imports, EVIDENCE_BUDGET.names), exports: boundedNames(component.exports, EVIDENCE_BUDGET.names),
+      listing: boundedFields(job.listing, { description: EVIDENCE_BUDGET.description, notes: EVIDENCE_BUDGET.long }),
+      declarations: boundedFields(declarations, { description: EVIDENCE_BUDGET.long, authors: EVIDENCE_BUDGET.long, licenses: EVIDENCE_BUDGET.long }),
+      strings,
       limitations: "Static component validation, host-import policy and image decode. No runtime or source-code audit. AI cannot prove safety." } };
 }
 

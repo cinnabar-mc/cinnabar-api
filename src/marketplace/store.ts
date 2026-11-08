@@ -1,8 +1,8 @@
 import type { ModLibraryEntry } from "../protocol";
 import {
-  ROLES, approvalRule, approvalsComplete, atLeast, canApprove, canReview, canSetRole, clip, fieldsOf, grantDiff, malformedText, reachOf,
-  requestedCapabilities, trimmed, validateListing, type Actor, type Grants, type ListingFields, type Reach, type ReviewState,
-  type Role,
+  ROLES, STAFF_MANAGERS_ONLY, approvalRule, approvalsComplete, atLeast, canApprove, canReview, canSetRole, clip, fieldsOf, grantDiff,
+  malformedText, managesStaff, reachOf, requestedCapabilities, trimmed, validateListing, type Actor, type Grants, type ListingFields,
+  type Reach, type ReviewState, type Role,
 } from "./policy";
 import { revocationBody, withinRevocationBudget, type RevokedRow } from "./revocations";
 import { CLIENT_REVISION, MAX_SCAN_ATTEMPTS, SCAN_LEASE_MS, SCAN_MAX_AGE_MS, SCAN_POLICY, parseScanReport, scanReady, type ScanReport } from "./scanning";
@@ -11,12 +11,13 @@ export const PLAYER_SESSION_MS = 30 * 24 * 3_600_000;
 const STAFF_SESSION_MS = 12 * 3_600_000;
 /** Role changes need a sign-in this recent. */
 const ROLE_CHANGE_SIGN_IN_MS = 10 * 60_000;
-const OAUTH_STATE_MS = 10 * 60_000;
 const MAX_PENDING_SUBMISSIONS = 5;
 const MAX_REPORTS_PER_DAY = 10;
 const MAX_LIBRARY = 100;
 const REPORT_REASONS = ["broken", "advantage", "malicious", "stolen", "other"];
 const MALFORMED_TEXT = "Use valid Unicode text.";
+const SIGN_IN_FIRST = "Sign in with Microsoft first.";
+const NO_SUCH_IMAGE = "No such image.";
 
 /** An HTTP-shaped answer, plus accounts whose live clients should receive their library again. */
 export interface MarketResult {
@@ -103,8 +104,6 @@ export class MarketplaceStore {
         role TEXT NOT NULL DEFAULT 'player', suspended INTEGER NOT NULL DEFAULT 0, seen_at INTEGER NOT NULL)`,
       `CREATE TABLE IF NOT EXISTS web_sessions (id_hash TEXT PRIMARY KEY, xuid TEXT NOT NULL, csrf TEXT NOT NULL,
         created_at INTEGER NOT NULL)`,
-      `CREATE TABLE IF NOT EXISTS oauth_states (state TEXT PRIMARY KEY, verifier TEXT NOT NULL, return_to TEXT NOT NULL,
-        expires_at INTEGER NOT NULL)`,
       `CREATE TABLE IF NOT EXISTS mod_listings (slug TEXT PRIMARY KEY, creator TEXT NOT NULL, name TEXT NOT NULL,
         summary TEXT NOT NULL, description TEXT NOT NULL, source TEXT NOT NULL, hidden INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL)`,
@@ -169,27 +168,14 @@ export class MarketplaceStore {
     migrate(4, `INSERT OR IGNORE INTO mod_media (sha256, version_id)
       SELECT json_extract(m.value, '$.sha256'), p.version_id FROM mod_pipeline p, json_each(p.media) m
       WHERE json_type(m.value, '$.sha256') = 'text'`);
+    // Pending sign-ins now live in sealed browser cookies; drop the table anonymous sign-in starts used to fill.
+    migrate(5, "DROP TABLE IF EXISTS oauth_states");
   }
 
   /** Increases whenever the set of pulled versions changes, so callers can tell a memoized revocation list is stale. */
   revocationRevision = 0;
 
   // --- Sign-in -------------------------------------------------------------------------------------------
-
-  /** Remembers a pending Microsoft sign-in for ten minutes. */
-  beginSignIn(state: string, verifier: string, returnTo: string, now: number): void {
-    this.sql.exec("DELETE FROM oauth_states WHERE expires_at <= ?", now);
-    this.sql.exec("INSERT INTO oauth_states (state, verifier, return_to, expires_at) VALUES (?, ?, ?, ?)",
-      state, verifier, returnTo, now + OAUTH_STATE_MS);
-  }
-
-  /** Consumes a pending sign-in exactly once. */
-  consumeSignIn(state: string, now: number): { verifier: string; returnTo: string } | null {
-    const row = this.sql.exec<{ verifier: string; return_to: string; expires_at: number }>(
-      "SELECT verifier, return_to, expires_at FROM oauth_states WHERE state = ?", state).toArray()[0];
-    this.sql.exec("DELETE FROM oauth_states WHERE state = ?", state);
-    return row && row.expires_at > now ? { verifier: row.verifier, returnTo: row.return_to } : null;
-  }
 
   /** Records the verified Xbox identity and opens a session under the hash of its cookie. */
   signIn(xuid: string, gamertag: string, sessionHash: string, csrf: string, now: number): void {
@@ -244,14 +230,14 @@ export class MarketplaceStore {
   /** Resolves the caller for a write, checking the CSRF token bound to their session. */
   private writer(caller: Caller, now: number): { account: Account; created_at: number } | MarketResult {
     const session = this.session(caller, now);
-    if (!session) return fail(401, "Sign in with Microsoft first.");
+    if (!session) return fail(401, SIGN_IN_FIRST);
     if (!caller.csrf || caller.csrf !== session.csrf) return fail(403, "Refresh the page and try again.");
     return session;
   }
 
   private staff(caller: Caller, now: number, write: boolean): Account | MarketResult {
     const session = write ? this.writer(caller, now) : this.session(caller, now);
-    if (!session) return fail(401, "Sign in with Microsoft first.");
+    if (!session) return fail(401, SIGN_IN_FIRST);
     if ("status" in session) return session;
     if (!atLeast(session.account, "moderator") || session.account.suspended) return fail(403, "Staff only.");
     return session.account;
@@ -272,7 +258,7 @@ export class MarketplaceStore {
   /** The signed-in account, its CSRF token and the mods it has sent to its game. */
   me(caller: Caller, now: number): MarketResult {
     const session = this.session(caller, now);
-    if (!session) return ok({ account: null, library: [], csrf: null });
+    if (!session) return anonymousResult("me")!;
     const { xuid, gamertag, role, suspended } = session.account;
     return ok({ account: { xuid, gamertag, role, suspended }, library: this.library(xuid), csrf: session.csrf });
   }
@@ -468,7 +454,7 @@ export class MarketplaceStore {
 
   mine(caller: Caller, now: number): MarketResult {
     const session = this.session(caller, now);
-    if (!session) return fail(401, "Sign in with Microsoft first.");
+    if (!session) return fail(401, SIGN_IN_FIRST);
     return ok(this.versions("l.creator = ? ORDER BY v.submitted_at DESC", session.account.xuid).map((v) => this.versionView(v)));
   }
 
@@ -549,10 +535,10 @@ export class MarketplaceStore {
   /** Pending screenshots are visible only to their creator or active staff, under an authenticated no-store route. */
   privateMedia(caller: Caller, id: number, sha256: string, now: number): MarketResult {
     const session = this.session(caller, now);
-    if (!session || session.account.suspended) return fail(404, "No such image.");
+    if (!session || session.account.suspended) return fail(404, NO_SUCH_IMAGE);
     const v = this.versionRow(id);
     const media = this.media(id).find(item => item.sha256 === sha256);
-    if (!v || !media || (v.creator !== session.account.xuid && !atLeast(session.account, "moderator"))) return fail(404, "No such image.");
+    if (!v || !media || (v.creator !== session.account.xuid && !atLeast(session.account, "moderator"))) return fail(404, NO_SUCH_IMAGE);
     return ok({ key: `media/${media.sha256}`, type: media.type });
   }
 
@@ -874,6 +860,8 @@ export class MarketplaceStore {
   setRole(caller: Caller, input: unknown, now: number): MarketResult {
     const session = this.writer(caller, now);
     if ("status" in session) return session;
+    // Authority comes before the gamertag lookup, so players can't probe which gamertags have signed in.
+    if (!managesStaff(session.account)) return fail(403, STAFF_MANAGERS_ONLY);
     const body = fieldsOf(input);
     const target = this.accountNamed(trimmed(body.gamertag));
     if ("status" in target) return target;
@@ -903,7 +891,8 @@ export class MarketplaceStore {
     if (malformedText(body.reason)) return fail(422, MALFORMED_TEXT);
     const reason = trimmed(body.reason);
     if (!reason) return fail(400, "Note why, for the audit log.");
-    const suspended = body.suspended === true;
+    if (typeof body.suspended !== "boolean") return fail(422, "Supply suspended as true or false.");
+    const suspended = body.suspended;
     this.sql.exec("UPDATE market_accounts SET suspended = ? WHERE xuid = ?", suspended ? 1 : 0, target.xuid);
     if (suspended) this.sql.exec("DELETE FROM mod_trust WHERE creator = ?", target.xuid);
     this.log(staff.xuid, suspended ? "suspended" : "restored", target.gamertag, reason, now);
@@ -944,9 +933,28 @@ export type MarketCall = Caller & (
   | { op: "private-media"; id: number; sha256: string }
   | { op: "scan-claim" } | { op: "scan-file"; job: string; lease: string; sha256: string }
   | { op: "scan-complete"; job: string; lease: string; body: unknown }
-  | { op: "begin"; state: string; verifier: string; returnTo: string } | { op: "consume"; state: string }
   | { op: "signin"; xuid: string; gamertag: string; newSession: string; newCsrf: string }
 );
+
+/**
+ * Operations that read the caller's session before anything else, so a caller without a session cookie always gets
+ * the same answer from them. A test checks every one against the Hub's actual anonymous answer.
+ */
+export const SESSION_OPS = ["me", "mine", "signout", "send", "remove", "report", "upload-auth", "precheck", "submit", "version",
+  "decide", "pull", "hide", "resolve", "role", "suspend", "queue", "reports", "people", "audit", "trust", "rescan", "private-media",
+] as const satisfies readonly MarketCall["op"][];
+
+/**
+ * The fixed answer a session-only operation gives a caller without a session, including the Hub's `game_online` for
+ * `me`, or null for any other operation. The Worker uses it to answer anonymous requests without calling the Hub.
+ */
+export function anonymousResult(op: MarketCall["op"]): MarketResult | null {
+  if (!(SESSION_OPS as readonly string[]).includes(op)) return null;
+  if (op === "me") return ok({ account: null, library: [], csrf: null, game_online: false });
+  if (op === "signout") return ok({});
+  if (op === "private-media") return fail(404, NO_SUCH_IMAGE);
+  return fail(401, SIGN_IN_FIRST);
+}
 
 /** Routes one call to the store. */
 export function handle(store: MarketplaceStore, call: MarketCall, now: number): MarketResult {
@@ -981,13 +989,6 @@ export function handle(store: MarketplaceStore, call: MarketCall, now: number): 
     case "scan-claim": return store.claimScan(now);
     case "scan-file": return store.scanFile(call.job, call.lease, call.sha256, now);
     case "scan-complete": return store.completeScan(call.job, call.lease, call.body, now);
-    case "begin":
-      store.beginSignIn(call.state, call.verifier, call.returnTo, now);
-      return ok({});
-    case "consume": {
-      const pending = store.consumeSignIn(call.state, now);
-      return pending ? ok(pending) : fail(400, "This sign-in link expired. Try again.");
-    }
     case "signin":
       store.signIn(call.xuid, call.gamertag, call.newSession, call.newCsrf, now);
       return ok({});

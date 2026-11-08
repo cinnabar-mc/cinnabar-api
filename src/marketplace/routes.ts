@@ -5,7 +5,8 @@ import { hubFor } from "../routing";
 import { MAX_COMPONENT_BYTES, readComponent } from "./component";
 import { clip, malformedText, type Grants } from "./policy";
 import { SignInFailure, authorizeUrl, randomToken, sha256Base64Url, xboxIdentity } from "./microsoft";
-import { PLAYER_SESSION_MS, type Caller, type MarketCall, type MarketResult, type MediaFile } from "./store";
+import { MAX_RETURN_TO, OAUTH_STATE_MS, openSignIn, sealSignIn } from "./oauth-state";
+import { PLAYER_SESSION_MS, anonymousResult, type Caller, type MarketCall, type MarketResult, type MediaFile } from "./store";
 import { BodyLimitError, MAX_IMAGES, MAX_UPLOAD_BYTES, imageType, readLimited, sha256 } from "./uploads";
 
 const SESSION_COOKIE = "cinnabar_session";
@@ -37,8 +38,9 @@ async function caller(c: Ctx): Promise<Caller> {
   return { session: token ? await sha256Base64Url(token) : undefined, csrf: c.req.header(CSRF_HEADER) };
 }
 
+/** The store's answer to `request`; one that needs a session but carries none is answered here without calling the Hub. */
 async function call(c: Ctx, request: MarketCall): Promise<MarketResult> {
-  return hubFor(c.env).marketplace(request);
+  return (!request.session && anonymousResult(request.op)) || hubFor(c.env).marketplace(request);
 }
 
 function reply(c: Ctx, result: MarketResult, cache = "no-store"): Response {
@@ -115,22 +117,24 @@ for (const path of ["/auth/*", "/me", "/me/*", "/mods", "/mods/*", "/submissions
 
 marketplaceRoutes.get("/auth/microsoft/start", async (c) => {
   const site = siteOrigin(c.env);
-  if (!site || !c.env.MICROSOFT_CLIENT_ID) return c.json({ error: "Sign-in isn't configured yet." }, 503);
+  const secret = c.env.MARKETPLACE_SIGNING_KEY;
+  if (!site || !c.env.MICROSOFT_CLIENT_ID || !secret) return c.json({ error: "Sign-in isn't configured yet." }, 503);
   let returnTo = `${site}/mods/`;
   const requested = c.req.query("return_to");
   if (requested) {
     try {
       const url = new URL(requested);
-      if (url.origin === site) returnTo = url.toString();
+      if (url.origin === site && url.toString().length <= MAX_RETURN_TO) returnTo = url.toString();
     } catch {
       // Fall back to the marketplace page.
     }
   }
   const state = randomToken();
   const verifier = randomToken();
-  await call(c, { op: "begin", state, verifier, returnTo });
-  // Binds the pending sign-in to this browser, so a link can't sign someone into another person's account.
-  setCookie(c, OAUTH_COOKIE, state, { prefix: "host", httpOnly: true, sameSite: "Lax", maxAge: 600 });
+  // The pending sign-in lives only in this browser's sealed cookie, which also binds it to this browser, so a link
+  // can't sign someone into another person's account and anonymous starts never write to the Hub.
+  setCookie(c, OAUTH_COOKIE, await sealSignIn(secret, { state, verifier, returnTo }, Date.now()),
+    { prefix: "host", httpOnly: true, sameSite: "Lax", maxAge: OAUTH_STATE_MS / 1000 });
   c.header("Cache-Control", "no-store");
   return c.redirect(authorizeUrl(c.env.MICROSOFT_CLIENT_ID, callbackUrl(c), state, await sha256Base64Url(verifier)), 302);
 });
@@ -138,14 +142,18 @@ marketplaceRoutes.get("/auth/microsoft/start", async (c) => {
 marketplaceRoutes.get("/auth/microsoft/callback", async (c) => {
   c.header("Cache-Control", "no-store");
   const site = siteOrigin(c.env);
-  if (!site || !c.env.MICROSOFT_CLIENT_ID) return c.json({ error: "Sign-in isn't configured yet." }, 503);
+  const secret = c.env.MARKETPLACE_SIGNING_KEY;
+  if (!site || !c.env.MICROSOFT_CLIENT_ID || !secret) return c.json({ error: "Sign-in isn't configured yet." }, 503);
   const state = c.req.query("state") ?? "";
-  const expected = getCookie(c, OAUTH_COOKIE, "host");
+  const pending = await openSignIn(secret, getCookie(c, OAUTH_COOKIE, "host"), Date.now());
+  // Clearing the cookie makes the pending sign-in single-use in this browser; Microsoft redeems each code only once.
   deleteCookie(c, OAUTH_COOKIE, { prefix: "host" });
-  if (!state || state !== expected) return c.text("This sign-in didn't start in this browser. Go back and try again.", 400);
-  const pending = await call(c, { op: "consume", state });
-  if (pending.status !== 200) return c.text("This sign-in link expired. Go back and try again.", 400);
-  const { verifier, returnTo } = pending.body as { verifier: string; returnTo: string };
+  if (pending === "expired") return c.text("This sign-in link expired. Go back and try again.", 400);
+  if (!pending || !state || state !== pending.state
+    || !URL.canParse(pending.returnTo) || new URL(pending.returnTo).origin !== site) {
+    return c.text("This sign-in didn't start in this browser. Go back and try again.", 400);
+  }
+  const { verifier, returnTo } = pending;
   const back = (error?: string) => {
     const url = new URL(returnTo);
     if (error) url.searchParams.set("signin_error", error);

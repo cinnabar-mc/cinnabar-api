@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { parse } from '@bytecodealliance/jco-transpile/wasm-tools';
 import sharp from 'sharp';
-import { analyze, validateComponent, SCAN_POLICY, PROMPT_VERSION } from '../.build/scanner-engine.mjs';
+import { EVIDENCE_BUDGET, analyze, boundedNames, validateComponent, SCAN_POLICY, PROMPT_VERSION } from '../.build/scanner-engine.mjs';
 import { isolatedAnalysis, parseAi, reviewEvidence, runOnce } from './runner.mjs';
 
 const CONFIG = { MARKETPLACE_API_ORIGIN: 'https://api.test', MARKETPLACE_SCANNER_TOKEN: 'test-scanner',
@@ -122,4 +122,43 @@ test('fails closed on substituted artifacts and never calls AI after failed vali
     submitted = JSON.parse(init.body); return Response.json({ received: true });
   }, async () => { analyzed = true; });
   assert.equal(analyzed, false); assert.equal(submitted.deterministic, 'error'); assert.equal(submitted.ai.verdict, 'error');
+});
+
+/** Unsigned LEB128 for WebAssembly lengths. */
+function leb(value) {
+  const out = [];
+  do { const byte = value & 0x7f; value >>>= 7; out.push(value ? byte | 0x80 : byte); } while (value);
+  return out;
+}
+
+/** `bytes` with one more top-level custom section `name` holding UTF-8 `text`. */
+function withCustomSection(bytes, name, text) {
+  const encoded = new TextEncoder().encode(name);
+  const payload = [...leb(encoded.length), ...encoded, ...new TextEncoder().encode(text)];
+  return new Uint8Array([...bytes, 0, ...leb(payload.length), ...payload]);
+}
+
+test('clips oversized creator text in the AI evidence packet and marks what was dropped', async () => {
+  const bytes = withCustomSection(await parse(GOOD_WAT), 'description', 'd'.repeat(65536));
+  const base = jobFor(bytes);
+  const job = { ...base, listing: { ...base.listing, description: '\u{1f600}'.repeat(40_000), notes: 'n'.repeat(4000), name: 'Fixture' } };
+  const { evidence } = await analyze(job, bytes, []);
+  const points = text => [...text].length;
+  assert.match(evidence.listing.description, new RegExp(`… \\[truncated: ${EVIDENCE_BUDGET.description} of 40000 code points\\]$`));
+  assert.ok(evidence.listing.description.startsWith('\u{1f600}'.repeat(EVIDENCE_BUDGET.description)));
+  assert.ok(points(evidence.listing.description) < EVIDENCE_BUDGET.description + 64);
+  assert.equal(evidence.listing.description.isWellFormed(), true);
+  assert.match(evidence.listing.notes, new RegExp(`truncated: ${EVIDENCE_BUDGET.long} of 4000 code points`));
+  assert.match(evidence.declarations.description, new RegExp(`truncated: ${EVIDENCE_BUDGET.long} of 65536 code points`));
+  // Fields within budget are untouched, and the whole packet stays small.
+  assert.equal(evidence.listing.name, 'Fixture');
+  assert.equal(evidence.listing.slug, 'test-mod');
+  assert.ok(points(JSON.stringify(evidence)) < 20_000);
+
+  const names = Array.from({ length: 256 }, (_, i) => `cinnabar:extension/interface-${i}@0.1.0`);
+  const kept = boundedNames(names, EVIDENCE_BUDGET.names);
+  assert.match(kept.at(-1), /^… \[truncated: \d+ more names\]$/);
+  assert.ok(kept.slice(0, -1).join('').length <= EVIDENCE_BUDGET.names);
+  assert.deepEqual(kept.slice(0, -1), names.slice(0, kept.length - 1));
+  assert.deepEqual(boundedNames(names.slice(0, 3), EVIDENCE_BUDGET.names), names.slice(0, 3));
 });

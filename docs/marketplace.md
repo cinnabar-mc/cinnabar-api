@@ -22,6 +22,11 @@ If the component declares a version it must match the listing version. The API
 reads grants itself, rejects ambiguous/duplicate declarations, and hashes actual
 bytes. Maximums are 16 MiB per component, four 1 MiB images, and 20 MiB + 256 KiB
 for the whole request, enforced on streamed bytes independent of Content-Length.
+A component's executable bytes, meaning everything except the top-level presentation
+asset sections the client strips, must also fit the pinned client's ceiling (mod-host
+`MAX_COMPONENT_BYTES`, 4 MiB at the current pin); a larger one is refused with 422,
+since no client could load it. `pnpm source:fetch` derives that ceiling and the asset
+section names from the pinned client revision.
 Raster types are PNG, JPEG and WebP. SVG and active content are refused.
 
 All bytes enter `MOD_FILES` directly, under `mods/<sha256>` or `media/<sha256>`.
@@ -109,12 +114,18 @@ It compares imports to the pinned client WIT and checks required callbacks. Imag
 must fully decode in sharp, be single-frame, and fit 4096 × 4096 / 16,777,216 pixels.
 It uses a disposable credential-free thread and a thirty-second deadline. Run the
 container with OS memory/CPU limits as native/Wasm allocations exceed JS heap limits.
-Client capability types and interface names are derived from `source.json`; no
-separately maintained permission snapshot is authoritative.
+Client capability types, interface names and the executable component ceiling are
+derived from `source.json`; no separately maintained snapshot is authoritative.
 
 The AI receives bounded declarations, listing text, import/export evidence,
-permission diffs and printable strings, with a fixed system instruction treating
-all packet contents as hostile data. It has no tools and fetches no creator URLs.
+permission diffs and printable strings. Creator text is clipped by code points so the
+packet fits the model's context: the listing description to 6,000, release notes and
+the component's description, authors and licenses to 2,000 each, other strings to 256,
+and each import or export list to 2,048 in total. Clipped text ends with a
+`… [truncated: <kept> of <total> code points]` marker, and a clipped list ends with a
+count of omitted names. Printable strings stay within 8,192 ASCII characters. Text that
+tokenizes unusually densely can still exceed the context, which ends as an AI error hold.
+A fixed system instruction treats all packet contents as hostile data. It has no tools and fetches no creator URLs.
 Workers AI JSON mode and local schema validation are both required. The report
 records the configured model, prompt version, validator and policy. Provider
 failure, invalid JSON, missing configuration or timeout produce an error hold.
@@ -143,12 +154,17 @@ never establish trust. Trust works only while its granter is still an unsuspende
 
 Staff cannot hide or restore their own listing or resolve reports about their own mod.
 Any staff member can hide a listing; only admins can restore one. The hide route's
-`hidden` field must be a boolean.
+`hidden` field and the suspend route's `suspended` field must be booleans; anything
+else is a 422 and changes nothing. Role and suspension requests from callers who can't
+make them are refused with 403 before the gamertag is looked up, so they reveal
+nothing about which accounts exist.
 
 Automatic publication additionally requires a clear AI response, reach below Acts,
 the exact approved baseline captured at submission, no additional permissions or
-command values, no new imports, unchanged listing/source/media content, current
-trust, and no open report. Suspensions, hiding or pulling delete relevant trust;
+command values, no new imports, unchanged name, summary, description, source, category,
+license and media, current trust, and no open report. Release notes are deliberately
+not compared: an established creator's new notes publish with the update without a new
+human review, after the same AI review as the rest of the listing text. Suspensions, hiding or pulling delete relevant trust;
 restoration requires deliberate administrative review. Concurrent updates that
 change the baseline fall back to human review. Metadata/image changes also need
 human review at launch.
@@ -167,6 +183,15 @@ Create the private `MOD_FILES` R2 bucket before merging. Configure `MARKETPLACE_
 `MICROSOFT_CLIENT_ID`, `OWNER_XUIDS`, the Microsoft app callback and Worker secrets
 `MARKETPLACE_SIGNING_KEY`, optional `MICROSOFT_CLIENT_SECRET`, and
 `MARKETPLACE_SCANNER_TOKEN`. Never place credentials in this repository.
+
+Web sign-in keeps no server state until Microsoft returns the browser. The start route
+seals the OAuth state, PKCE verifier and validated return address with AES-256-GCM in a
+ten-minute `__Host-cinnabar_oauth` cookie (HttpOnly, Secure, SameSite=Lax). Its key is
+derived from `MARKETPLACE_SIGNING_KEY` with HKDF-SHA256 under a fixed purpose label, so
+sign-in needs that secret and rotating it voids sign-ins in progress. The callback
+clears the cookie and refuses one that is missing, altered, expired or for another
+state; Microsoft redeems each authorization code once. Signed-in routes called without a
+session cookie get their signed-out answer from the Worker without reaching the Hub.
 
 For the initial signer, run `node scripts/marketplace-signing.mjs provision /path/to/client-checkout`.
 It generates Ed25519 material in memory, sends the PKCS#8 private half on stdin to

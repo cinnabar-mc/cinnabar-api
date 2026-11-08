@@ -136,10 +136,18 @@ export function approvalsComplete(reach: Reach, approvals: { admin: boolean }[])
   return approvals.length >= rule.count && (!rule.admin || approvals.some((a) => a.admin));
 }
 
+/** Why a caller who can't manage staff roles is refused. */
+export const STAFF_MANAGERS_ONLY = "Only admins manage staff.";
+
+/** Whether `actor` may change anyone's role at all: an active admin or owner. Checked before any target lookup. */
+export function managesStaff(actor: Actor): boolean {
+  return atLeast(actor, "admin") && !actor.suspended;
+}
+
 /** Who may assign `role` to `target`: admins manage moderators, only owners manage admins, owners come from config. */
 export function canSetRole(actor: Actor | null, target: Actor, role: Role): Verdict {
   if (!actor) return deny("Sign in with Microsoft first.");
-  if (!atLeast(actor, "admin") || actor.suspended) return deny("Only admins manage staff.");
+  if (!managesStaff(actor)) return deny(STAFF_MANAGERS_ONLY);
   if (target.xuid === actor.xuid) return deny("You can't change your own role.");
   if (role === "owner" || target.role === "owner") return deny("Owners are set in the API's configuration.");
   const needed: Role = role === "admin" || target.role === "admin" ? "owner" : "admin";

@@ -5,6 +5,8 @@
     "grants": "crates/mod-host/src/grants.rs",
     "wit": "crates/mod-api/wit/extension.wit",
     "drawing": "crates/mod-api/wit/deps/world-draw/drawing.wit",
-    "marketplaceKeys": "crates/launcher-host/data/marketplace-keys.json"
+    "marketplaceKeys": "crates/launcher-host/data/marketplace-keys.json",
+    "modHost": "crates/mod-host/src/lib.rs",
+    "modApi": "crates/mod-api/src/lib.rs"
   }
 }

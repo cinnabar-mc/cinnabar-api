@@ -9,6 +9,9 @@ function inputs(type = 'bool') {
     wit: 'package cinnabar:extension@0.1.0;\ninterface clock {\n}\nworld extension { import cinnabar:world-draw/drawing@0.2.0; }',
     drawing: 'package cinnabar:world-draw@0.2.0;\ninterface drawing {\n}',
     marketplaceKeys: JSON.stringify({ ed25519: [Buffer.alloc(32).toString('base64')] }),
+    modHost: '/// Maximum bytes accepted before compilation.\npub const MAX_COMPONENT_BYTES: usize = 4 * 1024 * 1024;\n',
+    modApi: 'pub const NOTICES_SECTION: &str = "cinnabar:extension/notices@1";\npub const ICON_SECTION: &str = "cinnabar:extension/icon@1";\n'
+      + 'pub const COMPONENT_ASSET_SECTIONS: [&str; 2] = [\n    NOTICES_SECTION,\n    ICON_SECTION,\n];\n',
   };
 }
 
@@ -24,4 +27,16 @@ test('derives optional packet-only markers and exact interface versions from pin
 test('refuses unsupported grant types and malformed trust roots instead of dropping declarations', () => {
   assert.throws(() => deriveContract(inputs('u64'), 'a'.repeat(40)), /grant type/);
   assert.throws(() => deriveContract({ ...inputs(), marketplaceKeys: '{"ed25519":[]}' }, 'a'.repeat(40)), /public keys/);
+});
+
+test('derives the executable component ceiling and the asset sections the client strips before applying it', () => {
+  assert.deepEqual(deriveContract(inputs(), 'a'.repeat(40)).component,
+    { executable_bytes: 4 * 1024 * 1024, asset_sections: ['cinnabar:extension/notices@1', 'cinnabar:extension/icon@1'] });
+  const base = inputs();
+  for (const changed of [
+    { modHost: base.modHost.replace('4 * 1024 * 1024', 'limits::COMPONENT') },
+    { modHost: '' },
+    { modApi: base.modApi.replace('[&str; 2]', '[&str; 3]') },
+    { modApi: base.modApi.replace('pub const ICON_SECTION', 'const ICON') },
+  ]) assert.throws(() => deriveContract({ ...base, ...changed }, 'a'.repeat(40)), /Client component/);
 });
