@@ -35,6 +35,30 @@ test('blocks unsupported imports, missing host callbacks and malformed images', 
   await assert.rejects(analyze(job, good, [new Uint8Array([137,80,78,71,13,10,26,10,0,0,0,0])]));
 });
 
+/** Append a top-level `cinnabar:grants` custom section declaring `grants`. */
+function withGrants(bytes, grants) {
+  const name = Buffer.from('cinnabar:grants');
+  const payload = Buffer.concat([Buffer.from(leb(name.length)), name, Buffer.from(JSON.stringify(grants))]);
+  return new Uint8Array(Buffer.concat([Buffer.from(bytes), Buffer.from([0]), Buffer.from(leb(payload.length)), payload]));
+}
+
+/** A packet component exporting `names` under their canonical kebab-case names. */
+function packetWat(names) {
+  return `(component (core module $m ${names.map(n => `(func (export "${n}"))`).join(' ')}) (core instance $i (instantiate $m)) ${
+    names.map(n => `(func (export "${n}") (canon lift (core func $i "${n}")))`).join(' ')})`;
+}
+
+test('accepts packet callbacks by canonical name even though Jco renames on-batch', async () => {
+  const complete = withGrants(await parse(packetWat(['start', 'on-batch', 'tick', 'stop'])), { packets: true });
+  const passed = await analyze({ ...jobFor(complete), grants: { packets: true } }, complete, []);
+  assert.deepEqual(passed.findings, []);
+  assert.equal(passed.deterministic, 'pass');
+  const missing = withGrants(await parse(packetWat(['start', 'tick', 'stop'])), { packets: true });
+  const blocked = await analyze({ ...jobFor(missing), grants: { packets: true } }, missing, []);
+  assert.equal(blocked.deterministic, 'block');
+  assert.ok(blocked.findings.includes('The packet mod is missing required callbacks.'));
+});
+
 test('checks canonical WIT interface versions rather than rewritten JavaScript specifiers', async () => {
   for (const [name, expected] of [
     ['cinnabar:extension/hud@0.1.0', 'pass'],

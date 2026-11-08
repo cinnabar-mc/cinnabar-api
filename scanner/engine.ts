@@ -88,7 +88,9 @@ export async function analyze(job: ScanJob, bytes: Uint8Array, media: Uint8Array
   if (!packet && !["init", "frame"].every(name => new RegExp(`export ${name}: func\\(\\);`).test(component.wit))) {
     findings.push("The component must export init and frame with the client callback signatures.");
   }
-  if (packet && !["start", "on-batch", "tick", "stop"].every(name => component.exports.includes(name))) {
+  // Jco renames exports to JavaScript identifiers (on-batch becomes onBatch), so read the canonical WIT names.
+  const exported = new Set([...component.wit.matchAll(/^\s*export\s+([a-z][a-z0-9-]*):\s*func\(/gm)].map(match => match[1]!));
+  if (packet && !["start", "on-batch", "tick", "stop"].every(name => exported.has(name))) {
     findings.push("The packet mod is missing required callbacks.");
   }
   sharp.cache(false);
