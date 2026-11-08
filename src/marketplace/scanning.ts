@@ -1,8 +1,8 @@
 import contract from "../../.generated/contract.json";
 export const CLIENT_REVISION = contract.revision;
 /** Increment when the validator, evidence or publication policy changes; older reports cannot publish. */
-export const SCAN_POLICY = "cinnabar-marketplace-2026-11-08-v3";
-export const VALIDATOR = "jco-0.20.0";
+export const SCAN_POLICY = "cinnabar-marketplace-2026-11-08-v4";
+export const VALIDATOR = "jco-0.20.0+wasm-tools-1.245.1";
 export const PROMPT_VERSION = "mod-evidence-v1";
 export const SCAN_LEASE_MS = 5 * 60_000;
 export const MAX_SCAN_ATTEMPTS = 3;

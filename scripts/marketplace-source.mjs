@@ -12,5 +12,12 @@ for (const [name, path] of Object.entries(source.inputs)) {
 }
 const contract = deriveContract(inputs, source.revision);
 await mkdir(new URL('../.generated/', import.meta.url), { recursive: true });
+// Preserve the complete pinned definitions for wasm-tools world compatibility checks.
+for (const [name, path] of Object.entries({ wit: 'extension.wit', drawing: 'deps/world-draw/drawing.wit',
+  session: 'deps/session/session.wit', serverExperience: 'deps/server-experience/capabilities.wit' })) {
+  const destination = new URL(`../.generated/wit/${path}`, import.meta.url);
+  await mkdir(new URL('.', destination), { recursive: true });
+  await writeFile(destination, inputs[name]);
+}
 await writeFile(new URL('../.generated/contract.json', import.meta.url), JSON.stringify(contract, null, 2) + '\n');
 console.log(`Derived ${contract.capabilities.length} capabilities and ${contract.interfaces.length} interfaces from pinned client inputs.`);

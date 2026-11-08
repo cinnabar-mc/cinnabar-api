@@ -29,6 +29,7 @@ jobs:
           python-version: "3.12"
       - run: pnpm typecheck
       - run: pnpm test
+      - run: pnpm scanner:setup
       - run: pnpm test:scanner
       - run: pnpm exec wrangler deploy --dry-run
 

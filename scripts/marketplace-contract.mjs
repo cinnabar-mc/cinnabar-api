@@ -7,7 +7,8 @@ export function deriveContract(inputs, revision) {
   if (!capabilities.length || capabilities.length !== [...block.matchAll(/pub \w+:/g)].length) {
     throw new Error('Unsupported client grant type; review the contract before accepting uploads.');
   }
-  const interfaces = [...new Set(Object.values(inputs).flatMap(text => {
+  // Dependency packages supply referenced types, not additional host authority.
+  const interfaces = [...new Set([inputs.wit, inputs.drawing].flatMap(text => {
     const pkg = text.match(/^package\s+([^;]+);/m)?.[1];
     if (!pkg) return [];
     const [base, version] = pkg.split('@');

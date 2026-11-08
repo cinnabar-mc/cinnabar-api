@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { parse } from '@bytecodealliance/jco-transpile/wasm-tools';
+import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { componentEmbed, componentNew, parse } from '@bytecodealliance/jco-transpile/wasm-tools';
 import sharp from 'sharp';
 import { EVIDENCE_BUDGET, analyze, boundedNames, validateComponent, SCAN_POLICY, PROMPT_VERSION } from '../.build/scanner-engine.mjs';
 import { isolatedAnalysis, parseAi, reviewEvidence, runOnce } from './runner.mjs';
@@ -42,22 +43,77 @@ function withGrants(bytes, grants) {
   return new Uint8Array(Buffer.concat([Buffer.from(bytes), Buffer.from([0]), Buffer.from(leb(payload.length)), payload]));
 }
 
-/** A packet component exporting `names` under their canonical kebab-case names. */
-function packetWat(names) {
-  return `(component (core module $m ${names.map(n => `(func (export "${n}"))`).join(' ')}) (core instance $i (instantiate $m)) ${
-    names.map(n => `(func (export "${n}") (canon lift (core func $i "${n}")))`).join(' ')})`;
+/** Build a trapping, never-executed fixture from a world in a disposable copy of the pinned WIT. */
+async function clientFixture(world, transform = wit => wit) {
+  const directory = await mkdtemp(new URL('../.build/scanner-fixture-', import.meta.url));
+  try {
+    await cp(new URL('../.generated/wit/', import.meta.url), directory, { recursive: true });
+    const path = `${directory}/extension.wit`;
+    await writeFile(path, transform(await readFile(path, 'utf8')));
+    return await componentNew(await componentEmbed({ witPath: directory, world, dummy: true }));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 }
 
 test('accepts packet callbacks by canonical name even though Jco renames on-batch', async () => {
-  const complete = withGrants(await parse(packetWat(['start', 'on-batch', 'tick', 'stop'])), { packets: true });
+  const complete = withGrants(await clientFixture('packet-mod'), { packets: true });
   const passed = await analyze({ ...jobFor(complete), grants: { packets: true } }, complete, []);
   assert.deepEqual(passed.findings, []);
   assert.equal(passed.deterministic, 'pass');
-  const missing = withGrants(await parse(packetWat(['start', 'tick', 'stop'])), { packets: true });
+  const missing = withGrants(await clientFixture('packet-mod', wit => wit.replace(/^\s*export on-batch:.*$/m, '')), { packets: true });
   const blocked = await analyze({ ...jobFor(missing), grants: { packets: true } }, missing, []);
   assert.equal(blocked.deterministic, 'block');
   assert.ok(blocked.findings.includes('The packet mod is missing required callbacks.'));
 });
+
+test('blocks packet callbacks with allowed names but incompatible signatures', async () => {
+  const bytes = withGrants(await clientFixture('packet-mod', wit => wit.replace(/^\s*export start:.*$/m,
+    '    export start: func(value: string);')), { packets: true });
+  const report = await analyze({ ...jobFor(bytes), grants: { packets: true } }, bytes, []);
+  assert.equal(report.deterministic, 'block');
+  assert.match(report.findings.join('\n'), /packet-mod world.*callback signatures/);
+});
+
+test('accepts regular callbacks and compatible subsets of pinned host interfaces', async () => {
+  const regular = await parse(GOOD_WAT);
+  assert.equal((await analyze(jobFor(regular), regular, [])).deterministic, 'pass');
+  const bytes = await componentNew(await componentEmbed({ dummy: true, world: 'fixture', witSource: `
+    package cinnabar:extension@0.1.0;
+    interface hud { set-label: func(text: string) -> result<_, string>; }
+    world fixture { import hud; export init: func(); export frame: func(); }
+  ` }));
+  assert.equal((await analyze(jobFor(bytes), bytes, [])).deterministic, 'pass');
+});
+
+test('blocks an allowed host interface with an incompatible function signature', async () => {
+  const bytes = await componentNew(await componentEmbed({ dummy: true, world: 'fixture', witSource: `
+    package cinnabar:extension@0.1.0;
+    interface hud { set-label: func(text: u32) -> result<_, string>; }
+    world fixture { import hud; export init: func(); export frame: func(); }
+  ` }));
+  const report = await analyze(jobFor(bytes), bytes, []);
+  assert.deepEqual(report.imports, ['cinnabar:extension/hud@0.1.0']);
+  assert.equal(report.deterministic, 'block');
+  assert.match(report.findings.join('\n'), /extension world.*host import types/);
+});
+
+for (const [kind, declaration] of [
+  ['named types', 'record viewport { width: string, height: f32, scale: f32 } read-viewport: func() -> option<viewport>;'],
+  ['resources', 'resource viewport; read-viewport: func() -> option<own<viewport>>;'],
+]) {
+  test(`blocks incompatible host ${kind}`, async () => {
+    const bytes = await componentNew(await componentEmbed({ dummy: true, world: 'fixture', witSource: `
+      package cinnabar:extension@0.1.0;
+      interface hud { ${declaration} }
+      world fixture { import hud; export init: func(); export frame: func(); }
+    ` }));
+    const report = await analyze(jobFor(bytes), bytes, []);
+    assert.deepEqual(report.imports, ['cinnabar:extension/hud@0.1.0']);
+    assert.equal(report.deterministic, 'block');
+    assert.match(report.findings.join('\n'), /extension world.*host import types/);
+  });
+}
 
 test('checks canonical WIT interface versions rather than rewritten JavaScript specifiers', async () => {
   for (const [name, expected] of [

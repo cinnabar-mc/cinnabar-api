@@ -5,6 +5,7 @@ COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY source.json ./
 COPY scripts/ scripts/
+RUN node scripts/install-wasm-tools.mjs
 COPY scanner/ scanner/
 COPY src/marketplace/ src/marketplace/
 RUN node scripts/marketplace-source.mjs && node scripts/build-scanner.mjs

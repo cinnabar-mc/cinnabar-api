@@ -2,6 +2,8 @@
 import { $init, generate } from "@bytecodealliance/jco-transpile/component";
 import { componentWit } from "@bytecodealliance/jco-transpile/wasm-tools";
 import sharp from "sharp";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import contract from "../.generated/contract.json";
 import { readComponent } from "../src/marketplace/component";
 import { grantDiff, type Grants, type ListingFields } from "../src/marketplace/policy";
@@ -74,6 +76,22 @@ export async function validateComponent(bytes: Uint8Array) {
   return { imports, exports: result.exports.map(([name]) => name), wit };
 }
 
+/**
+ * Check component subtyping against the pinned client world without executing guest code.
+ * wasm-tools validates a synthetic instantiation: host imports may be unused/subsets, but every
+ * imported function/type/resource must link and every required callback must have its WIT type.
+ * A type mismatch returns false; unavailable tooling, timeout or process failure throws.
+ */
+function targetsClientWorld(bytes: Uint8Array, world: "extension" | "packet-mod"): boolean {
+  const result = spawnSync(fileURLToPath(new URL("../.generated/wasm-tools/wasm-tools", import.meta.url)),
+    ["component", "targets", fileURLToPath(new URL("../.generated/wit/", import.meta.url)), "--world", world, "-"],
+    { input: bytes, env: {}, timeout: 10_000, maxBuffer: 64 * 1024, encoding: "utf8" });
+  if (result.error) throw result.error;
+  if (result.status === 0) return true;
+  if (result.status === 1) return false;
+  throw new Error("World compatibility validator failed.");
+}
+
 /** Build bounded evidence from bytes, independently checking declarations against the claimed job. */
 export async function analyze(job: ScanJob, bytes: Uint8Array, media: Uint8Array[]) {
   const declarations = readComponent(bytes);
@@ -93,6 +111,10 @@ export async function analyze(job: ScanJob, bytes: Uint8Array, media: Uint8Array
   if (packet && !["start", "on-batch", "tick", "stop"].every(name => exported.has(name))) {
     findings.push("The packet mod is missing required callbacks.");
   }
+  const world = packet ? "packet-mod" : "extension";
+  if (!findings.length && !targetsClientWorld(bytes, world)) {
+    findings.push(`The component does not target the pinned client ${world} world: incompatible host import types or callback signatures.`);
+  }
   sharp.cache(false);
   sharp.concurrency(1);
   for (let i = 0; i < media.length; i++) {
@@ -111,7 +133,7 @@ export async function analyze(job: ScanJob, bytes: Uint8Array, media: Uint8Array
       listing: boundedFields(job.listing, { description: EVIDENCE_BUDGET.description, notes: EVIDENCE_BUDGET.long }),
       declarations: boundedFields(declarations, { description: EVIDENCE_BUDGET.long, authors: EVIDENCE_BUDGET.long, licenses: EVIDENCE_BUDGET.long }),
       strings,
-      limitations: "Static component validation, host-import policy and image decode. No runtime or source-code audit. AI cannot prove safety." } };
+      limitations: "Static component and client world type validation, host-import policy and image decode. No runtime or source-code audit. AI cannot prove safety." } };
 }
 
 export { CLIENT_REVISION, PROMPT_VERSION, SCAN_POLICY, VALIDATOR };

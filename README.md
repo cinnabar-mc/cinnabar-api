@@ -269,7 +269,8 @@ no emote history is written to durable storage or logs. No server addresses are 
 pnpm install
 pnpm source:fetch # derive capabilities/imports from the immutable client revision in source.json
 pnpm test          # vitest in the Workers runtime
-pnpm test:scanner  # real component validation, image decoding and scanner protocol
+pnpm scanner:setup # checksum-pinned official wasm-tools (Linux x64/arm64)
+pnpm test:scanner  # component/client-world types, image decoding and scanner protocol
 pnpm typecheck
 cp .dev.vars.example .dev.vars && pnpm dev
 ```

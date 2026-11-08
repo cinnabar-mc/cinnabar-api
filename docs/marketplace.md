@@ -110,7 +110,14 @@ Completed/failed jobs keep their evidence. Staff can request a fresh job through
 
 The Node scanner runs full Jco/Wasmtime component translation and validates nested
 core bytecode without importing generated bindings or executing start functions.
-It compares imports to the pinned client WIT and checks required callbacks. Images
+It first checks canonical import names against the allowlist, then uses official
+`wasm-tools component targets` to verify component subtyping against the pinned
+client `packet-mod` world when `packets` is granted, or the baseline `extension`
+world otherwise. This checks imported functions, named types and resources, plus
+the exact required callback signatures, while permitting unused host imports.
+The baseline regular world requires `init` and `frame`; the player-mod worlds add
+optional callbacks and are not required of every regular component. A mismatch
+is a deterministic block. No guest callback or start function runs. Images
 must fully decode in sharp, be single-frame, and fit 4096 × 4096 / 16,777,216 pixels.
 It uses a disposable credential-free thread and a thirty-second deadline. Run the
 container with OS memory/CPU limits as native/Wasm allocations exceed JS heap limits.
@@ -219,8 +226,20 @@ Workers AI. Optional `AI_MODEL` defaults to
 container no signer, cloud deployment, R2 or database credentials. Its egress needs
 only the configured API and Cloudflare AI. A supervisor should restart it after
 failure. Multiple instances are supported; the SQL lease prevents duplicate work.
-For local fixture development use `pnpm source:fetch`, `pnpm scanner:build`, then
-`pnpm scanner:start` with equivalent environment variables.
+For local fixture development use `pnpm scanner:setup`, `pnpm source:fetch`,
+`pnpm scanner:build`, then `pnpm scanner:start` with equivalent environment variables.
+`pnpm test:scanner` needs the same setup and fetched WIT. The setup script installs
+official wasm-tools 1.245.1 into `.generated/wasm-tools/`, verifies the release
+archive's pinned SHA-256 and retains its licenses. Linux x64 and arm64 are supported;
+use the scanner container on other platforms. The Docker build runs this setup too.
+The pinned release hashes are in `scripts/install-wasm-tools.mjs`. Jco's bundled
+wasm-tools has no world-targeting API; it still supplies static translation and WIT
+extraction. `source:fetch` retains the client WIT and its drawing, session and
+server-experience dependencies under `.generated/wit/` at the same `source.json`
+revision. Dependency definitions do not expand the host import allowlist.
+The scanner build checks that the tool and trusted WIT are available. Runtime
+world checks read component bytes through stdin with a ten-second tool timeout,
+no shell, no credentials and no guest execution; tool failures remain scan errors.
 
 Monitor fixed `scan_completed` / `scan_retry_pending` scanner events, staff queue
 scan states, expired claims and pending publications. Reconfigure/restart a failed

@@ -20,6 +20,7 @@
     "cf-typegen": "wrangler types --strict-vars false",
     "source:fetch": "node scripts/marketplace-source.mjs",
     "scanner:build": "node scripts/build-scanner.mjs",
+    "scanner:setup": "node scripts/install-wasm-tools.mjs",
     "scanner:start": "node scanner/runner.mjs",
     "test:scanner": "pnpm scanner:build && node --test scanner/*.test.mjs",
     "typecheck": "wrangler types --strict-vars false && tsc --noEmit && tsc --noEmit -p scanner/tsconfig.json",

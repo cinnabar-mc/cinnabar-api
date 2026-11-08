@@ -22,6 +22,8 @@ test('derives optional packet-only markers and exact interface versions from pin
   assert.ok(contract.interfaces.includes('cinnabar:world-draw/drawing@0.2.0'));
   assert.equal(contract.interfaces.includes('cinnabar:world-draw/drawing@0.1.0'), false);
   assert.equal(new Set(contract.interfaces).size, contract.interfaces.length);
+  assert.deepEqual(deriveContract({ ...inputs(), serverExperience: 'package cinnabar:dependency@1.0.0;\ninterface private-host {}' },
+    'a'.repeat(40)).interfaces, contract.interfaces);
 });
 
 test('refuses unsupported grant types and malformed trust roots instead of dropping declarations', () => {
