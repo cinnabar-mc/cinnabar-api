@@ -296,4 +296,11 @@ describe("revision-aware mod releases", () => {
     }
     expect((await exports.default.fetch(`https://api.test/v1/mod/update`)).status).toBe(400);
   });
+
+  it("accepts thirty-two complete API revisions and rejects longer or malformed lists", async () => {
+    expect((await update({ api_revisions: Array(32).fill(HOST_A).join(",") })).status).toBe(204);
+    for (const api_revisions of [Array(33).fill(HOST_A).join(","), `${HOST_A},`, `${HOST_A},abc`]) {
+      expect((await update({ api_revisions })).status).toBe(400);
+    }
+  });
 });

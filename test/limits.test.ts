@@ -35,9 +35,13 @@ function expectLimited(response: Response): void {
 describe("connection caps", () => {
   it("schedules a new handshake before an existing later maintenance alarm", async () => {
     await runInDurableObject(hub(), (_, state) => state.storage.setAlarm(Date.now() + 300_000));
-    const before = Date.now();
     await upgrade();
-    expect(await runInDurableObject(hub(), (_, state) => state.storage.getAlarm())).toBeLessThanOrEqual(before + HANDSHAKE_TIMEOUT_MS + 100);
+    await runInDurableObject(hub(), async (_, state) => {
+      const alarm = await state.storage.getAlarm();
+      expect(alarm).not.toBeNull();
+      // Admission can wait on I/O; compare against the actor's clock after it completes.
+      expect(alarm).toBeLessThanOrEqual(Date.now() + HANDSHAKE_TIMEOUT_MS);
+    });
   });
 
   it("checks admission counters without scanning attached sockets", async () => {
