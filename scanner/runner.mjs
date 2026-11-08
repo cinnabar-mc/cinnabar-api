@@ -95,7 +95,8 @@ export async function runOnce(config, request = fetch, analyze = isolatedAnalysi
     imports: [], exports: [], media: (job.media ?? []).map(m => m.sha256), findings: [],
     ai: { verdict: 'error', model, prompt: PROMPT_VERSION, findings: ['Validation did not complete.'] } };
   try {
-    if (job.policy !== SCAN_POLICY || !/^[0-9a-f]{64}$/.test(job.sha256) || job.media.length > 4) throw new Error('Invalid job.');
+    if (job.policy !== SCAN_POLICY || !/^[0-9a-f]{64}$/.test(job.sha256)
+      || job.media.filter(m => m.role !== 'icon').length > 4 || job.media.filter(m => m.role === 'icon').length > 1) throw new Error('Invalid job.');
     const download = async (hash, size) => {
       const response = await call(`jobs/${encodeURIComponent(job.id)}/files/${hash}`, { headers: { 'X-Scan-Lease': job.lease } });
       const bytes = await limitedBody(response, size);

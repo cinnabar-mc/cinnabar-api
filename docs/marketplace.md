@@ -117,6 +117,32 @@ since no client could load it. `pnpm source:fetch` derives that ceiling and the 
 section names from the pinned client revision.
 Raster types are PNG, JPEG and WebP. SVG and active content are refused.
 
+The listing icon comes only from the component's optional top-level custom section
+`cinnabar:extension/icon@1`, containing encoded PNG bytes. No separate icon upload
+or screenshot is required. Exactly one section is accepted, with an inclusive
+256 KiB encoded-byte limit and width/height in `1..=256`, matching the client's
+section, byte and dimension rules. Missing sections yield no icon; duplicate,
+oversized or structurally invalid icons also yield no icon without rejecting the
+submission. The private version view records the reason as `icon_error` (null for
+a missing or valid icon).
+
+The Worker checks the PNG signature, IHDR first and exactly once, legal IHDR
+fields, bounded chunk lengths and CRCs, critical chunk order, palette framing,
+IDAT presence, and a final empty IEND with no trailing bytes. Unlike the client,
+which decodes PNG pixels, this structural check does not inflate IDAT, validate
+pixel/filter data or fully interpret ancillary chunks. A PNG with corrupt
+compressed pixels can therefore pass extraction but fail client decoding.
+Creator releases additionally pass the existing scanner's full media decode
+before publication; official hook publication uses the Worker's structural check.
+
+A valid icon is stored as `media/<sha256>` with `image/png` content type and an
+immutable media descriptor `{sha256, bytes, type: "image/png", caption: "", role: "icon"}`.
+The pipeline snapshot, digest index, scanner job/attestation and signed release's
+`media` include it alongside up to four gallery images. Existing media without a
+role remains gallery media; `gallery` responses exclude icons. Existing signed
+versions are not rewritten or backfilled. Additive migration 10 adds nullable
+`mod_pipeline.icon_error` without changing those snapshots or signatures.
+
 All bytes enter `MOD_FILES` directly, under `mods/<sha256>` or `media/<sha256>`.
 The R2 bucket must have public access disabled. Publication signs the release and
 changes API download authorization; it does not copy artifacts between buckets.
@@ -137,7 +163,18 @@ The code change removes the old binding; it does not delete the old bucket or da
 - `scan`: `state` (`queued`, `running`, `complete`, `failed`), attempts, job ID,
   completion/expiry time, authoritative `review_ready`, deterministic findings and structured AI evidence;
 - `publication`: `manual`, `automatic`, `official` or null;
-- immutable description and `gallery` descriptors `{sha256, bytes, type, caption, alt}`.
+- immutable description and `gallery` descriptors `{sha256, bytes, type, caption, alt}`;
+- `icon: string | null`, a root-relative authenticated preview URL
+  `/v1/me/mods/<id>/media/<sha256>` for that version, including pending versions;
+- private `icon_error: string | null`, explaining why an embedded icon was ignored.
+
+Public summaries (`GET /v1/mods`) and details (`GET /v1/mods/<slug>`) include
+`icon: string | null`, using the root-relative URL `/v1/mods/media/<sha256>` from
+the approved live version's immutable media snapshot. Pending releases cannot
+change that URL. Approving a version without a usable icon changes it to null;
+gallery images never supply an icon fallback. Public responses omit `icon_error`.
+The Official Mod publication hook extracts and stores its component icon through
+the same media contract, with the same version-bound publication/withdrawal rules.
 
 Public component/media URLs are `/v1/mods/assets/<sha256>` and
 `/v1/mods/media/<sha256>`. Authorization is checked on each request with one indexed
@@ -165,7 +202,7 @@ An account's persisted send clock advances timestamps even within the same clock
 millisecond, after deletion/re-addition and across restarts or clock adjustments.
 Its high-water mark is retained independently of active library entries.
 Removal works for hidden/pulled releases and does not uninstall local files.
-Creators and active staff fetch pending screenshots through authenticated
+Creators and active staff fetch pending screenshots and icons through authenticated
 `GET /v1/me/mods/<id>/media/<sha256>`; other accounts receive 404. Public listing
 responses include grants, category/license, release notes/history, publication mode
 and a scan summary without private findings. Previous-version review data includes

@@ -4,12 +4,12 @@ import { publicCache } from "../public-cache";
 import { hubFor } from "../routing";
 import { downloadModAsset } from "../mod-assets";
 import { MAX_COMPONENT_BYTES, readComponent } from "./component";
-import { clip, malformedText, type Grants } from "./policy";
+import { clip, malformedText } from "./policy";
 import { USERNAME_RULES, linkCode, normalizeLinkCode, randomToken, sha256Base64Url } from "./auth";
 import { authorizeUrl, googleIdentity } from "./google";
 import { MAX_RETURN_TO, OAUTH_STATE_MS, openSignIn, sealSignIn } from "./oauth-state";
 import { PLAYER_SESSION_MS, anonymousResult, type Caller, type MarketCall, type MarketResult, type MediaFile } from "./store";
-import { BodyLimitError, MAX_IMAGES, MAX_UPLOAD_BYTES, imageType, readLimited, sha256 } from "./uploads";
+import { BodyLimitError, MAX_IMAGES, MAX_UPLOAD_BYTES, imageType, readLimited, sha256, storeComponentIcon } from "./uploads";
 import { isMarketplaceUpdateQuery } from "./updates";
 import { OFFICIAL_SLUG } from "./official";
 
@@ -293,13 +293,12 @@ marketplaceRoutes.post("/submissions", async (c) => {
   if (!(file instanceof File)) return c.json({ error: "Choose your mod's .wasm file.", fields: { file: "Choose a file." } }, 422);
   if (file.size > MAX_COMPONENT_BYTES) return c.json({ error: "The file is over 16 MiB." }, 413);
   const bytes = new Uint8Array(await file.arrayBuffer());
-  let grants: Grants | null;
+  let declarations: ReturnType<typeof readComponent>;
   try {
-    const declarations = readComponent(bytes);
+    declarations = readComponent(bytes);
     if (declarations.version && declarations.version !== (listing as { version?: string }).version) {
       throw new Error("The component version must match the release version.");
     }
-    grants = declarations.grants;
   } catch (error) {
     const message = error instanceof Error ? error.message : "This file can't be read.";
     return c.json({ error: message, fields: { file: message } }, 422);
@@ -333,9 +332,11 @@ marketplaceRoutes.post("/submissions", async (c) => {
   } catch (error) { return c.json({ error: error instanceof Error ? error.message : "Invalid image." }, 422); }
   const hash = await sha256(bytes);
   for (const { file, data } of media) await c.env.MOD_FILES.put(`media/${file.sha256}`, data, { httpMetadata: { contentType: file.type } });
+  const icon = await storeComponentIcon(c.env.MOD_FILES, declarations.icon);
   await c.env.MOD_FILES.put(`mods/${hash}`, bytes, { httpMetadata: { contentType: "application/wasm" } });
   return reply(c, await call(c, { op: "submit", body: listing,
-    file: { sha256: hash, bytes: bytes.byteLength, grants, media: media.map(m => m.file) }, ...who }));
+    file: { sha256: hash, bytes: bytes.byteLength, grants: declarations.grants, iconError: declarations.iconError,
+      media: [...media.map(m => m.file), ...(icon ? [icon] : [])] }, ...who }));
 });
 
 for (const op of ["queue", "reports", "people", "audit"] as const) marketplaceRoutes.get(`/staff/${op}`, (c) => forward(c, { op }));

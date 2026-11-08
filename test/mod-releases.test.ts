@@ -6,6 +6,9 @@ import type { ModRelease, ModUpdateQuery } from "../src/mod-releases";
 import { validateListing } from "../src/marketplace/policy";
 import { MarketplaceStore, type MarketCall, type MarketResult } from "../src/marketplace/store";
 import { sha256Base64Url } from "../src/marketplace/auth";
+import { component, pngIcon } from "./component-fixtures";
+import { ICON_SECTION } from "../src/marketplace/icon";
+import { sha256 } from "../src/marketplace/uploads";
 
 const HOST_A = "a".repeat(40);
 const HOST_B = "b".repeat(40);
@@ -102,6 +105,36 @@ describe("revision-aware mod releases", () => {
     expect((await exports.default.fetch(`https://api.test/v1/mod/assets/${badHash}`)).status).toBe(404);
   });
 
+  it.each([true, false])("takes the Official Mod icon from its component (valid PNG: %s)", async valid => {
+    const png = valid ? pngIcon(2, 2, 120) : new Uint8Array([1, 2, 3]);
+    const bytes = component([[ICON_SECTION, png]]), hash = await sha256(bytes);
+    const body = release(); body.manifest.artifact = { ...body.manifest.artifact, size: bytes.length, sha256: hash };
+    await env.MOD_ASSETS.put(`mod-releases/${hash}`, bytes, { customMetadata: { sha256: hash } });
+    expect((await publish(body)).status).toBe(204);
+    const listing = (await market({ op: "mod", slug: "cinnabar-mod" })).body as any;
+    const iconHash = await sha256(png), icon = valid ? `/v1/mods/media/${iconHash}` : null;
+    expect(listing).toMatchObject({ icon, gallery: [], publication: "official" });
+    expect((await market({ op: "mods" })).body).toEqual(expect.arrayContaining([expect.objectContaining({ slug: "cinnabar-mod", icon })]));
+    const media = JSON.parse(listing.release.statement).media;
+    expect(media).toEqual(valid ? [{ sha256: iconHash, bytes: png.length, type: "image/png", caption: "", role: "icon" }] : []);
+    await market({ op: "signin", identity: { provider: "google", subject: "2535400000009001", email: "2535400000009001@test.invalid", email_verified: true }, newSession: "icon-owner", newCsrf: "icon-csrf" });
+    const view = await market({ op: "version", session: "icon-owner", id: Number(listing.version_id) });
+    expect(view.body).toMatchObject({ icon: valid ? `/v1/me/mods/${listing.version_id}/media/${iconHash}` : null,
+      icon_error: valid ? null : "The icon is not a PNG." });
+    if (valid) {
+      const stored = await env.MOD_FILES.get(`media/${iconHash}`);
+      expect(stored?.httpMetadata?.contentType).toBe("image/png");
+      const response = await exports.default.fetch(`https://api.test${icon}`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get("Content-Type")).toBe("image/png");
+      expect(new Uint8Array(await response.arrayBuffer())).toEqual(png);
+    }
+    expect((await publish(body)).status).toBe(204);
+    expect((await market({ op: "mod", slug: "cinnabar-mod" })).body).toEqual(listing);
+    expect((await market({ op: "pull", session: "icon-owner", csrf: "icon-csrf", id: Number(listing.version_id), body: { reason: "Withdraw fixture" } })).status).toBe(200);
+    if (icon) expect((await exports.default.fetch(`https://api.test${icon}`)).status).toBe(404);
+  });
+
   it("publishes a signed official marketplace release through the existing mod hook", async () => {
     const body = release();
     body.manifest.host.revision = HOST_B;
@@ -110,6 +143,7 @@ describe("revision-aware mod releases", () => {
     expect(result.status).toBe(200);
     const listing = result.body as { creator: string; release: { statement: string; signature: string } };
     expect(listing.creator).toBe("system:official");
+    expect(listing).toMatchObject({ icon: null, gallery: [] });
     expect(JSON.parse(listing.release.statement)).toMatchObject({ slug: "cinnabar-mod", version: "1.0.0", api_revision: HOST_A,
       client_revision: HOST_B, publication: "official", sha256: HASH, approvers: ["system:official"] });
     const key = await crypto.subtle.importKey("spki", Uint8Array.from(atob("MCowBQYDK2VwAyEAlSb5YEqBeXmlmyc5Xg5zqHKLWklg3zlZbCj4GAVu/TQ="), c => c.charCodeAt(0)), "Ed25519", false, ["verify"]);

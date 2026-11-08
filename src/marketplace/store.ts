@@ -77,11 +77,12 @@ type ListingRow = {
   hidden: number;
 };
 
-export interface MediaFile { sha256: string; bytes: number; type: "image/png" | "image/jpeg" | "image/webp"; caption: string; alt?: string }
+/** Immutable media descriptor; absent role means a legacy gallery image. */
+export interface MediaFile { sha256: string; bytes: number; type: "image/png" | "image/jpeg" | "image/webp"; caption: string; alt?: string; role?: "icon" }
 /** A submitted component already stored under its SHA-256, with the grants read from its bytes and its images. */
-export interface SubmittedFile { sha256: string; bytes: number; grants: Grants | null; media: MediaFile[] }
+export interface SubmittedFile { sha256: string; bytes: number; grants: Grants | null; media: MediaFile[]; iconError?: string | null }
 type PipelineRow = {
-  version_id: number; metadata: string; media: string; baseline: number | null;
+  version_id: number; metadata: string; media: string; icon_error: string | null; baseline: number | null;
   job_id: string; state: "queued" | "running" | "complete" | "failed";
   attempts: number; lease: string | null; lease_until: number | null;
   report: string | null; completed_at: number | null; publish_mode: "manual" | "automatic" | "official" | null; promotion_attempt_at: number;
@@ -223,13 +224,16 @@ export class MarketplaceStore {
       `UPDATE accounts SET username = 'Cinnabar' WHERE id = '${OFFICIAL_CREATOR}'`,
       "CREATE TABLE username_attempts (account_id TEXT NOT NULL, at INTEGER NOT NULL)",
       "CREATE INDEX username_attempts_account ON username_attempts (account_id, at)");
+    // Keep presentation diagnostics private without rewriting existing signed media snapshots.
+    migrate(10, "ALTER TABLE mod_pipeline ADD COLUMN icon_error TEXT");
   }
 
   /** Increases whenever the set of pulled versions changes, so callers can tell a memoized revocation list is stale. */
   revocationRevision = 0;
 
-  /** Records authenticated CI approval and deterministic byte validation without impersonating a scanner report. */
-  officialRelease(input: ModRelease, grants: Grants, license: string, now: number): number | null {
+  /** Records CI approval and byte validation; presentation media must already be stored and derived from the component. */
+  officialRelease(input: ModRelease, grants: Grants, license: string, now: number,
+    presentation: Pick<SubmittedFile, "media" | "iconError"> = { media: [] }): number | null {
     const release = canonicalRelease(input), m = release.manifest;
     const listing = this.listing(OFFICIAL_SLUG);
     if (listing && listing.creator !== OFFICIAL_CREATOR) return null;
@@ -251,8 +255,10 @@ export class MarketplaceStore {
     this.sql.exec(`INSERT INTO mod_official_releases (version_id, release, validation) VALUES (?, ?, ?)`, id, encoded,
       JSON.stringify({ policy: OFFICIAL_POLICY, at: now, sha256: m.artifact.sha256, bytes: m.artifact.size,
         checks: ["manifest", "publisher", "sha256", "size", "component-framing", "declarations", "grants", "executable-size"], approval: "authenticated-release-hook" }));
-    this.sql.exec(`INSERT INTO mod_pipeline (version_id, metadata, job_id, state, completed_at, publish_mode)
-      VALUES (?, ?, ?, 'complete', ?, 'official')`, id, JSON.stringify(metadata), crypto.randomUUID(), now);
+    this.sql.exec(`INSERT INTO mod_pipeline (version_id, metadata, media, icon_error, job_id, state, completed_at, publish_mode)
+      VALUES (?, ?, ?, ?, ?, 'complete', ?, 'official')`, id, JSON.stringify(metadata), JSON.stringify(presentation.media),
+      presentation.iconError ?? null, crypto.randomUUID(), now);
+    for (const item of presentation.media) this.sql.exec("INSERT OR IGNORE INTO mod_media (sha256, version_id) VALUES (?, ?)", item.sha256, id);
     this.log(OFFICIAL_CREATOR, "official approval", `${OFFICIAL_SLUG} ${m.version}`, OFFICIAL_POLICY, now);
     return id;
   }
@@ -530,7 +536,7 @@ export class MarketplaceStore {
     const grants = JSON.parse(live.grants) as Grants;
     return {
       slug: listing.slug, name: metadata.name, summary: metadata.summary, description: metadata.description,
-      source: metadata.source, gallery: this.media(live.id), creator: listing.creator, creator_name: this.name(listing.creator),
+      source: metadata.source, gallery: this.gallery(live.id), icon: this.iconUrl(live.id), creator: listing.creator, creator_name: this.name(listing.creator),
       category: metadata.category, license: metadata.license, grants,
       version: live.version, version_id: String(live.id), reach: live.reach,
       status: "approved",
@@ -744,8 +750,8 @@ export class MarketplaceStore {
         VALUES (?, ?, ?, ?, ?, ?, 'submitted', ?, ?) RETURNING id`,
       fields.slug, fields.version, file.sha256, file.bytes, JSON.stringify(grants), reach, now, API_REVISION).one().id;
     const baseline = this.liveVersion(fields.slug)?.id ?? null;
-    this.sql.exec(`INSERT INTO mod_pipeline (version_id, metadata, media, baseline, job_id) VALUES (?, ?, ?, ?, ?)`,
-      id, JSON.stringify(fields), JSON.stringify(file.media), baseline, crypto.randomUUID());
+    this.sql.exec(`INSERT INTO mod_pipeline (version_id, metadata, media, icon_error, baseline, job_id) VALUES (?, ?, ?, ?, ?, ?)`,
+      id, JSON.stringify(fields), JSON.stringify(file.media), file.iconError ?? null, baseline, crypto.randomUUID());
     for (const item of file.media) this.sql.exec("INSERT OR IGNORE INTO mod_media (sha256, version_id) VALUES (?, ?)", item.sha256, id);
     return ok(this.versionView(this.versionRow(id)!));
   }
@@ -776,7 +782,16 @@ export class MarketplaceStore {
   /** Media descriptors belong to the immutable version, not mutable listing metadata. */
   media(id: number): MediaFile[] { return JSON.parse(this.pipeline(id)?.media ?? "[]") as MediaFile[]; }
 
-  /** Pending screenshots are visible only to their creator or active staff, under an authenticated no-store route. */
+  /** Legacy media without a role remains in the gallery; component icons never become screenshots. */
+  private gallery(id: number): MediaFile[] { return this.media(id).filter(item => item.role !== "icon"); }
+
+  /** Uses the selected version's immutable digest, with authenticated preview access for private views. */
+  private iconUrl(id: number, preview = false): string | null {
+    const icon = this.media(id).find(item => item.role === "icon");
+    return icon ? `${preview ? `/v1/me/mods/${id}/media` : "/v1/mods/media"}/${icon.sha256}` : null;
+  }
+
+  /** Pending screenshots and icons are visible only to their creator or active staff, under an authenticated no-store route. */
   privateMedia(caller: Caller, id: number, sha256: string, now: number): MarketResult {
     const session = this.session(caller, now);
     if (!session || session.account.suspended) return fail(404, NO_SUCH_IMAGE);
@@ -980,7 +995,8 @@ export class MarketplaceStore {
       name: metadata.name, summary: metadata.summary, description: metadata.description, source: metadata.source, hidden: !!listing.hidden,
       category: metadata.category, license: metadata.license, notes: metadata.notes,
       trust: { trusted: !!trust && this.trusted(v.slug, v.creator, Date.now()), expires_at: trust?.expires_at ?? null },
-      gallery: this.media(v.id), scan: { state: p.state, attempts: p.attempts, job: p.job_id,
+      gallery: this.gallery(v.id), icon: this.iconUrl(v.id, true), icon_error: p.icon_error,
+      scan: { state: p.state, attempts: p.attempts, job: p.job_id,
         completed_at: p.completed_at, expires_at: p.completed_at === null ? null : p.completed_at + SCAN_MAX_AGE_MS,
         review_ready: this.scanPassed(p, Date.now()), report: reportOf(p) }, publication: p.publish_mode,
       capabilities: requestedCapabilities(grants), rule: approvalRule(v.reach as Reach), approvals: this.approvals(v.id),

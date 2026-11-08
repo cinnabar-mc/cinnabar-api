@@ -15,6 +15,8 @@ import { OAUTH_STATE_MS, sealSignIn } from "../src/marketplace/oauth-state";
 import { MarketplaceStore, SESSION_OPS, anonymousResult, type MarketCall } from "../src/marketplace/store";
 import { signText } from "../src/marketplace/signing";
 import { hub, installFakeIssuer, login, type Client } from "./helpers";
+import { component, pngIcon } from "./component-fixtures";
+import { ICON_SECTION } from "../src/marketplace/icon";
 
 const SITE = "https://site.test";
 const OWNER = "2535400000009001";
@@ -124,17 +126,6 @@ async function verifies(text: string, signature: string): Promise<boolean> {
 /** Posts a multipart submission as `browser`. */
 const upload = (browser: Browser, form: FormData) =>
   api("/submissions", { method: "POST", body: form, headers: { Cookie: browser.cookie, Origin: SITE, "X-Cinnabar-CSRF": browser.csrf } });
-
-/** Builds a component carrying only the given top-level custom sections. */
-function component(sections: [string, string][], layer = [0x0d, 0, 1, 0]): Uint8Array {
-  const bytes = [0, 0x61, 0x73, 0x6d, ...layer];
-  const encoder = new TextEncoder();
-  for (const [name, data] of sections) {
-    const body = [...[encoder.encode(name).length], ...encoder.encode(name), ...encoder.encode(data)];
-    bytes.push(0, body.length, ...body);
-  }
-  return new Uint8Array(bytes);
-}
 
 /** Submits a component built from `grants` through the multipart upload route. */
 async function submit(browser: Browser, slug: string, version: string, grants: object, extra: object = {}, scan = true): Promise<Response> {
@@ -715,6 +706,103 @@ describe("upload and publication pipeline", () => {
     expect(await (await api("/mods/race-mod")).json()).toMatchObject({ version: "1.0.0" });
   });
 
+  it("publishes the approved component's icon and keeps pending icons private alongside four gallery images", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const creator = await signIn("2535400000006110", "IconCreator");
+    /** Uploads a version with binary icon metadata and optional legacy screenshots. */
+    const uploadIcon = async (version: string, png: Uint8Array | null, gallery = false) => {
+      const form = new FormData();
+      form.set("listing", JSON.stringify({ slug: "icon-mod", name: "Icon mod", summary: "A mod with its own icon.", version }));
+      form.set("file", new File([component([["version", version], ["cinnabar:grants", "{}"], ...(png ? [[ICON_SECTION, png] as [string, Uint8Array]] : [])])], "icon-mod.wasm"));
+      if (gallery) for (let i = 0; i < 4; i++) form.append("images", new File([pngIcon(2, 2, i)], `Screenshot${i}.png`));
+      const response = await upload(creator, form);
+      expect(response.status, await response.clone().text()).toBe(200);
+      return await response.json() as any;
+    };
+    const firstPng = pngIcon(), first = await uploadIcon("1.0.0", firstPng, true);
+    expect(first).toMatchObject({ icon: expect.stringMatching(new RegExp(`^/v1/me/mods/${first.id}/media/[a-f0-9]{64}$`)), icon_error: null });
+    expect(first.gallery).toHaveLength(4);
+    expect(first.gallery.every((item: any) => item.role !== "icon")).toBe(true);
+    const hash = first.icon.split("/").at(-1);
+    const stored = await env.MOD_FILES.get(`media/${hash}`);
+    expect(stored?.httpMetadata?.contentType).toBe("image/png");
+    expect(new Uint8Array(await stored!.arrayBuffer())).toEqual(firstPng);
+    const preview = await creator.get(first.icon.slice(3));
+    expect(preview.headers.get("Content-Type")).toBe("image/png");
+    expect(preview.headers.get("Cache-Control")).toBe("private, no-store");
+    expect(new Uint8Array(await preview.arrayBuffer())).toEqual(firstPng);
+    expect((await api(first.icon.slice(3))).status).toBe(404);
+    expect((await api(`/mods/media/${hash}`)).status).toBe(404);
+    expect((await api("/mods/icon-mod")).status).toBe(404);
+    expect(await (await owner.get(`/staff/versions/${first.id}`)).json()).toMatchObject({ icon: first.icon });
+    expect(await (await creator.get("/me/mods")).json()).toEqual(expect.arrayContaining([expect.objectContaining({ id: first.id, icon: first.icon })]));
+    const job = await claim();
+    expect(job.media).toHaveLength(5);
+    expect(job.media.find((item: any) => item.role === "icon")).toMatchObject({ sha256: hash, bytes: firstPng.length, type: "image/png" });
+    const scanIcon = await scanFile(job, hash);
+    expect(scanIcon.headers.get("Content-Type")).toBe("image/png");
+    expect(new Uint8Array(await scanIcon.arrayBuffer())).toEqual(firstPng);
+    expect((await scanner(`jobs/${job.id}/complete`, report(job, { media: job.media.slice(0, 4).map((m: any) => m.sha256) }), job.lease)).status).toBe(422);
+    expect((await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).status).toBe(200);
+    expect((await owner.post(`/staff/versions/${first.id}/decision`, { decision: "approve" })).status).toBe(200);
+    const publicIcon = `/v1/mods/media/${hash}`;
+    const firstPublic = await (await api("/mods/icon-mod")).json() as any;
+    expect(firstPublic.icon).toBe(publicIcon);
+    expect(firstPublic.gallery).toHaveLength(4);
+    expect(firstPublic.icon_error).toBeUndefined();
+    expect(JSON.parse(firstPublic.release.statement).media).toEqual(job.media);
+    expect(await (await api("/mods")).json()).toEqual(expect.arrayContaining([expect.objectContaining({ slug: "icon-mod", icon: publicIcon })]));
+    const publicImage = await api(publicIcon.slice(3));
+    expect(publicImage.status).toBe(200);
+    expect(publicImage.headers.get("Content-Type")).toBe("image/png");
+    expect(publicImage.headers.get("Cache-Control")).toBe("no-store");
+    expect(publicImage.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(new Uint8Array(await publicImage.arrayBuffer())).toEqual(firstPng);
+
+    const second = await uploadIcon("1.0.1", pngIcon(1, 1, 200));
+    expect(second.icon).not.toBe(first.icon);
+    expect(second.gallery).toEqual([]);
+    const secondPublicIcon = `/v1/mods/media/${second.icon.split("/").at(-1)}`;
+    expect((await api(secondPublicIcon.slice(3))).status).toBe(404);
+    expect((await creator.get(second.icon.slice(3))).status).toBe(200);
+    expect(await (await api("/mods/icon-mod")).json()).toMatchObject({ version: "1.0.0", icon: publicIcon });
+    expect(await (await api("/mods")).json()).toEqual(expect.arrayContaining([expect.objectContaining({ slug: "icon-mod", icon: publicIcon })]));
+    await scanOne();
+    expect(await (await api("/mods/icon-mod")).json()).toMatchObject({ version: "1.0.0", icon: publicIcon });
+    expect((await owner.post(`/staff/versions/${second.id}/decision`, { decision: "approve" })).status).toBe(200);
+    expect(await (await api("/mods/icon-mod")).json()).toMatchObject({ version: "1.0.1", icon: secondPublicIcon, gallery: [] });
+    expect((await api(secondPublicIcon.slice(3))).status).toBe(200);
+
+    const missing = await uploadIcon("1.0.2", null);
+    expect(missing).toMatchObject({ icon: null, icon_error: null });
+    await scanOne();
+    expect((await owner.post(`/staff/versions/${missing.id}/decision`, { decision: "approve" })).status).toBe(200);
+    expect(await (await api("/mods/icon-mod")).json()).toMatchObject({ version: "1.0.2", icon: null, gallery: [] });
+    // Withdrawal uses the same indexed visibility checks as gallery media.
+    expect((await owner.post(`/staff/versions/${second.id}/pull`, { reason: "Withdraw icon" })).status).toBe(200);
+    expect((await api(secondPublicIcon.slice(3))).status).toBe(404);
+  });
+
+  it("accepts an unusable icon, retaining its diagnostic only in creator and staff version views", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const creator = await signIn("2535400000006111", "BadIconCreator");
+    const form = new FormData();
+    form.set("listing", JSON.stringify({ slug: "bad-icon-mod", name: "Bad icon", summary: "A placeholder icon fixture.", version: "1.0.0" }));
+    form.set("file", new File([component([[ICON_SECTION, "not a PNG"]])], "bad-icon-mod.wasm"));
+    const response = await upload(creator, form);
+    expect(response.status).toBe(200);
+    const version = await response.json() as any;
+    expect(version).toMatchObject({ icon: null, icon_error: "The icon is not a PNG.", gallery: [] });
+    expect(await (await owner.get(`/staff/versions/${version.id}`)).json()).toMatchObject({ icon: null, icon_error: version.icon_error });
+    expect(await (await creator.get("/me/mods")).json()).toEqual(expect.arrayContaining([expect.objectContaining({ id: version.id, icon_error: version.icon_error })]));
+    await scanOne();
+    expect((await owner.post(`/staff/versions/${version.id}/decision`, { decision: "approve" })).status).toBe(200);
+    const listing = await (await api("/mods/bad-icon-mod")).json() as any;
+    expect(listing.icon).toBeNull();
+    expect(listing.icon_error).toBeUndefined();
+    expect(JSON.parse(listing.release.statement).media).toEqual([]);
+  });
+
   it("stores images with components, binds their hashes to scans and publishes after approval", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
     const creator = await signIn("2535400000006106", "ImageCreator");
@@ -729,7 +817,7 @@ describe("upload and publication pipeline", () => {
     const result = await upload(creator, form);
     expect(result.status).toBe(200);
     const v = await result.json() as any;
-    expect(v).toMatchObject({ category: "Interface", license: "MIT", notes: "Initial screenshot release", scan: { review_ready: false } });
+    expect(v).toMatchObject({ category: "Interface", license: "MIT", notes: "Initial screenshot release", icon: null, icon_error: null, scan: { review_ready: false } });
     expect(v.gallery[0]).toMatchObject({ caption: "HUD screenshot", alt: "Coordinates above the hotbar" });
     const mediaHash = v.gallery[0].sha256;
     expect(await env.MOD_FILES.head(`media/${mediaHash}`)).not.toBeNull();

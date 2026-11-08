@@ -192,6 +192,34 @@ test('runs a complete claim/download/hash/real-validation/AI/attestation cycle',
   assert.equal(submitted.deterministic, 'pass'); assert.equal(submitted.ai.verdict, 'clear');
 });
 
+test('scans a component icon alongside four gallery images without putting icon bytes in AI declarations', async () => {
+  const png = await sharp({ create: { width: 2, height: 2, channels: 4, background: '#ca6654' } }).png().toBuffer();
+  const name = Buffer.from('cinnabar:extension/icon@1');
+  const payload = Buffer.concat([Buffer.from(leb(name.length)), name, png]);
+  const bytes = Buffer.concat([await parse(GOOD_WAT), Buffer.from([0, ...leb(payload.length)]), payload]);
+  const imageHash = createHash('sha256').update(png).digest('hex');
+  const descriptor = { sha256: imageHash, bytes: png.length, type: 'image/png', caption: '' };
+  const job = { ...jobFor(bytes), media: [...Array.from({ length: 4 }, () => descriptor), { ...descriptor, role: 'icon' }] };
+  let submitted;
+  await runOnce(CONFIG, async (url, init) => {
+    const path = new URL(url).pathname;
+    if (path.endsWith('/claim')) return Response.json({ job });
+    if (path.endsWith(`/files/${job.sha256}`)) return new Response(bytes);
+    if (path.endsWith(`/files/${imageHash}`)) return new Response(png);
+    if (path.includes('/ai/run/')) {
+      const evidence = JSON.parse(JSON.parse(init.body).messages[1].content);
+      assert.equal(evidence.declarations.icon, undefined);
+      assert.equal(evidence.declarations.iconError, undefined);
+      return Response.json({ success: true, result: { response: { verdict: 'clear', findings: [] } } });
+    }
+    if (path.endsWith('/complete')) { submitted = JSON.parse(init.body); return Response.json({ received: true }); }
+    throw new Error('Unexpected request');
+  });
+  assert.equal(submitted.deterministic, 'pass');
+  assert.equal(submitted.ai.verdict, 'clear');
+  assert.deepEqual(submitted.media, job.media.map(m => m.sha256));
+});
+
 test('fails closed on substituted artifacts and never calls AI after failed validation', async () => {
   const bytes = await parse(GOOD_WAT); const job = jobFor(bytes); let submitted; let analyzed = false;
   await runOnce(CONFIG, async (url, init) => {
