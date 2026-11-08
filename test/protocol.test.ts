@@ -1,3 +1,5 @@
+import { Validator, type Schema } from "@cfworker/json-schema";
+import schema from "../schema/v1.json";
 import { describe, expect, it } from "vitest";
 import { CHANNELS, Close, compareVersions, decodeClientMessage, isReleaseHookRequest } from "../src/protocol";
 
@@ -88,5 +90,28 @@ describe("v1 additions", () => {
 
   it("defines the stay-away close code", () => {
     expect(Close.stayAway).toBe(4429);
+  });
+});
+
+describe("account response schema", () => {
+  it("requires nullable username in successful link results and excludes provider names", () => {
+    const validator = new Validator({ $ref: `${schema.$id}#/$defs/AccountLinkResult` }, "2020-12");
+    validator.addSchema(schema as unknown as Schema);
+    for (const username of [null, "ChosenPlayer"]) {
+      expect(validator.validate({ type: "account_link_result", ok: true, account: { username } }).valid).toBe(true);
+    }
+    for (const account of [{ display_name: "Private Name" }, {}, { username: 123 }, { username: null, display_name: "Private Name" }]) {
+      expect(validator.validate({ type: "account_link_result", ok: true, account }).valid).toBe(false);
+    }
+  });
+
+  it("declares username in the private account response", () => {
+    const validator = new Validator({ $ref: `${schema.$id}#/$defs/MeResponse` }, "2020-12");
+    validator.addSchema(schema as unknown as Schema);
+    const account = { id: "opaque-id", username: null, email: "player@test.invalid", role: "player", suspended: false, xbox: null };
+    const me = { account, library: [], csrf: "csrf", game_online: false };
+    expect(validator.validate(me).valid).toBe(true);
+    expect(validator.validate({ ...me, account: { ...account, username: "Player" } }).valid).toBe(true);
+    expect(validator.validate({ ...me, account: { ...account, display_name: "Private Name" } }).valid).toBe(false);
   });
 });

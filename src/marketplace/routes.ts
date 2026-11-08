@@ -5,7 +5,7 @@ import { hubFor } from "../routing";
 import { downloadModAsset } from "../mod-assets";
 import { MAX_COMPONENT_BYTES, readComponent } from "./component";
 import { clip, malformedText, type Grants } from "./policy";
-import { linkCode, normalizeLinkCode, randomToken, sha256Base64Url } from "./auth";
+import { USERNAME_RULES, linkCode, normalizeLinkCode, randomToken, sha256Base64Url } from "./auth";
 import { authorizeUrl, googleIdentity } from "./google";
 import { MAX_RETURN_TO, OAUTH_STATE_MS, openSignIn, sealSignIn } from "./oauth-state";
 import { PLAYER_SESSION_MS, anonymousResult, type Caller, type MarketCall, type MarketResult, type MediaFile } from "./store";
@@ -197,6 +197,7 @@ marketplaceRoutes.post("/auth/signout", async (c) => {
 });
 
 marketplaceRoutes.get("/me", (c) => forward(c, { op: "me" }));
+marketplaceRoutes.post("/me/username", c => forwardJson(c, USERNAME_RULES, body => ({ op: "username", body })));
 marketplaceRoutes.post("/me/xbox/link-code", async c => {
   const code = linkCode();
   const result = await call(c, { op: "link-code", ...(await caller(c)), codeHash: await sha256Base64Url(normalizeLinkCode(code)) });

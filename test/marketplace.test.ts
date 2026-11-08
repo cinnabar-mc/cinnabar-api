@@ -72,13 +72,13 @@ function cookieValue(response: Response, name: string): string {
 }
 
 /** Runs the whole Google sign-in redirect dance for an Xbox identity and returns the signed-in browser. */
-async function signIn(xuid: string, display_name: string, returnTo = `${SITE}/mods/#/staff`): Promise<Browser> {
+async function signIn(xuid: string, username: string, returnTo = `${SITE}/mods/#/staff`): Promise<Browser> {
   const start = await api(`/auth/google/start?return_to=${encodeURIComponent(returnTo)}`);
   expect(start.status).toBe(302);
   const consent = new URL(start.headers.get("Location")!);
   const state = consent.searchParams.get("state")!;
   const oauth = cookieValue(start, "__Host-cinnabar_oauth");
-  const callback = await api(`/auth/google/callback?code=${encodeURIComponent(`${xuid}:${display_name}`)}&state=${state}`, {
+  const callback = await api(`/auth/google/callback?code=${encodeURIComponent(`${xuid}:${username}`)}&state=${state}`, {
     headers: { Cookie: `__Host-cinnabar_oauth=${oauth}` },
   });
   expect(callback.status).toBe(302);
@@ -95,14 +95,15 @@ async function signIn(xuid: string, display_name: string, returnTo = `${SITE}/mo
   };
   // Existing behavior fixtures have an explicitly linked synthetic Xbox identity; account-link tests exercise
   // the full authenticated game WebSocket exchange separately.
-  const account = (await (await browser.get("/me")).json() as { account: { xbox: unknown } }).account;
+  const account = (await (await browser.get("/me")).json() as { account: { xbox: unknown; username: string | null } }).account;
+  if (account.username === null) expect((await browser.post("/me/username", { username })).status).toBe(200);
   if (!account.xbox) {
     const issued = await browser.post("/me/xbox/link-code");
     const { code } = await issued.json() as { code: string };
     const hash = await sha256Base64Url(normalizeLinkCode(code));
     await runInDurableObject(hub(), (_: Hub, state) => {
       const store = new MarketplaceStore(state.storage.sql, new Set([`${OWNER}@test.invalid`]));
-      expect(store.linkXbox(hash, xuid, display_name, Date.now()).ok).toBe(true);
+      expect(store.linkXbox(hash, xuid, username, Date.now()).ok).toBe(true);
     });
   }
   return browser;
@@ -168,9 +169,9 @@ async function scanOne(extra: object = {}): Promise<Response> {
   return response;
 }
 
-/** The owner promotes `display_name` to `role` (owners manage admins; admins manage moderators). */
-async function promote(by: Browser, display_name: string, role: string): Promise<void> {
-  const res = await by.post("/staff/people/role", { display_name, role, reason: "Test staff" });
+/** The owner promotes `username` to `role` (owners manage admins; admins manage moderators). */
+async function promote(by: Browser, username: string, role: string): Promise<void> {
+  const res = await by.post("/staff/people/role", { username, role, reason: "Test staff" });
   expect(res.status, await res.clone().text()).toBe(200);
 }
 
@@ -226,14 +227,14 @@ describe("Google sign-in", () => {
     const start = await api(`/auth/google/start?return_to=${encodeURIComponent("https://evil.test/")}`);
     const consent = new URL(start.headers.get("Location")!);
     expect(consent.origin + consent.pathname).toBe("https://accounts.google.com/o/oauth2/v2/auth");
-    expect(consent.searchParams.get("scope")).toBe("openid email profile");
+    expect(consent.searchParams.get("scope")).toBe("openid email");
     expect(consent.searchParams.get("code_challenge_method")).toBe("S256");
     expect(consent.searchParams.get("redirect_uri")).toBe("https://api.test/v1/auth/google/callback");
     expect(start.headers.getSetCookie()[0]).toMatch(/^__Host-cinnabar_oauth=.+; Max-Age=600; Path=\/; HttpOnly; Secure; SameSite=Lax$/);
 
     const browser = await signIn("2535400000001001", "Steve");
-    const me = await (await browser.get("/me")).json() as { account: { display_name: string; role: string }; game_online: boolean };
-    expect(me.account).toMatchObject({ display_name: "Steve", role: "player" });
+    const me = await (await browser.get("/me")).json() as { account: { username: string; role: string }; game_online: boolean };
+    expect(me.account).toMatchObject({ username: "Steve", role: "player" });
     expect(me.game_online).toBe(false);
   });
 
@@ -383,18 +384,18 @@ describe("submission, review and delivery", () => {
     const admin = await signIn("2535400000005001", "AdminTwo");
     const target = await signIn("2535400000005002", "Helper");
     await promote(owner, "AdminTwo", "admin");
-    expect((await admin.post("/staff/people/role", { display_name: "Helper", role: "admin", reason: "x" })).status).toBe(403);
-    expect((await admin.post("/staff/people/role", { display_name: "OreKeeper", role: "player", reason: "x" })).status).toBe(403);
-    expect((await admin.post("/staff/people/role", { display_name: "helper", role: "moderator", reason: "" })).status).toBe(400);
+    expect((await admin.post("/staff/people/role", { username: "Helper", role: "admin", reason: "x" })).status).toBe(403);
+    expect((await admin.post("/staff/people/role", { username: "OreKeeper", role: "player", reason: "x" })).status).toBe(403);
+    expect((await admin.post("/staff/people/role", { username: "helper", role: "moderator", reason: "" })).status).toBe(400);
     await promote(admin, "helper", "moderator");
     expect((await target.get("/staff/queue")).status).toBe(200);
-    const people = await (await admin.get("/staff/people")).json() as { display_name: string; role: string }[];
-    expect(people.map((p) => [p.display_name, p.role])).toEqual(expect.arrayContaining([["OreKeeper", "owner"], ["Helper", "moderator"]]));
+    const people = await (await admin.get("/staff/people")).json() as { username: string; role: string }[];
+    expect(people.map((p) => [p.username, p.role])).toEqual(expect.arrayContaining([["OreKeeper", "owner"], ["Helper", "moderator"]]));
 
     await runInDurableObject(hub(), (_: Hub, state) => {
       state.storage.sql.exec("UPDATE web_sessions SET created_at = created_at - 3600000 WHERE account_id = (SELECT account_id FROM identities WHERE provider = 'google' AND subject = ?)", "2535400000005001");
     });
-    const stale = await admin.post("/staff/people/role", { display_name: "Helper", role: "player", reason: "Stepped down" });
+    const stale = await admin.post("/staff/people/role", { username: "Helper", role: "player", reason: "Stepped down" });
     expect(stale.status).toBe(401);
     await promote(await signIn("2535400000005001", "AdminTwo"), "Helper", "player");
     expect((await target.get("/staff/queue")).status).toBe(401);
@@ -406,12 +407,12 @@ describe("upload and publication pipeline", () => {
   /** Create an explicitly established project with one human-approved baseline. */
   async function established(slug: string, version = "1.0.0") {
     const owner = await signIn(OWNER, "OreKeeper");
-    const display_name = `Creator${String(++creatorId).slice(-4)}`;
-    const creator = await signIn(String(creatorId), display_name);
+    const username = `Creator${String(++creatorId).slice(-4)}`;
+    const creator = await signIn(String(creatorId), username);
     const initial = await (await submit(creator, slug, version, { hud: true })).json() as { id: string };
     expect((await owner.post(`/staff/versions/${initial.id}/decision`, { decision: "approve" })).status).toBe(200);
     expect((await owner.post(`/staff/mods/${slug}/trust`, { trusted: true, reason: "Established project reviewed by staff" })).status).toBe(200);
-    return { owner, creator, initial, display_name };
+    return { owner, creator, initial, username };
   }
 
   it("persists original signed bytes across policy changes and store restarts", async () => {
@@ -451,7 +452,7 @@ describe("upload and publication pipeline", () => {
     const owner = await signIn(OWNER, "OreKeeper");
     const creator = await signIn("2535400000006291", "RemovalCreator");
     const player = await signIn("2535400000006292", "RemovalPlayer");
-    const other = await signIn("2535400000006293", "OtherRemovalPlayer");
+    const other = await signIn("2535400000006293", "OtherRemoval");
     const version = await (await submit(creator, "browser-removal", "7.4.93", { hud: true })).json() as { id: string };
     expect((await owner.post(`/staff/versions/${version.id}/decision`, { decision: "approve" })).status).toBe(200);
     expect((await player.post("/mods/browser-removal/send")).status).toBe(200);
@@ -485,7 +486,7 @@ describe("upload and publication pipeline", () => {
     await runInDurableObject(hub(), (_: Hub, state) => {
       const store = new MarketplaceStore(state.storage.sql, new Set([`${OWNER}@test.invalid`]));
       const now = Date.parse(selected.sent_at);
-      store.signIn({ provider: "google", subject: "2535400000006292", display_name: "RemovalPlayer", email: "2535400000006292@test.invalid", email_verified: true }, "removal-fixture-session", "removal-fixture-csrf", now);
+      store.signIn({ provider: "google", subject: "2535400000006292", email: "2535400000006292@test.invalid", email_verified: true }, "removal-fixture-session", "removal-fixture-csrf", now);
       expect(store.send({ session: "removal-fixture-session", csrf: "removal-fixture-csrf" }, "browser-removal", now).status).toBe(200);
     });
     expect((await player.post(path, selected)).status).toBe(409);
@@ -516,7 +517,7 @@ describe("upload and publication pipeline", () => {
 
   it("serves the exact older signed release and signs expiring revocation evidence", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
-    const creator = await signIn("2535400000006199", "PinnedReleaseCreator");
+    const creator = await signIn("2535400000006199", "PinnedCreator");
     const initial = await (await submit(creator, "pinned-client", "7.4.91", { hud: true })).json() as { id: string };
     expect((await owner.post(`/staff/versions/${initial.id}/decision`, { decision: "approve" })).status).toBe(200);
     const baseline = await (await owner.get(`/staff/versions/${initial.id}`)).json() as { sha256: string };
@@ -524,7 +525,7 @@ describe("upload and publication pipeline", () => {
     const original = await (await api(path)).json();
     expect(original).toMatchObject({ release: { statement: expect.any(String), signature: expect.any(String) } });
     expect((await api(`/mods/pinned-client/releases/7.4.90/${baseline.sha256}`)).status).toBe(404);
-    const player = await signIn("2535400000006197", "LibraryRemovalPlayer");
+    const player = await signIn("2535400000006197", "RemovalUser");
     const { client } = await login({ xuid: "2535400000006197" });
     const { client: other } = await login({ xuid: "2535400000006196" });
     open.push(client, other);
@@ -632,7 +633,7 @@ describe("upload and publication pipeline", () => {
   });
 
   it("rechecks revoked trust, open reports, suspension and the exact baseline at completion", async () => {
-    const { owner, creator, initial, display_name } = await established("revoked-mod");
+    const { owner, creator, initial, username } = await established("revoked-mod");
     await submit(creator, "revoked-mod", "1.1.0", { hud: true }, {}, false);
     const job = await claim();
     await owner.post("/staff/mods/revoked-mod/trust", { trusted: false, reason: "Incident under review" });
@@ -645,7 +646,7 @@ describe("upload and publication pipeline", () => {
     expect(await (await scanner(`jobs/${nextJob.id}/complete`, report(nextJob), nextJob.lease)).json()).toMatchObject({ automatic: false });
     await owner.post(`/staff/versions/${initial.id}/pull`, { reason: "Withdrawn during investigation" });
     expect((await api("/mods/revoked-mod")).status).toBe(404);
-    await owner.post("/staff/people/suspend", { display_name, suspended: true, reason: "Incident under review" });
+    await owner.post("/staff/people/suspend", { username, suspended: true, reason: "Incident under review" });
     expect((await submit(creator, "revoked-mod", "1.3.0", { hud: true })).status).toBe(403);
   });
 
@@ -819,8 +820,8 @@ describe("marketplace revision-checked updates", () => {
   /** Publish a synthetic component through the real submission, scan and staff-signing paths. */
   async function project(slug: string, versions = ["1.1.0"], apiRevisions: Record<string, string | null> = {}) {
     const owner = await signIn(OWNER, "OreKeeper");
-    const display_name = `Updater${String(++creatorId).slice(-4)}`;
-    const creator = await signIn(String(creatorId), display_name);
+    const username = `Updater${String(++creatorId).slice(-4)}`;
+    const creator = await signIn(String(creatorId), username);
     const releases: { id: string; sha256: string }[] = [];
     for (const version of versions) {
       const response = await submit(creator, slug, version, { hud: true });
@@ -833,7 +834,7 @@ describe("marketplace revision-checked updates", () => {
       expect((await owner.post(`/staff/versions/${release.id}/decision`, { decision: "approve" })).status).toBe(200);
       releases.push(release);
     }
-    return { owner, creator, display_name, releases };
+    return { owner, creator, username, releases };
   }
 
   it("returns the numerically newest compatible newer signed release anonymously", async () => {
@@ -883,7 +884,7 @@ describe("marketplace revision-checked updates", () => {
   });
 
   it("requires every publication gate and immediately applies pulls, hiding and creator suspension", async () => {
-    const { releases, owner, display_name } = await project("update-gates", ["1.1.0", "1.2.0"]);
+    const { releases, owner, username } = await project("update-gates", ["1.1.0", "1.2.0"]);
     const newest = Number(releases[1]!.id);
     const url = updateUrl("update-gates", { current_version: "1.1.0" });
     expect((await api(url)).status).toBe(200);
@@ -914,9 +915,9 @@ describe("marketplace revision-checked updates", () => {
     expect(hidden.status).toBe(404);
     expect(hidden.headers.get("Cache-Control")).toBe("no-store");
     expect((await owner.post("/staff/mods/update-gates/hide", { hidden: false, reason: "Reviewed" })).status).toBe(200);
-    expect((await owner.post("/staff/people/suspend", { display_name, suspended: true, reason: "Synthetic creator hold" })).status).toBe(200);
+    expect((await owner.post("/staff/people/suspend", { username, suspended: true, reason: "Synthetic creator hold" })).status).toBe(200);
     expect((await api(updateUrl("update-gates"))).status).toBe(404);
-    expect((await owner.post("/staff/people/suspend", { display_name, suspended: false, reason: "Reviewed" })).status).toBe(200);
+    expect((await owner.post("/staff/people/suspend", { username, suspended: false, reason: "Reviewed" })).status).toBe(200);
     expect((await api(updateUrl("update-gates"))).status).toBe(200);
   });
 
@@ -1067,7 +1068,7 @@ describe("moderation input and targeting", () => {
 
   it("makes legacy stored text well-formed in signed release statements", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
-    const creator = await signIn("2535400000007104", "LegacyTextCreator");
+    const creator = await signIn("2535400000007104", "LegacyTxtCreator");
     const v = await (await submit(creator, "legacy-text", "1.0.0", { hud: true })).json() as { id: string };
     await runInDurableObject(hub(), (_: Hub, state) => {
       const row = state.storage.sql.exec<{ metadata: string }>("SELECT metadata FROM mod_pipeline WHERE version_id = ?", Number(v.id)).one();
@@ -1082,24 +1083,23 @@ describe("moderation input and targeting", () => {
     expect(await verifies(release.statement, release.signature)).toBe(true);
   });
 
-  it("refuses role changes and suspensions when several accounts share a display_name", async () => {
+  it("resolves staff targets by case-insensitive username", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
     await signIn("2535400000007111", "Twin");
-    await signIn("2535400000007112", "twin");
-    const role = await owner.post("/staff/people/role", { display_name: "Twin", role: "moderator", reason: "Ambiguous target" });
-    expect(role.status).toBe(409);
-    const suspend = await owner.post("/staff/people/suspend", { display_name: "TWIN", suspended: true, reason: "Ambiguous target" });
-    expect(suspend.status).toBe(409);
-    const people = await (await owner.get("/staff/people")).json() as { display_name: string }[];
-    expect(people.map(p => p.display_name.toLowerCase())).not.toContain("twin");
+    const role = await owner.post("/staff/people/role", { username: "TWIN", role: "moderator", reason: "Username target" });
+    expect(role.status).toBe(200);
+    const suspend = await owner.post("/staff/people/suspend", { username: "twin", suspended: true, reason: "Username target" });
+    expect(suspend.status).toBe(200);
+    const people = await (await owner.get("/staff/people")).json() as { username: string }[];
+    expect(people.map(p => p.username)).toContain("Twin");
   });
 
   it("refuses reports from suspended accounts and against hidden listings", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
     await published(owner, "2535400000007121", "report-gates");
     const details = { reason: "broken", details: "The panel won't close with Escape." };
-    const suspended = await signIn("2535400000007122", "SuspendedReporter");
-    expect((await owner.post("/staff/people/suspend", { display_name: "SuspendedReporter", suspended: true, reason: "Spam reports" })).status).toBe(200);
+    const suspended = await signIn("2535400000007122", "SuspReporter");
+    expect((await owner.post("/staff/people/suspend", { username: "SuspReporter", suspended: true, reason: "Spam reports" })).status).toBe(200);
     expect((await suspended.post("/mods/report-gates/reports", details)).status).toBe(403);
     const reporter = await signIn("2535400000007123", "HiddenReporter");
     expect((await owner.post("/staff/mods/report-gates/hide", { hidden: true, reason: "Under review" })).status).toBe(200);
@@ -1189,7 +1189,7 @@ describe("staff conflicts, public load and revocation limits", () => {
     expect(await (await owner.get(`/staff/versions/${held.id}`)).json()).toMatchObject({ trust: { trusted: false } });
     await promote(owner, "TrustGranter", "admin");
     expect((await update("1.0.3")).automatic).toBe(true);
-    expect((await owner.post("/staff/people/suspend", { display_name: "TrustGranter", suspended: true, reason: "Account compromised" })).status).toBe(200);
+    expect((await owner.post("/staff/people/suspend", { username: "TrustGranter", suspended: true, reason: "Account compromised" })).status).toBe(200);
     expect((await update("1.0.4")).automatic).toBe(false);
     expect(await (await api("/mods/granted-mod")).json()).toMatchObject({ version: "1.0.3" });
   });
@@ -1222,9 +1222,9 @@ describe("staff conflicts, public load and revocation limits", () => {
     expect(await status(first.image)).toBe(404);
     expect((await admin.post("/staff/mods/indexed-media/hide", { hidden: false, reason: "Media reviewed" })).status).toBe(200);
     expect(await status(first.image)).toBe(200);
-    expect((await owner.post("/staff/people/suspend", { display_name: "MediaCreator", suspended: true, reason: "Media review" })).status).toBe(200);
+    expect((await owner.post("/staff/people/suspend", { username: "MediaCreator", suspended: true, reason: "Media review" })).status).toBe(200);
     expect(await status(first.image)).toBe(404);
-    expect((await owner.post("/staff/people/suspend", { display_name: "MediaCreator", suspended: false, reason: "Media reviewed" })).status).toBe(200);
+    expect((await owner.post("/staff/people/suspend", { username: "MediaCreator", suspended: false, reason: "Media reviewed" })).status).toBe(200);
     expect(await status(first.image)).toBe(200);
 
     await runInDurableObject(hub(), (_: Hub, state) => {
@@ -1467,15 +1467,15 @@ describe("anonymous load, sign-in state and moderation probes", () => {
     form.set("file", new File([component([])], "anonymous.wasm"));
     const routes: [string, RequestInit | undefined, MarketCall["op"]][] = [
       ["/me", undefined, "me"], ["/me/mods", undefined, "mine"], [`/me/mods/1/media/${"a".repeat(64)}`, undefined, "private-media"],
-      ["/auth/signout", { method: "POST" }, "signout"],
+      ["/auth/signout", { method: "POST" }, "signout"], ["/me/username", json("POST", { username: "AnonPlayer" }), "username"],
       ["/staff/queue", undefined, "queue"], ["/staff/reports", undefined, "reports"], ["/staff/people", undefined, "people"],
       ["/staff/audit", undefined, "audit"], ["/staff/versions/1", undefined, "version"], ["/staff/versions/1/file", undefined, "version"],
       ["/staff/versions/1/rescan", { method: "POST" }, "rescan"], ["/staff/versions/1/decision", json("POST", { decision: "approve" }), "decide"],
       ["/staff/versions/1/pull", json("POST"), "pull"], ["/staff/reports/1/resolve", json("POST", { note: "Probe" }), "resolve"],
       ["/staff/mods/anonymous-probe/hide", json("POST", { hidden: true, reason: "Probe" }), "hide"],
       ["/staff/mods/anonymous-probe/trust", json("POST", { trusted: true, reason: "Probe" }), "trust"],
-      ["/staff/people/role", json("POST", { display_name: "OreKeeper", role: "player", reason: "Probe" }), "role"],
-      ["/staff/people/suspend", json("POST", { display_name: "OreKeeper", suspended: true, reason: "Probe" }), "suspend"],
+      ["/staff/people/role", json("POST", { username: "OreKeeper", role: "player", reason: "Probe" }), "role"],
+      ["/staff/people/suspend", json("POST", { username: "OreKeeper", suspended: true, reason: "Probe" }), "suspend"],
       ["/mods/anonymous-probe/send", { method: "POST" }, "send"],
       ["/mods/anonymous-probe/remove", json("POST", { sha256: "a".repeat(64), sent_at: new Date(0).toISOString() }), "remove"],
       ["/mods/anonymous-probe/reports", json("POST", { reason: "broken", details: "An anonymous report probe." }), "report"],
@@ -1496,9 +1496,9 @@ describe("anonymous load, sign-in state and moderation probes", () => {
   it("requires an explicit suspended value and refuses role and suspension probes before looking anyone up", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
     await signIn("2535400000009201", "SuspendTarget");
-    const suspend = (body: object) => owner.post("/staff/people/suspend", { display_name: "SuspendTarget", reason: "Explicit value fixture", ...body });
-    const suspended = async () => (await (await owner.get("/staff/people")).json() as { display_name: string; suspended: boolean }[])
-      .find(p => p.display_name === "SuspendTarget")?.suspended ?? false;
+    const suspend = (body: object) => owner.post("/staff/people/suspend", { username: "SuspendTarget", reason: "Explicit value fixture", ...body });
+    const suspended = async () => (await (await owner.get("/staff/people")).json() as { username: string; suspended: boolean }[])
+      .find(p => p.username === "SuspendTarget")?.suspended ?? false;
     expect((await suspend({ suspended: true })).status).toBe(200);
     for (const body of [{}, { suspended: "false" }, { suspended: 0 }, { suspended: null }]) {
       const response = await suspend(body);
@@ -1513,22 +1513,22 @@ describe("anonymous load, sign-in state and moderation probes", () => {
     const moderator = await signIn("2535400000009203", "ModProber");
     await promote(owner, "ModProber", "moderator");
     await signIn("2535400000009204", "ProbeTwin");
-    await signIn("2535400000009205", "probetwin");
-    // Existing, unknown and ambiguous display_names all get the same refusal, so nobody learns which exist.
-    for (const display_name of ["SuspendTarget", "NobodyHasThisTag", "ProbeTwin"]) {
+
+    // Existing and unknown usernames all get the same refusal, so nobody learns which exist.
+    for (const username of ["SuspendTarget", "NobodyHasThisTag", "ProbeTwin"]) {
       for (const [by, role, suspension] of [[player, "Only admins manage staff.", "Staff only."],
         [moderator, "Only admins manage staff.", "Only admins can suspend accounts."]] as const) {
-        const roleChange = await by.post("/staff/people/role", { display_name, role: "moderator", reason: "Probe" });
-        expect(roleChange.status, display_name).toBe(403);
+        const roleChange = await by.post("/staff/people/role", { username, role: "moderator", reason: "Probe" });
+        expect(roleChange.status, username).toBe(403);
         expect(await roleChange.json()).toEqual({ error: role });
-        const suspensionChange = await by.post("/staff/people/suspend", { display_name, suspended: true, reason: "Probe" });
-        expect(suspensionChange.status, display_name).toBe(403);
+        const suspensionChange = await by.post("/staff/people/suspend", { username, suspended: true, reason: "Probe" });
+        expect(suspensionChange.status, username).toBe(403);
         expect(await suspensionChange.json()).toEqual({ error: suspension });
       }
     }
     // Admins still get the precise answer.
-    expect((await owner.post("/staff/people/role", { display_name: "NobodyHasThisTag", role: "moderator", reason: "Probe" })).status).toBe(404);
-    expect((await owner.post("/staff/people/role", { display_name: "ProbeTwin", role: "moderator", reason: "Probe" })).status).toBe(409);
+    expect((await owner.post("/staff/people/role", { username: "NobodyHasThisTag", role: "moderator", reason: "Probe" })).status).toBe(404);
+    expect((await owner.post("/staff/people/role", { username: "probetwin", role: "moderator", reason: "Probe" })).status).toBe(200);
   });
 
   it("refuses components whose executable bytes exceed the pinned client's ceiling", async () => {

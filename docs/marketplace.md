@@ -7,9 +7,9 @@ AI findings assist moderation; they are not a safety certification.
 
 ## Accounts and Xbox delivery
 
-Google sign-in uses server-side authorization code + S256 PKCE with `openid email profile`.
+Google sign-in uses server-side authorization code + S256 PKCE with `openid email`.
 The server exchanges the code at `https://oauth2.googleapis.com/token` using the client secret
-and verifier, then reads `sub`, `email`, `email_verified` and `name` directly from Google's
+and verifier, then reads `sub`, `email` and `email_verified` directly from Google's
 HTTPS OpenID userinfo endpoint, `https://openidconnect.googleapis.com/v1/userinfo`. This uses
 the newly issued server-side bearer token instead of parsing an untrusted browser ID token,
 and avoids a separate local JWKS cache and signature/claim validation path. Tokens are discarded.
@@ -27,7 +27,7 @@ account email in `OWNER_EMAILS`; a stored role cannot grant owner.
 `GET /v1/me` returns:
 
 ```json
-{"account":{"id":"opaque-account-id","display_name":"Player","email":"player@example.com","role":"player","suspended":false,"xbox":null},"library":[],"csrf":"session-csrf","game_online":false}
+{"account":{"id":"opaque-account-id","username":null,"email":"player@example.com","role":"player","suspended":false,"xbox":null},"library":[],"csrf":"session-csrf","game_online":false}
 ```
 
 Signed-out callers receive `account: null`, an empty library, `csrf: null`, and
@@ -35,8 +35,18 @@ Signed-out callers receive `account: null`, an empty library, `csrf: null`, and
 currently authenticated socket for that linked XUID. All creator, approval, report, role,
 suspension, trust/granter, audit, session, CSRF and library references use the Cinnabar account ID.
 Staff role/suspension writes accept `{account_id, role|suspended, reason}`; existing forms can
-also supply an unambiguous `display_name` (legacy `gamertag` is accepted as a display-name alias).
-Use IDs because display names need not be unique. Audit role/suspension targets use account IDs.
+also supply a case-insensitive `username`. Audit role/suspension targets use account IDs.
+
+`POST /v1/me/username` takes `{username: "Player_42"}` with the session, `X-Cinnabar-CSRF`
+and the same trusted-Origin checks as other writes. A username can be chosen exactly once.
+It must contain 3–16 ASCII letters, digits or underscores; case is preserved and uniqueness is
+case-insensitive. Reserved names: cinnabar, admin, administrator, moderator, mod, staff, official,
+support, system, root, owner, null, undefined. Success returns the updated `GET /v1/me` body.
+Invalid or reserved names return 400 with the rules; taken and already-set names return 409.
+Missing session returns 401, bad CSRF/untrusted Origin or suspension returns 403. Five attempts
+per account per ten minutes are allowed, including invalid and taken names; excess returns 429.
+Google account names are never read or stored. Accounts start with `username: null`, and public
+creator and reviewer names use “Cinnabar player” until the account chooses a username.
 
 `POST /v1/me/xbox/link-code` needs the session and `X-Cinnabar-CSRF`; it returns 200
 `{code: "ABCD-2345", expires_in: 600}`. Codes contain eight random characters (40 bits) from
@@ -50,7 +60,7 @@ Unlinking retains account-owned selections, so a newly linked Xbox receives them
 Enter the code in Cinnabar. On the existing authenticated `/v1/connect` socket the client sends
 `{type: "account_link", code: string}` (at most 64 characters; case, spaces and hyphens are ignored).
 The Hub uses only the connection's verified XUID and gamertag, never values in the message.
-It replies `{type: "account_link_result", ok: true, account: {display_name: string}}` or
+It replies `{type: "account_link_result", ok: true, account: {username: string | null}}` or
 `{type: "account_link_result", ok: false, error: "invalid"|"expired"|"already_linked"|"rate_limited"}`.
 Success consumes the code atomically with linking and immediately pushes `mod_library` to that
 Xbox's connections. Replay returns `invalid`. Expired codes return `expired`; a valid code
@@ -77,6 +87,11 @@ and is never read by runtime authorization. Existing signed statements and asset
 byte-identical; their historical approver values are not rewritten. Startup migration and
 multi-statement marketplace writes run in synchronous SQLite transactions. There was no
 production web account data before this migration.
+
+Migration 9 drops `accounts.display_name`, adds nullable `username` with a unique SQLite
+`COLLATE NOCASE` index, and creates the username attempt ledger. It reserves `Cinnabar` for
+`system:official`, including when the official account is created later. Existing sessions,
+account references, signed release statements, signatures and digest asset URLs are preserved.
 
 ## Upload and release contract
 

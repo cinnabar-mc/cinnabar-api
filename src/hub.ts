@@ -625,7 +625,7 @@ export class Hub extends DurableObject<Env> {
    */
   async marketplace(call: MarketCall): Promise<MarketResult> {
     const result = this.ctx.storage.transactionSync(() => handle(this.market, call, Date.now()));
-    if (call.op === "me" && result.status === 200) {
+    if ((call.op === "me" || call.op === "username") && result.status === 200) {
       const account = (result.body as { account: { xbox: { xuid: string } | null } | null }).account;
       (result.body as { game_online: boolean }).game_online = !!account?.xbox && [...(this.byXuid.get(account.xbox.xuid) ?? [])]
         .some((ws) => this.sessions.get(ws)?.stage === "ready");
