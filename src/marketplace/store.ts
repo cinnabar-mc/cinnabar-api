@@ -10,6 +10,7 @@ import {
 } from "./policy";
 import { revocationBody, withinRevocationBudget, type RevokedRow } from "./revocations";
 import { API_REVISION, CLIENT_REVISION, MAX_SCAN_ATTEMPTS, SCAN_LEASE_MS, SCAN_MAX_AGE_MS, SCAN_POLICY, parseScanReport, scanReady, type ScanReport } from "./scanning";
+import { AI_DAILY_NEURONS, ScanBudget, neuronsFor } from "./ai-budget";
 
 export const PLAYER_SESSION_MS = 30 * 24 * 3_600_000;
 const STAFF_SESSION_MS = 12 * 3_600_000;
@@ -86,6 +87,8 @@ type PipelineRow = {
   job_id: string; state: "queued" | "running" | "complete" | "failed";
   attempts: number; lease: string | null; lease_until: number | null;
   report: string | null; completed_at: number | null; publish_mode: "manual" | "automatic" | "official" | null; promotion_attempt_at: number;
+  /** Worst-case Neurons charged by the current claim and when it was made, see `ScanBudget`. */
+  ai_reserved: number; ai_claimed_at: number | null;
 };
 
 const ok = (body: unknown, extra: Partial<MarketResult> = {}): MarketResult => ({ status: 200, body, ...extra });
@@ -110,7 +113,11 @@ const PUBLISHED = `v.status = 'approved' AND v.signature IS NOT NULL AND v.state
  * approvals, reports, players' libraries and the staff audit log. Every rule the website shows is enforced here.
  */
 export class MarketplaceStore {
-  constructor(private readonly sql: SqlStorage, private readonly owners: ReadonlySet<string>) {
+  private readonly budget: ScanBudget;
+
+  /** `aiDailyNeurons` bounds the Workers AI Neurons scans may use per UTC day. */
+  constructor(private readonly sql: SqlStorage, private readonly owners: ReadonlySet<string>, aiDailyNeurons = AI_DAILY_NEURONS) {
+    this.budget = new ScanBudget(sql, aiDailyNeurons);
     for (const statement of [
       `CREATE TABLE IF NOT EXISTS market_accounts (xuid TEXT PRIMARY KEY, gamertag TEXT NOT NULL,
         role TEXT NOT NULL DEFAULT 'player', suspended INTEGER NOT NULL DEFAULT 0, seen_at INTEGER NOT NULL)`,
@@ -226,6 +233,10 @@ export class MarketplaceStore {
       "CREATE INDEX username_attempts_account ON username_attempts (account_id, at)");
     // Keep presentation diagnostics private without rewriting existing signed media snapshots.
     migrate(10, "ALTER TABLE mod_pipeline ADD COLUMN icon_error TEXT");
+    // Keep scanner AI spending within a daily Neuron budget.
+    migrate(11, "CREATE TABLE scan_ai_days (day INTEGER PRIMARY KEY, neurons INTEGER NOT NULL DEFAULT 0, paused INTEGER NOT NULL DEFAULT 0)",
+      "ALTER TABLE mod_pipeline ADD COLUMN ai_reserved INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE mod_pipeline ADD COLUMN ai_claimed_at INTEGER");
   }
 
   /** Increases whenever the set of pulled versions changes, so callers can tell a memoized revocation list is stale. */
@@ -814,7 +825,11 @@ export class MarketplaceStore {
       .toArray().length > 0;
   }
 
-  /** SQL jobs are a transactional outbox: creation commits with the version, independent of scanner availability. */
+  /**
+   * SQL jobs are a transactional outbox: creation commits with the version, independent of scanner availability.
+   * When the day's AI budget can't cover another worst-case scan, answers `{job: null, paused, resumes_at}` and
+   * leaves every job and attempt count unchanged.
+   */
   claimScan(now: number): MarketResult {
     this.sql.exec(`UPDATE mod_pipeline SET state = 'failed', lease = NULL, lease_until = NULL
       WHERE state IN ('queued', 'running') AND attempts >= ? AND (lease_until IS NULL OR lease_until <= ?)`, MAX_SCAN_ATTEMPTS, now);
@@ -822,9 +837,11 @@ export class MarketplaceStore {
       WHERE v.status = 'submitted' AND (p.state = 'queued' OR (p.state = 'running' AND p.lease_until <= ?))
       AND p.attempts < ? ORDER BY p.version_id LIMIT 1`, now, MAX_SCAN_ATTEMPTS).toArray()[0];
     if (!p) return ok({ job: null });
+    const resumes = this.budget.refusal(now);
+    if (resumes !== null) return ok({ job: null, paused: "daily_ai_budget", resumes_at: resumes });
     const lease = crypto.randomUUID();
-    this.sql.exec("UPDATE mod_pipeline SET state = 'running', lease = ?, lease_until = ?, attempts = attempts + 1 WHERE version_id = ?",
-      lease, now + SCAN_LEASE_MS, p.version_id);
+    this.sql.exec(`UPDATE mod_pipeline SET state = 'running', lease = ?, lease_until = ?, attempts = attempts + 1,
+      ai_reserved = ?, ai_claimed_at = ? WHERE version_id = ?`, lease, now + SCAN_LEASE_MS, this.budget.reserve(now), now, p.version_id);
     const v = this.versionRow(p.version_id)!;
     const previous = p.baseline === null ? undefined : this.versionRow(p.baseline);
     return ok({ job: { id: p.job_id, lease, version_id: v.id, sha256: v.sha256, bytes: v.bytes, policy: SCAN_POLICY,
@@ -855,8 +872,10 @@ export class MarketplaceStore {
     }
     if (p.state !== "running" || !p.lease_until || p.lease_until <= now || v.status !== "submitted") return fail(409, "Stale scan claim.");
     const failed = report.deterministic === "error" || report.ai.verdict === "error";
-    this.sql.exec("UPDATE mod_pipeline SET state = ?, report = ?, completed_at = ? WHERE version_id = ?",
+    this.sql.exec("UPDATE mod_pipeline SET state = ?, report = ?, completed_at = ?, ai_reserved = 0 WHERE version_id = ?",
       failed ? "failed" : "complete", JSON.stringify(report), now, v.id);
+    // A report without usage comes from an older scanner, so its worst-case charge stands.
+    if (report.ai.usage && p.ai_claimed_at !== null) this.budget.settle(p.ai_claimed_at, p.ai_reserved, neuronsFor(report.ai.usage));
     // Pending releases can cross deployments; the accepted report attests to the current pinned scanner client.
     this.sql.exec("UPDATE mod_versions SET api_revision = ? WHERE id = ?", API_REVISION, v.id);
     if (this.automaticAllowed(v, now)) {
@@ -865,6 +884,22 @@ export class MarketplaceStore {
       return ok({ received: true, automatic: true }, { approved: v.id });
     }
     return ok({ received: true, automatic: false });
+  }
+
+  /**
+   * Returns a claimed job to the queue without counting the attempt, after Workers AI refused its request. The
+   * `daily_allocation` reason (the default) also pauses claims until the next UTC day; `capacity` does not.
+   */
+  releaseScan(job: string, lease: string, input: unknown, now: number): MarketResult {
+    const reason = input && typeof input === "object" && "reason" in input ? (input as { reason: unknown }).reason : "daily_allocation";
+    if (reason !== "daily_allocation" && reason !== "capacity") return fail(400, "Unknown release reason.");
+    const p = this.sql.exec<PipelineRow>("SELECT * FROM mod_pipeline WHERE job_id = ?", job).toArray()[0];
+    if (!p || p.lease !== lease || p.state !== "running" || !p.lease_until || p.lease_until <= now) return fail(409, "Stale scan claim.");
+    this.sql.exec(`UPDATE mod_pipeline SET state = 'queued', lease = NULL, lease_until = NULL, attempts = MAX(attempts - 1, 0),
+      ai_reserved = 0, ai_claimed_at = NULL WHERE version_id = ?`, p.version_id);
+    if (p.ai_claimed_at !== null) this.budget.settle(p.ai_claimed_at, p.ai_reserved, 0);
+    if (reason === "daily_allocation") this.budget.pause(now);
+    return ok({ released: true, paused: reason === "daily_allocation" });
   }
 
   /** Evaluate live trust and the exact prior release again, including after signing or storage I/O. */
@@ -1225,6 +1260,7 @@ export type MarketCall = Caller & (
   | { op: "private-media"; id: number; sha256: string }
   | { op: "scan-claim" } | { op: "scan-file"; job: string; lease: string; sha256: string }
   | { op: "scan-complete"; job: string; lease: string; body: unknown }
+  | { op: "scan-release"; job: string; lease: string; body: unknown }
   | { op: "signin"; identity: ProviderIdentity; newSession: string; newCsrf: string }
   | { op: "link-code"; codeHash: string } | { op: "unlink" } | { op: "username"; body: unknown }
 );
@@ -1286,6 +1322,7 @@ export function handle(store: MarketplaceStore, call: MarketCall, now: number): 
     case "scan-claim": return store.claimScan(now);
     case "scan-file": return store.scanFile(call.job, call.lease, call.sha256, now);
     case "scan-complete": return store.completeScan(call.job, call.lease, call.body, now);
+    case "scan-release": return store.releaseScan(call.job, call.lease, call.body, now);
     case "signin":
       store.signIn(call.identity, call.newSession, call.newCsrf, now);
       return ok({});

@@ -407,6 +407,11 @@ marketplaceRoutes.post("/internal/marketplace/jobs/:job/complete", async c => {
   if (body === null) return c.json({ error: "Send a bounded scan report." }, 400);
   return reply(c, await call(c, { op: "scan-complete", job: c.req.param("job"), lease: c.req.header("X-Scan-Lease") ?? "", body }));
 });
+marketplaceRoutes.post("/internal/marketplace/jobs/:job/release", async c => {
+  const body = await readJson(c);
+  if (body === null) return c.json({ error: "Send an empty body or a JSON release reason." }, 400);
+  return reply(c, await call(c, { op: "scan-release", job: c.req.param("job"), lease: c.req.header("X-Scan-Lease") ?? "", body }));
+});
 
 const INVALID_REQUEST = "Send the request as JSON.";
 for (const [path, op] of [["/staff/versions/:id/decision", "decide"], ["/staff/versions/:id/pull", "pull"],
