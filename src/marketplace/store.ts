@@ -908,11 +908,13 @@ export class MarketplaceStore {
       || (p.publish_mode === "official" ? p.state !== "complete" || v.slug !== OFFICIAL_SLUG || v.creator !== OFFICIAL_CREATOR
         || this.officialDigestPulled(v.sha256) || !this.officialValidationReady(v, p)
         : !this.scanPassed(p, now))) return null;
-    // Manual approvals count only from staff who are still active and aren't the creator, unless that creator is an owner.
+    // Manual approvals count only from staff who are still active and aren't the creator, unless that creator is an owner,
+    // whose own approval publishes their mod by itself.
     const decided = p.publish_mode === "official" || (p.publish_mode === "automatic" ? this.automaticAllowed(v, now)
       : p.publish_mode === "manual" && approvalsComplete(v.reach as Reach, this.approvals(id).flatMap(a => {
         const actor = this.account(a.id);
-        return actor && !actor.suspended && atLeast(actor, "moderator") && (actor.id !== v.creator || actor.role === "owner") ? [{ admin: atLeast(actor, "admin") }] : [];
+        return actor && !actor.suspended && atLeast(actor, "moderator") && (actor.id !== v.creator || actor.role === "owner")
+          ? [{ admin: atLeast(actor, "admin"), ownerSelf: actor.id === v.creator && actor.role === "owner" }] : [];
       })));
     return decided ? { sha256: v.sha256, bytes: v.bytes, media: this.media(id), statement: this.statement(id) } : null;
   }
@@ -1042,7 +1044,7 @@ export class MarketplaceStore {
       if (this.account(v.creator)?.suspended || this.listing(v.slug)?.hidden) return fail(409, "Restore the creator and listing before approving.");
       const admin = atLeast(staff, "admin");
       this.sql.exec("INSERT INTO mod_approvals (version_id, account_id, admin, at) VALUES (?, ?, ?, ?)", v.id, staff.id, admin ? 1 : 0, now);
-      const approvals = [...state.approvals, { id: staff.id, admin }];
+      const approvals = [...state.approvals, { id: staff.id, admin, ownerSelf: staff.id === v.creator && staff.role === "owner" }];
       const done = approvalsComplete(state.reach, approvals);
       if (done) {
         this.sql.exec("UPDATE mod_versions SET decided_at = ?, note = ? WHERE id = ?", now, note, v.id);
