@@ -6,7 +6,7 @@ import contract from "../.generated/contract.json";
 import { MAX_EXECUTABLE_BYTES, readComponent } from "../src/marketplace/component";
 import { TOKEN_URL, USERINFO_URL } from "../src/marketplace/google";
 import { normalizeLinkCode, sha256Base64Url } from "../src/marketplace/auth";
-import { approvalRule, canApprove, canSetRole, grantDiff, reachOf, validateListing, type Actor } from "../src/marketplace/policy";
+import { approvalRule, approvalsComplete, canApprove, canSetRole, grantDiff, reachOf, validateListing, type Actor } from "../src/marketplace/policy";
 import { REVOCATION_BUDGET_BYTES, REVOCATION_MEMO_MS } from "../src/marketplace/revocations";
 import { marketplaceRoutes } from "../src/marketplace/routes";
 import { CLIENT_REVISION, SCAN_POLICY, VALIDATOR, PROMPT_VERSION, SCAN_LEASE_MS } from "../src/marketplace/scanning";
@@ -181,6 +181,8 @@ describe("marketplace policy", () => {
     const network = { creator: "1", status: "submitted" as const, reach: 4 as const, approvals: [{ id: "2", admin: false }] };
     expect(canApprove(staff("3", "moderator"), network)).toEqual({ ok: false, reason: "Network mods need an admin's approval." });
     expect(canApprove(staff("4", "admin"), network).ok).toBe(true);
+    expect(approvalsComplete(4, [{ admin: true }])).toBe(false);
+    expect(approvalsComplete(4, [{ admin: true, ownerSelf: true }])).toBe(true);
     // Owners may approve their own mods; admins and moderators may not.
     expect(canApprove(staff("1", "owner"), { ...network, approvals: [] }).ok).toBe(true);
     expect(canApprove(staff("1", "admin"), { ...network, approvals: [] })).toEqual({ ok: false, reason: "You can't review your own mod." });
@@ -272,7 +274,9 @@ describe("submission, review and delivery", () => {
     const admin = await signIn("2535400000002101", "SelfAdmin");
     await promote(owner, "SelfAdmin", "admin");
 
-    const own = await (await submit(owner, "owner-tool", "1.0.0", { camera: true })).json() as { id: string };
+    // A Network mod normally needs two approvals; the owner's own approval publishes it alone.
+    const own = await (await submit(owner, "owner-tool", "1.0.0", { packets: true })).json() as { id: string; reach: number };
+    expect(own.reach).toBe(4);
     const approved = await owner.post(`/staff/versions/${own.id}/decision`, { decision: "approve" });
     expect(approved.status, await approved.clone().text()).toBe(200);
     expect((await approved.json() as { status: string }).status).toBe("approved");

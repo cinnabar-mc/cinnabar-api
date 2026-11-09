@@ -132,8 +132,9 @@ export function canApprove(actor: Actor | null, version: ReviewState): Verdict {
   return { ok: true };
 }
 
-/** Whether the approvals recorded so far satisfy the reach's rule. */
-export function approvalsComplete(reach: Reach, approvals: { admin: boolean }[]): boolean {
+/** Whether the approvals recorded so far satisfy the reach's rule; an owner approving their own mod publishes it alone. */
+export function approvalsComplete(reach: Reach, approvals: { admin: boolean; ownerSelf?: boolean }[]): boolean {
+  if (approvals.some((a) => a.ownerSelf)) return true;
   const rule = approvalRule(reach);
   return approvals.length >= rule.count && (!rule.admin || approvals.some((a) => a.admin));
 }
