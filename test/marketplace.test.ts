@@ -11,6 +11,7 @@ import { REVOCATION_BUDGET_BYTES, REVOCATION_MEMO_MS } from "../src/marketplace/
 import { marketplaceRoutes } from "../src/marketplace/routes";
 import { CLIENT_REVISION, SCAN_POLICY, VALIDATOR, PROMPT_VERSION, SCAN_LEASE_MS } from "../src/marketplace/scanning";
 import { BodyLimitError, readLimited } from "../src/marketplace/uploads";
+import { UPLOAD_LIMITS } from "../src/marketplace/media-policy";
 import { OAUTH_STATE_MS, sealSignIn } from "../src/marketplace/oauth-state";
 import { MarketplaceStore, SESSION_OPS, anonymousResult, type MarketCall } from "../src/marketplace/store";
 import { signText } from "../src/marketplace/signing";
@@ -219,6 +220,11 @@ describe("marketplace policy", () => {
 });
 
 describe("Google sign-in", () => {
+  it("advertises the same gallery policy to signed-out and signed-in browsers", async () => {
+    expect(await (await api("/me")).json()).toMatchObject({ account: null, upload_limits: UPLOAD_LIMITS });
+    const browser = await signIn("2535400000091001", "GalleryLimits");
+    expect(await (await browser.get("/me")).json()).toMatchObject({ upload_limits: UPLOAD_LIMITS });
+  });
   it("starts with PKCE and a browser-bound state, then signs a Cinnabar account in", async () => {
     const start = await api(`/auth/google/start?return_to=${encodeURIComponent("https://evil.test/")}`);
     const consent = new URL(start.headers.get("Location")!);
@@ -1567,7 +1573,7 @@ describe("anonymous load, sign-in state and moderation probes", () => {
       expect(await hub().marketplace(call), op).toEqual(anonymousResult(op));
     }
     expect(anonymousResult("mods")).toBeNull();
-    expect(anonymousResult("me")).toEqual({ status: 200, body: { account: null, library: [], csrf: null, game_online: false } });
+    expect(anonymousResult("me")).toEqual({ status: 200, body: { account: null, library: [], csrf: null, game_online: false, upload_limits: UPLOAD_LIMITS } });
   });
 
   it("answers anonymous session-only routes without calling the Hub", async () => {
@@ -1600,7 +1606,7 @@ describe("anonymous load, sign-in state and moderation probes", () => {
       expect(answered.headers.get("Cache-Control"), path).toMatch(/no-store/);
     }
     // Through the whole Worker, an anonymous browser still sees the signed-out shape the website expects.
-    expect(await (await api("/me")).json()).toEqual({ account: null, library: [], csrf: null, game_online: false });
+    expect(await (await api("/me")).json()).toEqual({ account: null, library: [], csrf: null, game_online: false, upload_limits: UPLOAD_LIMITS });
     expect(await (await api("/staff/queue")).json()).toEqual({ error: "Sign in to Cinnabar first." });
   });
 

@@ -1626,6 +1626,21 @@
         }
       }
     },
+    "UploadLimits": {
+      "description": "Server-enforced upload policy advertised to the website. Values come from marketplace/media-policy.ts.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component_bytes", "images", "image_bytes", "image_dimension", "image_pixels", "caption_chars", "alt_chars"],
+      "properties": {
+        "component_bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "images": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "image_bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "image_dimension": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "image_pixels": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "caption_chars": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "alt_chars": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+      }
+    },
     "MeResponse": {
       "description": "GET /v1/me and successful POST /v1/me/username. Account, selections and CSRF belong to the Cinnabar account; game_online requires a linked Xbox with a live authenticated socket.",
       "type": "object",
@@ -1633,7 +1648,8 @@
         "account",
         "library",
         "csrf",
-        "game_online"
+        "game_online",
+        "upload_limits"
       ],
       "properties": {
         "account": {
@@ -1657,6 +1673,9 @@
         },
         "game_online": {
           "type": "boolean"
+        },
+        "upload_limits": {
+          "$ref": "#/$defs/UploadLimits"
         }
       }
     },
