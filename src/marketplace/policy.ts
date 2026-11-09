@@ -111,7 +111,8 @@ export function canReview(actor: Actor | null, version: ReviewState): Verdict {
   if (!actor) return deny("Sign in to Cinnabar first.");
   if (actor.suspended) return deny("Your account is suspended.");
   if (!atLeast(actor, "moderator")) return deny("Only staff review mods.");
-  if (version.creator === actor.id) return deny("You can't review your own mod.");
+  // Owners may approve their own mods; every other staff member reviews only other people's.
+  if (version.creator === actor.id && actor.role !== "owner") return deny("You can't review your own mod.");
   if (version.status !== "submitted") return deny("This version isn't waiting for review.");
   if (version.approvals.some((a) => a.id === actor.id)) return deny("You've already approved this version.");
   return { ok: true };

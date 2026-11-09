@@ -181,7 +181,10 @@ describe("marketplace policy", () => {
     const network = { creator: "1", status: "submitted" as const, reach: 4 as const, approvals: [{ id: "2", admin: false }] };
     expect(canApprove(staff("3", "moderator"), network)).toEqual({ ok: false, reason: "Network mods need an admin's approval." });
     expect(canApprove(staff("4", "admin"), network).ok).toBe(true);
-    expect(canApprove(staff("1", "owner"), { ...network, approvals: [] })).toEqual({ ok: false, reason: "You can't review your own mod." });
+    // Owners may approve their own mods; admins and moderators may not.
+    expect(canApprove(staff("1", "owner"), { ...network, approvals: [] }).ok).toBe(true);
+    expect(canApprove(staff("1", "admin"), { ...network, approvals: [] })).toEqual({ ok: false, reason: "You can't review your own mod." });
+    expect(canApprove(staff("1", "moderator"), { ...network, approvals: [] })).toEqual({ ok: false, reason: "You can't review your own mod." });
     expect(canSetRole(staff("5", "admin"), staff("6", "player"), "admin").ok).toBe(false);
     expect(canSetRole(staff("5", "owner"), staff("6", "player"), "admin").ok).toBe(true);
   });
@@ -264,6 +267,23 @@ describe("Google sign-in", () => {
 });
 
 describe("submission, review and delivery", () => {
+  it("lets owners approve their own mods but not admins or moderators", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const admin = await signIn("2535400000002101", "SelfAdmin");
+    await promote(owner, "SelfAdmin", "admin");
+
+    const own = await (await submit(owner, "owner-tool", "1.0.0", { camera: true })).json() as { id: string };
+    const approved = await owner.post(`/staff/versions/${own.id}/decision`, { decision: "approve" });
+    expect(approved.status, await approved.clone().text()).toBe(200);
+    expect((await approved.json() as { status: string }).status).toBe("approved");
+    expect((await api("/mods/owner-tool")).status).toBe(200);
+
+    const theirs = await (await submit(admin, "admin-tool", "1.0.0", { hud: true })).json() as { id: string };
+    const refused = await admin.post(`/staff/versions/${theirs.id}/decision`, { decision: "approve" });
+    expect(refused.status).toBe(403);
+    expect((await refused.json() as { error: string }).error).toBe("You can't review your own mod.");
+  });
+
   it("keeps a mod private until staff approve it, signs it, and delivers it to the player's game", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
     const creator = await signIn("2535400000002001", "BlockSmith42");
