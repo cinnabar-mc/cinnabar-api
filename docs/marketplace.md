@@ -27,11 +27,13 @@ account email in `OWNER_EMAILS`; a stored role cannot grant owner.
 `GET /v1/me` returns:
 
 ```json
-{"account":{"id":"opaque-account-id","username":null,"email":"player@example.com","role":"player","suspended":false,"xbox":null},"library":[],"csrf":"session-csrf","game_online":false}
+{"account":{"id":"opaque-account-id","username":null,"email":"player@example.com","role":"player","suspended":false,"xbox":null},"library":[],"csrf":"session-csrf","game_online":false,"upload_limits":{"component_bytes":16777216,"images":4,"image_bytes":1048576,"image_dimension":4096,"image_pixels":16777216,"caption_chars":160,"alt_chars":300}}
 ```
 
 Signed-out callers receive `account: null`, an empty library, `csrf: null`, and
-`game_online: false`. A linked account instead has `xbox: {xuid, gamertag}`. Online means a
+`game_online: false`. Both responses include the same `upload_limits` from
+`src/marketplace/media-policy.ts`; these are browser hints, and server validation
+remains authoritative. A linked account instead has `xbox: {xuid, gamertag}`. Online means a
 currently authenticated socket for that linked XUID. All creator, approval, report, role,
 suspension, trust/granter, audit, session, CSRF and library references use the Cinnabar account ID.
 Staff role/suspension writes accept `{account_id, role|suspended, reason}`; existing forms can
@@ -98,7 +100,8 @@ account references, signed release statements, signatures and digest asset URLs 
 `POST /v1/submissions` takes multipart `listing` JSON, one `file` component, and
 optional repeated `images` files and `image_metadata` JSON. Image metadata is an
 ordered array of `{caption, alt}`, with one entry per image (160 and 300 characters
-respectively). Omitting it uses the filename as the caption. Identity comes from the host session cookie and
+respectively). Multipart image order is preserved in gallery responses. Omitting
+metadata uses the filename as the caption. Identity comes from the host session cookie and
 `X-Cinnabar-CSRF`. Authentication and the twenty-upload/hour account budget run
 before reading the body. Five pending releases per creator are allowed.
 

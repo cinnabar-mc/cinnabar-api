@@ -1,8 +1,8 @@
 import type { MediaFile } from "./store";
+import { MAX_COMPONENT_BYTES } from "./component";
+import { MAX_IMAGES, MAX_IMAGE_BYTES } from "./media-policy";
 
-export const MAX_IMAGE_BYTES = 1024 * 1024;
-export const MAX_IMAGES = 4;
-export const MAX_UPLOAD_BYTES = 16 * 1024 * 1024 + MAX_IMAGES * MAX_IMAGE_BYTES + 256 * 1024;
+export const MAX_UPLOAD_BYTES = MAX_COMPONENT_BYTES + MAX_IMAGES * MAX_IMAGE_BYTES + 256 * 1024;
 
 export class BodyLimitError extends Error {}
 

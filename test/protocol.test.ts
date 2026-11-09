@@ -2,6 +2,7 @@ import { Validator, type Schema } from "@cfworker/json-schema";
 import schema from "../schema/v1.json";
 import { describe, expect, it } from "vitest";
 import { CHANNELS, Close, compareVersions, decodeClientMessage, isReleaseHookRequest } from "../src/protocol";
+import { UPLOAD_LIMITS } from "../src/marketplace/media-policy";
 
 describe("versions", () => {
   it.each([
@@ -109,9 +110,24 @@ describe("account response schema", () => {
     const validator = new Validator({ $ref: `${schema.$id}#/$defs/MeResponse` }, "2020-12");
     validator.addSchema(schema as unknown as Schema);
     const account = { id: "opaque-id", username: null, email: "player@test.invalid", role: "player", suspended: false, xbox: null };
-    const me = { account, library: [], csrf: "csrf", game_online: false };
+    const me = { account, library: [], csrf: "csrf", game_online: false, upload_limits: UPLOAD_LIMITS };
     expect(validator.validate(me).valid).toBe(true);
     expect(validator.validate({ ...me, account: { ...account, username: "Player" } }).valid).toBe(true);
     expect(validator.validate({ ...me, account: { ...account, display_name: "Private Name" } }).valid).toBe(false);
+  });
+
+  it("keeps the website upload contract complete and aligned with production policy", () => {
+    const validator = new Validator({ $ref: `${schema.$id}#/$defs/UploadLimits` }, "2020-12");
+    validator.addSchema(schema as unknown as Schema);
+    expect(validator.validate(UPLOAD_LIMITS).valid).toBe(true);
+    expect([...schema.$defs.UploadLimits.required].sort()).toEqual(Object.keys(UPLOAD_LIMITS).sort());
+    for (const key of Object.keys(UPLOAD_LIMITS)) {
+      const missing: Record<string, number> = { ...UPLOAD_LIMITS };
+      delete missing[key];
+      expect(validator.validate(missing).valid, key).toBe(false);
+      for (const value of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+        expect(validator.validate({ ...UPLOAD_LIMITS, [key]: value }).valid, key).toBe(false);
+      }
+    }
   });
 });

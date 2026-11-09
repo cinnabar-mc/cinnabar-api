@@ -3,6 +3,7 @@ import { env, exports } from "cloudflare:workers";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { normalizeLinkCode, sha256Base64Url } from "../src/marketplace/auth";
 import { MarketplaceStore } from "../src/marketplace/store";
+import { UPLOAD_LIMITS } from "../src/marketplace/media-policy";
 import { OAUTH_STATE_MS, openSignIn, sealSignIn } from "../src/marketplace/oauth-state";
 import { marketplaceRoutes } from "../src/marketplace/routes";
 import { hub, installFakeIssuer, login, type Client } from "./helpers";
@@ -79,7 +80,7 @@ describe("Cinnabar accounts", () => {
     const profile = { sub: "returning-account", name: "Returning Player", email: "returning@test.invalid", email_verified: true };
     const first = await browser(profile), second = await browser(profile);
     expect(first.me).toEqual({ account: { id: expect.any(String), username: null, email: profile.email,
-      role: "player", suspended: false, xbox: null }, library: [], csrf: expect.any(String), game_online: false });
+      role: "player", suspended: false, xbox: null }, library: [], csrf: expect.any(String), game_online: false, upload_limits: UPLOAD_LIMITS });
     expect(first.me.account.id).toMatch(/^[0-9a-f-]{36}$/);
     expect(second.me.account.id).toBe(first.me.account.id);
     expect(second.session).not.toBe(first.session);

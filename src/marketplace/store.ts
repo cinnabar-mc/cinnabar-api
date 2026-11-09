@@ -1,4 +1,5 @@
 import { equalHash, USERNAME_RULES, validUsername, type ProviderIdentity } from "./auth";
+import { UPLOAD_LIMITS } from "./media-policy";
 import { compareVersions, type ModLibraryEntry } from "../protocol";
 import type { MarketplaceUpdateQuery } from "./updates";
 import { canonicalRelease, type ModRelease } from "../mod-releases";
@@ -410,7 +411,7 @@ export class MarketplaceStore {
     if (!session) return anonymousResult("me")!;
     const { id, username, email, role, suspended } = session.account;
     return ok({ account: { id, username, email, role, suspended, xbox: this.xbox(id) },
-      library: this.library(id), csrf: session.csrf, game_online: false });
+      library: this.library(id), csrf: session.csrf, game_online: false, upload_limits: UPLOAD_LIMITS });
   }
 
   /** Sets a handle once, with at most five attempts per account per ten minutes, including invalid or taken names. */
@@ -1279,7 +1280,7 @@ export const SESSION_OPS = ["me", "mine", "signout", "username", "link-code", "u
  */
 export function anonymousResult(op: MarketCall["op"]): MarketResult | null {
   if (!(SESSION_OPS as readonly string[]).includes(op)) return null;
-  if (op === "me") return ok({ account: null, library: [], csrf: null, game_online: false });
+  if (op === "me") return ok({ account: null, library: [], csrf: null, game_online: false, upload_limits: UPLOAD_LIMITS });
   if (op === "signout") return ok({});
   if (op === "private-media") return fail(404, NO_SUCH_IMAGE);
   return fail(401, SIGN_IN_FIRST);

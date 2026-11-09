@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import contract from "../.generated/contract.json";
 import { readComponent } from "../src/marketplace/component";
+import { MAX_IMAGE_DIMENSION, MAX_IMAGE_PIXELS } from "../src/marketplace/media-policy";
 import { grantDiff, type Grants, type ListingFields } from "../src/marketplace/policy";
 import { CLIENT_REVISION, PROMPT_VERSION, SCAN_POLICY, VALIDATOR } from "../src/marketplace/scanning";
 
@@ -119,10 +120,10 @@ export async function analyze(job: ScanJob, bytes: Uint8Array, media: Uint8Array
   sharp.cache(false);
   sharp.concurrency(1);
   for (let i = 0; i < media.length; i++) {
-    const image = sharp(media[i], { failOn: "warning", limitInputPixels: 16_777_216, animated: true });
+    const image = sharp(media[i], { failOn: "warning", limitInputPixels: MAX_IMAGE_PIXELS, animated: true });
     const metadata = await image.metadata();
     if (!metadata.format || IMAGE_FORMATS[metadata.format] !== job.media[i]?.type || (metadata.pages ?? 1) !== 1
-      || !metadata.width || !metadata.height || metadata.width > 4096 || metadata.height > 4096) throw new Error("Invalid image format, dimensions or animation.");
+      || !metadata.width || !metadata.height || metadata.width > MAX_IMAGE_DIMENSION || metadata.height > MAX_IMAGE_DIMENSION) throw new Error("Invalid image format, dimensions or animation.");
     await image.raw().toBuffer(); // Force a full decode, including corrupt/truncated pixel data.
   }
   // Treat printable strings and all metadata as hostile evidence, never as scanner instructions.
