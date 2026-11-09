@@ -908,11 +908,11 @@ export class MarketplaceStore {
       || (p.publish_mode === "official" ? p.state !== "complete" || v.slug !== OFFICIAL_SLUG || v.creator !== OFFICIAL_CREATOR
         || this.officialDigestPulled(v.sha256) || !this.officialValidationReady(v, p)
         : !this.scanPassed(p, now))) return null;
-    // Manual approvals count only from staff who are still active and aren't the creator.
+    // Manual approvals count only from staff who are still active and aren't the creator, unless that creator is an owner.
     const decided = p.publish_mode === "official" || (p.publish_mode === "automatic" ? this.automaticAllowed(v, now)
       : p.publish_mode === "manual" && approvalsComplete(v.reach as Reach, this.approvals(id).flatMap(a => {
         const actor = this.account(a.id);
-        return actor && !actor.suspended && atLeast(actor, "moderator") && actor.id !== v.creator ? [{ admin: atLeast(actor, "admin") }] : [];
+        return actor && !actor.suspended && atLeast(actor, "moderator") && (actor.id !== v.creator || actor.role === "owner") ? [{ admin: atLeast(actor, "admin") }] : [];
       })));
     return decided ? { sha256: v.sha256, bytes: v.bytes, media: this.media(id), statement: this.statement(id) } : null;
   }
