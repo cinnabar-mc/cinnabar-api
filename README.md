@@ -149,6 +149,10 @@ A source link is optional for every listing.
 - A separate scanner validates full component structure/types/core bytecode, host imports
   and image decoding without executing uploaded code. Workers AI assists staff with bounded,
   schema-validated findings. Missing, failed or expired checks prevent publication.
+- Scanning stays within Workers AI's free 10,000 Neurons a day: the API stops handing out jobs once
+  the day's reported usage plus one worst-case scan (2,922 Neurons) would pass 9,000 Neurons
+  (`SCAN_AI_DAILY_NEURONS` overrides this). Paused jobs stay queued and are scanned after 00:00 UTC; nothing
+  fails because of the budget. See [the daily budget](docs/marketplace.md#daily-workers-ai-budget).
 - Admins can establish a creator for a particular project after human review. Eligible updates
   publish automatically only with current trust and completed checks, unchanged content/imports,
   no added permissions or commands, and no suspension, withdrawal or open-report hold.
@@ -211,9 +215,12 @@ Then set the `MARKETPLACE_ORIGIN`, `GOOGLE_CLIENT_ID` and `OWNER_EMAILS` variabl
   sign-in cookie's encryption key is derived from that secret.
 - The session cookie only reaches the API when the website shares its registrable domain (for example
   `cinnabar.gg`), so the site must leave `*.workers.dev` before sign-in works there.
-- Keep the marketplace R2 bucket private with no public domains. Run the separate scanner with its
-  limited credential and a Workers AI token; it never receives the signing key. Provisioning,
-  scanner deployment and website HTTP enablement are separate from merging the API code.
+- Keep the marketplace R2 bucket private with no public domains. The separate scanner runs every ten
+  minutes from `.github/workflows/scanner.yml` with its limited credential and a Workers AI token; it
+  never receives the signing key. Add `MARKETPLACE_SCANNER_TOKEN` (a long random value; deployment also
+  installs it as the Worker secret and fails without it) and `AI_API_TOKEN` (a Cloudflare API token with
+  only Account · Workers AI · Read) to the `production` GitHub environment. Until both exist, scheduled
+  runs exit with a notice. Provisioning and website HTTP enablement are separate from merging the API code.
   See [deployment and recovery](docs/marketplace.md#deployment-and-recovery).
 
 ## Privacy

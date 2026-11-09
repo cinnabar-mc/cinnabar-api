@@ -488,7 +488,8 @@ describe("account-ID persistence", () => {
       const sql = state.storage.sql, now = Date.now();
       for (const table of ["accounts", "identities", "xbox_links", "account_link_codes", "account_link_attempts", "username_attempts"]) sql.exec(`DROP TABLE ${table}`);
       for (const table of ["web_sessions", "mod_approvals", "mod_library", "mod_library_clock"]) sql.exec(`ALTER TABLE ${table} RENAME COLUMN account_id TO xuid`);
-      sql.exec("ALTER TABLE mod_pipeline DROP COLUMN icon_error");
+      for (const column of ["icon_error", "ai_reserved", "ai_claimed_at"]) sql.exec(`ALTER TABLE mod_pipeline DROP COLUMN ${column}`);
+      sql.exec("DROP TABLE scan_ai_days");
       sql.exec("DELETE FROM market_schema WHERE version >= 8");
       const oldId = "2535400000092001";
       sql.exec("INSERT INTO market_accounts (xuid, gamertag, role, suspended, seen_at) VALUES (?, 'Legacy Player', 'admin', 1, ?)", oldId, now);

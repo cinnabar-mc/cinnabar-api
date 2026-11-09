@@ -14,6 +14,7 @@ declare namespace Cloudflare {
     MARKETPLACE_ORIGIN?: string; // the website origin allowed to call marketplace routes with credentials
     GOOGLE_CLIENT_ID?: string; // Google web OAuth client ID
     OWNER_EMAILS?: string; // comma-separated verified account emails that hold the owner role
+    SCAN_AI_DAILY_NEURONS?: string; // optional Workers AI Neurons the scanner may use per UTC day; defaults to 9000
   }
 }
 interface Env {
@@ -29,4 +30,5 @@ interface Env {
   MARKETPLACE_ORIGIN?: string;
   GOOGLE_CLIENT_ID?: string;
   OWNER_EMAILS?: string;
+  SCAN_AI_DAILY_NEURONS?: string;
 }

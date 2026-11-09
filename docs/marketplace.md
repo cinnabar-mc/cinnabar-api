@@ -216,9 +216,10 @@ release. No network call must succeed to enqueue work. Independent consumers pol
 
 | Route | Request / result |
 | --- | --- |
-| `POST /v1/internal/marketplace/claim` | Returns `{job: null}` or a job with a random lease, exact hash/size, listing, grants, images and prior release evidence. |
+| `POST /v1/internal/marketplace/claim` | Returns `{job: null}`, `{job: null, paused: "daily_ai_budget", resumes_at}` when the [daily AI budget](#daily-workers-ai-budget) is spent, or a job with a random lease, exact hash/size, listing, grants, images and prior release evidence. |
 | `GET /v1/internal/marketplace/jobs/<job>/files/<sha256>` | `X-Scan-Lease` selects only a file attached to that unexpired job. |
 | `POST /v1/internal/marketplace/jobs/<job>/complete` | `X-Scan-Lease`, bounded JSON attestation. Hash, media hashes, validator, pinned client revision and policy must match. |
+| `POST /v1/internal/marketplace/jobs/<job>/release` | `X-Scan-Lease`, optional `{reason: "daily_allocation" \| "capacity"}` (default `daily_allocation`). Returns the unexpired claim to `queued` without counting its attempt and answers `{released: true, paused}`. `daily_allocation` also pauses claims until the next UTC day. |
 
 These routes require `Authorization: Bearer <MARKETPLACE_SCANNER_TOKEN>`. This
 credential cannot authenticate as staff or sign a release. Keep it separate from
@@ -261,7 +262,47 @@ A fixed system instruction treats all packet contents as hostile data. It has no
 Workers AI JSON mode and local schema validation are both required. The report
 records the configured model, prompt version, validator and policy. Provider
 failure, invalid JSON, missing configuration or timeout produce an error hold.
+The scanner never sends more than 96 KiB of message text; a larger packet is not
+sent and also ends as an error hold. The report's `ai.usage`
+(`{prompt_tokens, completion_tokens}`, non-negative integers up to 1,000,000) is
+zero when no request was sent, Cloudflare's `result.usage` when it reports one,
+and otherwise the most the sent request could have used. A Workers AI quota
+refusal never completes the job; see the daily budget below.
 AI cannot alter hashes, grant trust, approve a deterministic block or sign releases.
+
+### Daily Workers AI budget
+
+Workers AI includes 10,000 free Neurons per account per day, reset at 00:00 UTC.
+On Workers Paid, Cloudflare bills usage above that automatically and it cannot be
+switched off, so the API stops handing out jobs first. It keeps a per-UTC-day
+Neuron ledger in the Hub: a claim charges the worst case of one scan to each UTC
+day its five-minute lease overlaps, completion replaces that charge with the
+report's `ai.usage`, and a release removes it. A lease that expires without
+either keeps its worst-case charge, as its scanner may have called the AI before
+failing; a report without `ai.usage`, from an older scanner, does too. A claim is
+refused with `paused: "daily_ai_budget"` when the day's charges plus another worst
+case would exceed the budget. That refusal changes no job or attempt count:
+queued releases wait and the first scan after midnight UTC picks them up.
+
+| Value | Amount |
+| --- | --- |
+| Default model pricing | 26,668 Neurons per million input tokens, 204,805 per million output tokens ($0.293 / $2.253 per million at $0.011 per 1,000 Neurons) |
+| Worst-case prompt | 96 KiB of message bytes plus 2,048 tokens of template allowance = 100,352 tokens (byte-level tokenization yields at most one token per byte) |
+| Worst-case scan | 100,352 input and 1,200 output tokens = 2,922 Neurons |
+| Daily budget | 9,000 Neurons, or the optional `SCAN_AI_DAILY_NEURONS` Worker variable |
+
+The worst case only gates admission; actual usage is what accumulates. A typical
+packet of a few thousand tokens costs on the order of 100–300 Neurons, so dozens of
+scans fit in a day, while three worst-case scans always fit. Claims stop once a day's
+charges pass 6,078 Neurons. A budget below 2,922 admits no scans. The prices are for the
+default model; overriding `AI_MODEL` makes the ledger inaccurate. The ledger only
+counts the scanner, so other Workers AI use on the same account needs a lower budget.
+
+If Cloudflare refuses anyway (HTTP 429, error code 3036 or 4006, or a message about
+the daily free allocation or Neurons), the scanner releases the job instead of
+completing it, which also pauses the rest of the UTC day, and stops. A capacity
+error (code 3040) releases with `reason: "capacity"`, which requeues without
+pausing. Every other AI failure keeps producing an error hold.
 
 This first policy uses static evidence. It does not execute guest code, scan
 repository sources or claim to detect every malicious behavior. Host imports
@@ -446,8 +487,8 @@ case-insensitive; only verified account emails qualify). Google requires authori
 callback path too: the callback URI is derived from the API request origin.
 Set Worker secrets `MARKETPLACE_SIGNING_KEY`, `GOOGLE_CLIENT_SECRET` and
 `MARKETPLACE_SCANNER_TOKEN`. Never place credentials in this repository. The production
-GitHub environment must contain `GOOGLE_CLIENT_SECRET`: deployment installs it with
-`wrangler secret put`, just like the signer. An empty secret fails deployment loudly rather
+GitHub environment must contain `GOOGLE_CLIENT_SECRET` and `MARKETPLACE_SCANNER_TOKEN`: deployment
+installs them with `wrangler secret put`, just like the signer. An empty secret fails deployment loudly rather
 than silently retaining an unknown old credential or deploying broken sign-in. Pull requests
 never receive these secrets. Missing configuration (including the client-ID placeholder)
 returns 503 from both Google auth endpoints.
@@ -473,7 +514,28 @@ inputs before configuring the Worker. Pull requests never receive the secret.
 Keep the client and API trust pins aligned; rotate deliberately with overlapping
 client public keys before changing the signer. Local fixtures use a separate key.
 
-Build the separate scanner image from the repository root:
+Production scanning runs as the scheduled `.github/workflows/scanner.yml` workflow
+from `main`, every ten minutes and on manual dispatch, one run at a time. It builds
+`scanner/Dockerfile` and runs it with the isolation flags below in drain mode
+(`SCANNER_DRAIN=1` or `node scanner/runner.mjs --drain`): it scans until the queue
+is empty, the budget pauses or Workers AI refuses for quota, stops claiming after
+ten minutes, then exits. It exits 0 in those cases and 1 after an API or network
+error, whose job is retried after its lease expires. The run uses
+`MARKETPLACE_API_ORIGIN=https://api.cinnabar.gg` and reads `AI_ACCOUNT_ID` from
+`wrangler.jsonc`. Add these secrets to the `production` GitHub environment:
+
+- `MARKETPLACE_SCANNER_TOKEN`: a long random value, for example `openssl rand -base64 48`.
+  Main deployment installs it as the Worker secret with `wrangler secret put` and
+  fails when it is empty, like the other secrets.
+- `AI_API_TOKEN`: a Cloudflare API token limited to this account with only the
+  Account · Workers AI · Read permission. Cloudflare's API reference accepts Workers
+  AI Read or Workers AI Write for running a model; the getting-started guide's custom
+  token lists Read and Edit, so add Edit only if Cloudflare refuses Read alone.
+
+Until both secrets exist, each scheduled run ends successfully with a notice and
+scans nothing. The workflow's runner (`vars.API_RUNNER`, default `ubuntu-latest`) needs Docker.
+
+To run the scanner elsewhere, build the separate scanner image from the repository root:
 
 ```sh
 docker build -f scanner/Dockerfile -t cinnabar-mod-scanner .
@@ -488,7 +550,8 @@ Workers AI. Optional `AI_MODEL` defaults to
 `@cf/meta/llama-3.3-70b-instruct-fp8-fast`, which supports JSON mode. Give the
 container no signer, cloud deployment, R2 or database credentials. Its egress needs
 only the configured API and Cloudflare AI. A supervisor should restart it after
-failure. Multiple instances are supported; the SQL lease prevents duplicate work.
+failure, or run it with `SCANNER_DRAIN=1` from a scheduler. Multiple instances are
+supported; the SQL lease prevents duplicate work and every claim draws on the same budget.
 For local fixture development use `pnpm scanner:setup`, `pnpm source:fetch`,
 `pnpm scanner:build`, then `pnpm scanner:start` with equivalent environment variables.
 `pnpm test:scanner` needs the same setup and fetched WIT. The setup script installs
@@ -504,7 +567,8 @@ The scanner build checks that the tool and trusted WIT are available. Runtime
 world checks read component bytes through stdin with a ten-second tool timeout,
 no shell, no credentials and no guest execution; tool failures remain scan errors.
 
-Monitor fixed `scan_completed` / `scan_retry_pending` scanner events, staff queue
+Monitor fixed `scan_completed` / `scan_retry_pending` / `scan_paused_daily_ai_budget` /
+`scan_released_ai_quota` / `scan_queue_empty` scanner events, staff queue
 scan states, expired claims and pending publications. Reconfigure/restart a failed
 scanner, then rescan held releases. If signing/storage fails, restore the resource;
 cron retries eligible publications. Revoke creator trust during incidents, pull
@@ -522,4 +586,7 @@ they do not call production inference or deploy infrastructure.
 - [Workers WebAssembly restrictions](https://developers.cloudflare.com/workers/runtime-apis/webassembly/)
 - [Workers AI REST authentication](https://developers.cloudflare.com/workers-ai/get-started/rest-api/)
 - [Workers AI JSON mode](https://developers.cloudflare.com/workers-ai/features/json-mode/)
+- [Workers AI pricing and the daily free allocation](https://developers.cloudflare.com/workers-ai/platform/pricing/)
+- [Workers AI errors](https://developers.cloudflare.com/workers-ai/platform/errors/)
+- [Workers AI run API and token permissions](https://developers.cloudflare.com/api/resources/ai/methods/run/)
 - [sharp input validation and pixel limits](https://sharp.pixelplumbing.com/api-constructor/)

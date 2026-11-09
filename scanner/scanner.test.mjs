@@ -5,7 +5,8 @@ import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { componentEmbed, componentNew, parse } from '@bytecodealliance/jco-transpile/wasm-tools';
 import sharp from 'sharp';
 import { EVIDENCE_BUDGET, analyze, boundedNames, validateComponent, SCAN_POLICY, PROMPT_VERSION } from '../.build/scanner-engine.mjs';
-import { isolatedAnalysis, parseAi, reviewEvidence, runOnce } from './runner.mjs';
+import { AI_MAX_INPUT_BYTES, AI_MAX_OUTPUT_TOKENS, AI_PROMPT_OVERHEAD_TOKENS } from '../.build/scanner-policy.mjs';
+import { aiRefusal, drain, isolatedAnalysis, parseAi, reviewEvidence, runOnce } from './runner.mjs';
 
 const CONFIG = { MARKETPLACE_API_ORIGIN: 'https://api.test', MARKETPLACE_SCANNER_TOKEN: 'test-scanner',
   AI_ACCOUNT_ID: 'a'.repeat(32), AI_API_TOKEN: 'test-ai', AI_MODEL: '@cf/meta/llama-3.3-70b-instruct-fp8-fast' };
@@ -269,4 +270,111 @@ test('clips oversized creator text in the AI evidence packet and marks what was 
   assert.ok(kept.slice(0, -1).join('').length <= EVIDENCE_BUDGET.names);
   assert.deepEqual(kept.slice(0, -1), names.slice(0, kept.length - 1));
   assert.deepEqual(boundedNames(names.slice(0, 3), EVIDENCE_BUDGET.names), names.slice(0, 3));
+});
+
+/** A fake AI answer with Cloudflare's envelope, optionally carrying `usage`. */
+const aiAnswer = (usage, response = { verdict: 'clear', findings: [] }) =>
+  Response.json({ success: true, result: { response, ...(usage ? { usage } : {}) } });
+
+/** Scanner protocol fake for one `job` with fixture `bytes`; `ai` answers AI requests and `seen` collects API calls. */
+function protocol(job, bytes, ai, seen = []) {
+  return async (url, init) => {
+    const path = new URL(url).pathname;
+    if (path.includes('/ai/run/')) return ai(init);
+    seen.push({ path, body: init.body === undefined ? undefined : JSON.parse(init.body) });
+    if (path.endsWith('/claim')) return Response.json({ job });
+    if (path.includes('/files/')) return new Response(bytes);
+    if (path.endsWith('/complete') || path.endsWith('/release')) return Response.json({ received: true });
+    throw new Error('Unexpected request');
+  };
+}
+
+test('reports provider token usage, zero without a request and a conservative bound when usage is missing', async () => {
+  const usage = { prompt_tokens: 1234, completion_tokens: 56 };
+  assert.deepEqual((await reviewEvidence({}, CONFIG, async () => aiAnswer({ ...usage, total_tokens: 1290 }))).usage, usage);
+  assert.deepEqual((await reviewEvidence({}, {})).usage, { prompt_tokens: 0, completion_tokens: 0 });
+  let sent;
+  const missing = await reviewEvidence({ strings: 'abc' }, CONFIG, async (_, init) => { sent = JSON.parse(init.body); return aiAnswer(); });
+  const bytes = sent.messages.reduce((sum, m) => sum + Buffer.byteLength(m.content), 0);
+  assert.equal(sent.max_tokens, AI_MAX_OUTPUT_TOKENS);
+  assert.deepEqual(missing.usage, { prompt_tokens: bytes + AI_PROMPT_OVERHEAD_TOKENS, completion_tokens: AI_MAX_OUTPUT_TOKENS });
+  assert.deepEqual((await reviewEvidence({}, CONFIG, async () => aiAnswer({ prompt_tokens: -1, completion_tokens: 2 }))).usage.completion_tokens,
+    AI_MAX_OUTPUT_TOKENS);
+  // A failed request may still have been billed, so it carries the bound too.
+  assert.equal((await reviewEvidence({}, CONFIG, async () => { throw new Error('timeout'); })).usage.completion_tokens, AI_MAX_OUTPUT_TOKENS);
+
+  const fixture = await parse(GOOD_WAT); const seen = [];
+  await runOnce(CONFIG, protocol(jobFor(fixture), fixture, async () => aiAnswer(usage), seen));
+  assert.deepEqual(seen.at(-1).body.ai.usage, usage);
+  // A deterministic block never calls the AI and reports no usage.
+  const blocked = []; const unknown = await parse('(component (import "evil:host/files@0.1.0" (instance)))');
+  await runOnce(CONFIG, protocol(jobFor(unknown), unknown, async () => { throw new Error('AI called'); }, blocked));
+  assert.deepEqual(blocked.at(-1).body.ai.usage, { prompt_tokens: 0, completion_tokens: 0 });
+});
+
+test('keeps the largest ordinary evidence packet within the AI input bound and never sends a larger one', async () => {
+  let bytes = await parse(GOOD_WAT);
+  for (const name of ['description', 'authors', 'licenses']) bytes = withCustomSection(bytes, name, 'x'.repeat(65536));
+  const long = 'y'.repeat(40_000);
+  const job = { ...jobFor(bytes), listing: { slug: long, name: long, summary: long, description: long, version: long, source: long,
+    category: long, license: long, notes: long } };
+  const { evidence } = await analyze(job, bytes, []);
+  let calls = 0;
+  await reviewEvidence(evidence, CONFIG, async () => { calls++; return aiAnswer(); });
+  assert.equal(calls, 1);
+  const oversized = await reviewEvidence({ strings: 'z'.repeat(AI_MAX_INPUT_BYTES) }, CONFIG, async () => { throw new Error('AI called'); });
+  assert.equal(oversized.verdict, 'error');
+  assert.deepEqual(oversized.usage, { prompt_tokens: 0, completion_tokens: 0 });
+});
+
+test('classifies Workers AI quota refusals', () => {
+  assert.equal(aiRefusal(429, { success: false, errors: [{ code: 3036, message: 'You have used up your daily free allocation of 10,000 neurons.' }] }), 'daily_allocation');
+  assert.equal(aiRefusal(400, { success: false, errors: [{ code: 4006, message: 'Quota' }] }), 'daily_allocation');
+  assert.equal(aiRefusal(403, { success: false, errors: [{ code: 1, message: 'Daily free allocation exceeded' }] }), 'daily_allocation');
+  assert.equal(aiRefusal(429, null), 'daily_allocation');
+  assert.equal(aiRefusal(429, { success: false, errors: [{ code: 3040, message: 'Capacity temporarily exceeded, please try again.' }] }), 'capacity');
+  assert.equal(aiRefusal(500, { success: false, errors: [{ code: 3007, message: 'Request timeout' }] }), null);
+  assert.equal(aiRefusal(200, { success: true, result: {} }), null);
+});
+
+test('releases a job instead of failing it when Workers AI refuses for quota', async () => {
+  const fixture = await parse(GOOD_WAT); const job = jobFor(fixture);
+  for (const [answer, reason] of [
+    [() => Response.json({ success: false, errors: [{ code: 3036, message: 'You have used up your daily free allocation of 10,000 neurons.' }] }, { status: 429 }), 'daily_allocation'],
+    [() => Response.json({ success: false, errors: [{ code: 4006, message: 'you have used up your daily free allocation' }] }), 'daily_allocation'],
+    [() => new Response('Too Many Requests', { status: 429 }), 'daily_allocation'],
+    [() => Response.json({ success: false, errors: [{ code: 3040, message: 'Capacity temporarily exceeded, please try again.' }] }, { status: 429 }), 'capacity'],
+  ]) {
+    const seen = [];
+    assert.equal(await runOnce(CONFIG, protocol(job, fixture, async () => answer(), seen)), 'released');
+    assert.equal(seen.some(call => call.path.endsWith('/complete')), false);
+    assert.deepEqual(seen.at(-1), { path: `/v1/internal/marketplace/jobs/${job.id}/release`, body: { reason } });
+  }
+  // Other provider failures keep completing the job as an AI error.
+  const seen = [];
+  assert.equal(await runOnce(CONFIG, protocol(job, fixture, async () => new Response('oops', { status: 500 }), seen)), 'scanned');
+  assert.equal(seen.at(-1).body.ai.verdict, 'error');
+});
+
+test('drain mode scans until the queue is empty or paused, then stops', async () => {
+  const fixture = await parse(GOOD_WAT); const job = jobFor(fixture);
+  /** A claim fake answering the queued `answers` in order, then an empty queue. */
+  const queue = answers => { const calls = []; return { calls, request: async (url, init) => {
+    const path = new URL(url).pathname;
+    if (path.endsWith('/claim')) { calls.push('claim'); return Response.json(answers.shift() ?? { job: null }); }
+    return protocol(job, fixture, async () => aiAnswer({ prompt_tokens: 1, completion_tokens: 1 }))(url, init);
+  } }; };
+  const empty = queue([]);
+  assert.equal(await drain(CONFIG, empty.request), 'idle');
+  assert.deepEqual(empty.calls, ['claim']);
+  const two = queue([{ job }, { job }]);
+  assert.equal(await drain(CONFIG, two.request), 'idle');
+  assert.equal(two.calls.length, 3);
+  const paused = queue([{ job }, { job: null, paused: 'daily_ai_budget', resumes_at: 0 }, { job }]);
+  assert.equal(await drain(CONFIG, paused.request), 'paused');
+  assert.equal(paused.calls.length, 2);
+  const late = queue([{ job }, { job }]);
+  let clock = 0;
+  assert.equal(await drain(CONFIG, late.request, isolatedAnalysis, 1, () => clock++), 'scanned');
+  assert.equal(late.calls.length, 1);
 });

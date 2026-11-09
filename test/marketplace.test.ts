@@ -9,7 +9,8 @@ import { normalizeLinkCode, sha256Base64Url } from "../src/marketplace/auth";
 import { approvalRule, approvalsComplete, canApprove, canSetRole, grantDiff, reachOf, validateListing, type Actor } from "../src/marketplace/policy";
 import { REVOCATION_BUDGET_BYTES, REVOCATION_MEMO_MS } from "../src/marketplace/revocations";
 import { marketplaceRoutes } from "../src/marketplace/routes";
-import { CLIENT_REVISION, SCAN_POLICY, VALIDATOR, PROMPT_VERSION, SCAN_LEASE_MS } from "../src/marketplace/scanning";
+import { AI_USAGE_MAX_TOKENS, CLIENT_REVISION, SCAN_POLICY, VALIDATOR, PROMPT_VERSION, SCAN_LEASE_MS, parseScanReport } from "../src/marketplace/scanning";
+import { AI_DAILY_NEURONS, AI_SCAN_WORST_CASE_NEURONS, dailyNeurons, neuronsFor } from "../src/marketplace/ai-budget";
 import { BodyLimitError, readLimited } from "../src/marketplace/uploads";
 import { OAUTH_STATE_MS, sealSignIn } from "../src/marketplace/oauth-state";
 import { MarketplaceStore, SESSION_OPS, anonymousResult, type MarketCall } from "../src/marketplace/store";
@@ -718,7 +719,7 @@ describe("upload and publication pipeline", () => {
     const { creator } = await established("race-mod");
     const v = await (await submit(creator, "race-mod", "1.0.1", { hud: true }, {}, false)).json() as any;
     await runInDurableObject(hub(), (_: Hub, state) => {
-      const store = new MarketplaceStore(state.storage.sql, new Set([`${OWNER}@test.invalid`]));
+      const store = new MarketplaceStore(state.storage.sql, new Set([`${OWNER}@test.invalid`]), dailyNeurons(env.SCAN_AI_DAILY_NEURONS));
       const job = (store.claimScan(Date.now()).body as any).job;
       expect(store.completeScan(job.id, job.lease, report(job), Date.now()).approved).toBe(Number(v.id));
       const candidate = store.publicationReady(Number(v.id), Date.now())!;
@@ -1692,5 +1693,141 @@ describe("listing addresses", () => {
     expect(listing({ name: "No source" }).errors.source).toBeUndefined();
     expect(listing({ name: "Bad source", source: "None" }).errors.source).toBeTruthy();
     expect(listing({ name: "Good source", source: "https://github.com/RestartFU/cinnaroids" }).errors.source).toBeUndefined();
+  });
+});
+
+describe("scanner AI budget", () => {
+  const DAY = 86_400_000;
+  /** Neurons charged to the UTC day containing `at`. */
+  const charged = (sql: SqlStorage, at: number): number =>
+    sql.exec<{ neurons: number }>("SELECT neurons FROM scan_ai_days WHERE day = ?", Math.floor(at / DAY)).toArray()[0]?.neurons ?? 0;
+  /** A passing report for `job` carrying AI `usage`, or none like reports from older scanners. */
+  const reportWith = (job: any, usage?: unknown) =>
+    report(job, { ai: { verdict: "clear", model: "test-model", prompt: PROMPT_VERSION, findings: [], ...(usage ? { usage } : {}) } });
+  const NO_USAGE = { prompt_tokens: 0, completion_tokens: 0 };
+  /** Completes every job claimable at `at`, since the Hub's storage carries other tests' leftover jobs. */
+  const drainAt = (store: MarketplaceStore, at: number) => {
+    for (let job = (store.claimScan(at).body as any).job; job; job = (store.claimScan(at).body as any).job) {
+      store.completeScan(job.id, job.lease, reportWith(job, NO_USAGE), at);
+    }
+  };
+
+  it("prices usage with the default model's Neuron rates and reads the configured budget", () => {
+    expect(neuronsFor({ prompt_tokens: 1_000_000, completion_tokens: 0 })).toBe(26_668);
+    expect(neuronsFor({ prompt_tokens: 0, completion_tokens: 1_000_000 })).toBe(204_805);
+    expect(neuronsFor({ prompt_tokens: 0, completion_tokens: 0 })).toBe(0);
+    expect(neuronsFor({ prompt_tokens: 227_912, completion_tokens: 0 })).toBe(6078);
+    // 96 KiB of message bytes plus 2,048 template tokens in, 1,200 tokens out.
+    expect(AI_SCAN_WORST_CASE_NEURONS).toBe(2922);
+    expect(AI_DAILY_NEURONS).toBe(9000);
+    for (const value of [undefined, "", "abc", "0", "-5", "1.5", "1e4"]) expect(dailyNeurons(value)).toBe(9000);
+    expect(dailyNeurons("5000")).toBe(5000);
+    expect(dailyNeurons(" 7000 ")).toBe(7000);
+  });
+
+  it("accepts bounded token usage in scan reports and rejects malformed usage", () => {
+    const job = { sha256: "a".repeat(64), media: [] };
+    expect(parseScanReport(reportWith(job), job.sha256)!.ai).not.toHaveProperty("usage");
+    const usage = { prompt_tokens: 10, completion_tokens: AI_USAGE_MAX_TOKENS };
+    expect(parseScanReport(reportWith(job, usage), job.sha256)!.ai.usage).toEqual(usage);
+    for (const bad of [{ prompt_tokens: -1, completion_tokens: 0 }, { prompt_tokens: 1.5, completion_tokens: 0 },
+      { prompt_tokens: "10", completion_tokens: 0 }, { prompt_tokens: 0, completion_tokens: AI_USAGE_MAX_TOKENS + 1 },
+      { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }, { prompt_tokens: 0 }, [0, 0], 7]) {
+      expect(parseScanReport(reportWith(job, bad), job.sha256), JSON.stringify(bad)).toBeNull();
+    }
+    expect(parseScanReport(report(job, { ai: { verdict: "clear", model: "m", prompt: PROMPT_VERSION, findings: [], usage: null } }), job.sha256)).toBeNull();
+  });
+
+  it("charges each UTC day for reservations and reported usage, refusing claims that could exceed the default budget", async () => {
+    const creator = await signIn("2535400000007101", "BudgetCreator");
+    const day = Date.UTC(2030, 0, 1), noon = day + DAY / 2;
+    // Leftover jobs would be claimed first, so finish them on an earlier day.
+    await runInDurableObject(hub(), (_: Hub, state) => drainAt(new MarketplaceStore(state.storage.sql, new Set()), day - DAY));
+    for (const slug of ["budget-a", "budget-b", "budget-c"]) await submit(creator, slug, "1.0.0", { hud: true }, {}, false);
+    await runInDurableObject(hub(), (_: Hub, state) => {
+      const sql = state.storage.sql;
+      const store = new MarketplaceStore(sql, new Set());
+      const claimAt = (at: number) => store.claimScan(at).body as any;
+      const attempts = () => sql.exec<{ slug: string; attempts: number; state: string }>(`SELECT v.slug, p.attempts, p.state
+        FROM mod_pipeline p JOIN mod_versions v ON v.id = p.version_id WHERE v.slug LIKE 'budget-%' ORDER BY v.slug`).toArray();
+
+      const a = claimAt(noon).job;
+      expect(charged(sql, noon)).toBe(AI_SCAN_WORST_CASE_NEURONS);
+      expect(store.completeScan(a.id, a.lease, reportWith(a, { prompt_tokens: 227_912, completion_tokens: 0 }), noon + 1).status).toBe(200);
+      expect(charged(sql, noon)).toBe(6078);
+      // 6,078 used plus a 2,922 worst case is exactly the 9,000 budget.
+      const b = claimAt(noon + 2).job;
+      expect(b).toBeTruthy();
+      expect(charged(sql, noon)).toBe(AI_DAILY_NEURONS);
+      // The in-flight reservation counts, so a third claim could exceed the budget: it pauses without touching the job.
+      const before = attempts();
+      expect(claimAt(noon + 3)).toEqual({ job: null, paused: "daily_ai_budget", resumes_at: day + DAY });
+      expect(attempts()).toEqual(before);
+      expect(before[2]).toEqual({ slug: "budget-c", attempts: 0, state: "queued" });
+      // A report without usage keeps its worst-case charge.
+      expect(store.completeScan(b.id, b.lease, reportWith(b), noon + 4).status).toBe(200);
+      expect(charged(sql, noon)).toBe(AI_DAILY_NEURONS);
+      expect(claimAt(day + DAY - 1).paused).toBe("daily_ai_budget");
+
+      // The next UTC day starts empty. A lease that crosses midnight charges both days, then settles both.
+      const late = day + 2 * DAY - 60_000;
+      const c = claimAt(late).job;
+      expect(c).toBeTruthy();
+      expect(charged(sql, late)).toBe(AI_SCAN_WORST_CASE_NEURONS);
+      expect(charged(sql, late + 60_000)).toBe(AI_SCAN_WORST_CASE_NEURONS);
+      expect(store.completeScan(c.id, c.lease, reportWith(c, { prompt_tokens: 1000, completion_tokens: 10 }), late + 120_000).status).toBe(200);
+      expect([charged(sql, late), charged(sql, late + 60_000)]).toEqual([29, 29]);
+      expect(charged(sql, noon)).toBe(AI_DAILY_NEURONS);
+    });
+  });
+
+  it("reads the daily budget from SCAN_AI_DAILY_NEURONS", async () => {
+    const creator = await signIn("2535400000007103", "ConfiguredBudget");
+    await submit(creator, "configured-budget", "1.0.0", { hud: true }, {}, false);
+    const setCharged = (neurons: number) => runInDurableObject(hub(), (_: Hub, state) => {
+      state.storage.sql.exec("INSERT OR REPLACE INTO scan_ai_days (day, neurons, paused) VALUES (?, ?, 0)", Math.floor(Date.now() / DAY), neurons);
+    });
+    await setCharged(Number(env.SCAN_AI_DAILY_NEURONS) - AI_SCAN_WORST_CASE_NEURONS + 1);
+    expect(await (await scanner("claim")).json()).toMatchObject({ job: null, paused: "daily_ai_budget" });
+    await setCharged(Number(env.SCAN_AI_DAILY_NEURONS) - AI_SCAN_WORST_CASE_NEURONS);
+    const job = await claim();
+    expect(job).toBeTruthy();
+    // The Hub's storage outlives this test, so leave nothing claimed or charged behind.
+    expect((await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).status).toBe(200);
+    await setCharged(0);
+  });
+
+  it("returns a refused job to the queue uncounted and pauses claims until the next UTC day", async () => {
+    const owner = await signIn(OWNER, "OreKeeper");
+    const creator = await signIn("2535400000007102", "ReleaseCreator");
+    for (let job = await claim(); job; job = await claim()) await scanner(`jobs/${job.id}/complete`, reportWith(job, NO_USAGE), job.lease);
+    const v = await (await submit(creator, "release-mod", "1.0.0", { hud: true }, {}, false)).json() as any;
+    const scan = async () => ((await (await owner.get(`/staff/versions/${v.id}`)).json()) as any).scan;
+    const job = await claim();
+    expect(job.version_id).toBe(Number(v.id));
+    expect((await scanner(`jobs/${job.id}/release`, undefined, "wrong-lease")).status).toBe(409);
+    expect((await scanner(`jobs/${job.id}/release`, { reason: "other" }, job.lease)).status).toBe(400);
+    // A capacity refusal requeues without pausing.
+    expect(await (await scanner(`jobs/${job.id}/release`, { reason: "capacity" }, job.lease)).json()).toEqual({ released: true, paused: false });
+    expect(await scan()).toMatchObject({ state: "queued", attempts: 0 });
+    const again = await claim();
+    expect(again.id).toBe(job.id);
+    expect(await scan()).toMatchObject({ state: "running", attempts: 1 });
+    // The default reason is a used-up daily allocation.
+    expect(await (await scanner(`jobs/${again.id}/release`, undefined, again.lease)).json()).toEqual({ released: true, paused: true });
+    expect((await scanner(`jobs/${again.id}/complete`, report(again), again.lease)).status).toBe(409);
+    expect(await scan()).toMatchObject({ state: "queued", attempts: 0 });
+    const tomorrow = (Math.floor(Date.now() / DAY) + 1) * DAY;
+    expect(await (await scanner("claim")).json()).toEqual({ job: null, paused: "daily_ai_budget", resumes_at: tomorrow });
+    expect(await scan()).toMatchObject({ state: "queued", attempts: 0 });
+    await runInDurableObject(hub(), (_: Hub, state) => {
+      const store = new MarketplaceStore(state.storage.sql, new Set());
+      const next = (store.claimScan(tomorrow).body as any).job;
+      expect(next.id).toBe(job.id);
+      expect(state.storage.sql.exec<{ attempts: number }>("SELECT attempts FROM mod_pipeline WHERE job_id = ?", job.id).one().attempts).toBe(1);
+      // The Hub's storage outlives this test, so finish the job and lift today's pause.
+      expect(store.completeScan(next.id, next.lease, report(next), tomorrow + 1).status).toBe(200);
+      state.storage.sql.exec("DELETE FROM scan_ai_days WHERE day = ?", Math.floor(Date.now() / DAY));
+    });
   });
 });

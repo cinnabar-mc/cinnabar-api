@@ -104,6 +104,13 @@ jobs:
           : "${RELEASE_HOOK_SECRET:?Missing RELEASE_HOOK_SECRET}"
           printf '%s' "$RELEASE_HOOK_SECRET" | pnpm exec wrangler secret put RELEASE_HOOK_SECRET
       - if: steps.head.outputs.current == 'true'
+        name: Configure the marketplace scanner credential
+        env:
+          MARKETPLACE_SCANNER_TOKEN: ${{ secrets.MARKETPLACE_SCANNER_TOKEN }}
+        run: |
+          : "${MARKETPLACE_SCANNER_TOKEN:?Missing MARKETPLACE_SCANNER_TOKEN}"
+          printf '%s' "$MARKETPLACE_SCANNER_TOKEN" | pnpm exec wrangler secret put MARKETPLACE_SCANNER_TOKEN
+      - if: steps.head.outputs.current == 'true'
         name: Mirror cosmetic assets as static files
         run: node scripts/sync-static-assets.mjs static
       - if: steps.head.outputs.current == 'true'

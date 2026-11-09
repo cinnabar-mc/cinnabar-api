@@ -1,0 +1,57 @@
+name: Mod scanner
+
+# Drains the marketplace scan queue on a schedule. Each run claims jobs until the queue is empty or the API's daily
+# Workers AI budget pauses scanning; paused jobs stay queued and are scanned by the first run after 00:00 UTC.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ fromJSON(vars.API_RUNNER || '"ubuntu-latest"') }}
+    timeout-minutes: 15
+    # The environment only admits main, so no other ref sees the scanner credentials.
+    environment: production
+    steps:
+      - id: secrets
+        name: Check scanner credentials
+        env:
+          MARKETPLACE_SCANNER_TOKEN: ${{ secrets.MARKETPLACE_SCANNER_TOKEN }}
+          AI_API_TOKEN: ${{ secrets.AI_API_TOKEN }}
+        run: |
+          if [ -n "$MARKETPLACE_SCANNER_TOKEN" ] && [ -n "$AI_API_TOKEN" ]; then
+            echo configured=true >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=Scanner not configured::Add MARKETPLACE_SCANNER_TOKEN and AI_API_TOKEN to the production environment to enable scheduled scans."
+          fi
+      - if: steps.secrets.outputs.configured == 'true'
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - if: steps.secrets.outputs.configured == 'true'
+        name: Build the scanner image
+        run: docker build -f scanner/Dockerfile -t cinnabar-mod-scanner .
+      - if: steps.secrets.outputs.configured == 'true'
+        name: Scan queued releases
+        env:
+          MARKETPLACE_API_ORIGIN: https://api.cinnabar.gg
+          MARKETPLACE_SCANNER_TOKEN: ${{ secrets.MARKETPLACE_SCANNER_TOKEN }}
+          AI_API_TOKEN: ${{ secrets.AI_API_TOKEN }}
+        run: |
+          # The account ID is public; read it from the Worker configuration rather than repeating it.
+          AI_ACCOUNT_ID="$(node -e 'const m = /"account_id"\s*:\s*"([0-9a-f]{32})"/.exec(require("fs").readFileSync("wrangler.jsonc", "utf8")); if (!m) process.exit(1); console.log(m[1])')"
+          export AI_ACCOUNT_ID
+          # `-e NAME` copies each value from this step's environment, so secrets never appear on the command line.
+          docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --memory 512m --cpus 1 --pids-limit 64 --tmpfs /tmp:rw,noexec,nosuid,size=32m \
+            -e MARKETPLACE_API_ORIGIN -e MARKETPLACE_SCANNER_TOKEN -e AI_ACCOUNT_ID -e AI_API_TOKEN -e SCANNER_DRAIN=1 \
+            cinnabar-mod-scanner
