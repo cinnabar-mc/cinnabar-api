@@ -9,8 +9,7 @@ import { normalizeLinkCode, sha256Base64Url } from "../src/marketplace/auth";
 import { approvalRule, approvalsComplete, canApprove, canSetRole, grantDiff, reachOf, validateListing, type Actor } from "../src/marketplace/policy";
 import { REVOCATION_BUDGET_BYTES, REVOCATION_MEMO_MS } from "../src/marketplace/revocations";
 import { marketplaceRoutes } from "../src/marketplace/routes";
-import { AI_USAGE_MAX_TOKENS, CLIENT_REVISION, SCAN_POLICY, VALIDATOR, PROMPT_VERSION, SCAN_LEASE_MS, parseScanReport } from "../src/marketplace/scanning";
-import { AI_DAILY_NEURONS, AI_SCAN_WORST_CASE_NEURONS, dailyNeurons, neuronsFor } from "../src/marketplace/ai-budget";
+import { CLIENT_REVISION, REVIEW_POLICY } from "../src/marketplace/review";
 import { BodyLimitError, readLimited } from "../src/marketplace/uploads";
 import { OAUTH_STATE_MS, sealSignIn } from "../src/marketplace/oauth-state";
 import { MarketplaceStore, SESSION_OPS, anonymousResult, type MarketCall } from "../src/marketplace/store";
@@ -129,36 +128,11 @@ const upload = (browser: Browser, form: FormData) =>
   api("/submissions", { method: "POST", body: form, headers: { Cookie: browser.cookie, Origin: SITE, "X-Cinnabar-CSRF": browser.csrf } });
 
 /** Submits a component built from `grants` through the multipart upload route. */
-async function submit(browser: Browser, slug: string, version: string, grants: object, extra: object = {}, scan = true): Promise<Response> {
+async function submit(browser: Browser, slug: string, version: string, grants: object, extra: object = {}): Promise<Response> {
   const form = new FormData();
   form.set("listing", JSON.stringify({ slug, name: slug, summary: `A test mod called ${slug}.`, version, ...extra }));
   form.set("file", new File([component([["version", version], ["cinnabar:grants", JSON.stringify(grants)]])], `${slug}.wasm`));
-  const result = await upload(browser, form);
-  if (result.status === 200 && scan) await scanOne();
-  return result;
-}
-
-/** Scanner protocol helper. The full trusted validator is exercised separately by the Node scanner tests. */
-const scanner = (path: string, body?: unknown, lease?: string) => api(`/internal/marketplace/${path}`, {
-  method: "POST", headers: { Authorization: "Bearer test-scanner-token", "Content-Type": "application/json", ...(lease ? { "X-Scan-Lease": lease } : {}) },
-  body: body === undefined ? undefined : JSON.stringify(body),
-});
-/** Fetches a claimed job's file with the scanner credential and `lease`. */
-const scanFile = (job: any, sha256: string, lease: string = job.lease) => api(`/internal/marketplace/jobs/${job.id}/files/${sha256}`, {
-  headers: { Authorization: "Bearer test-scanner-token", "X-Scan-Lease": lease },
-});
-async function claim(): Promise<any> { return ((await (await scanner("claim")).json()) as any).job; }
-function report(job: any, extra: object = {}) {
-  return { sha256: job.sha256, policy: SCAN_POLICY, validator: VALIDATOR, client_revision: CLIENT_REVISION, deterministic: "pass", imports: [], exports: [],
-    media: job.media.map((m: { sha256: string }) => m.sha256), findings: [],
-    ai: { verdict: "clear", model: "test-model", prompt: PROMPT_VERSION, findings: [] }, ...extra };
-}
-async function scanOne(extra: object = {}): Promise<Response> {
-  const job = await claim();
-  expect(job).toBeTruthy();
-  const response = await scanner(`jobs/${job.id}/complete`, report(job, extra), job.lease);
-  expect(response.status, await response.clone().text()).toBe(200);
-  return response;
+  return upload(browser, form);
 }
 
 /** The owner promotes `username` to `role` (owners manage admins; admins manage moderators). */
@@ -419,19 +393,18 @@ describe("submission, review and delivery", () => {
 
 describe("upload and publication pipeline", () => {
   let creatorId = 2535400000006200n;
-  /** Create an explicitly established project with one human-approved baseline. */
-  async function established(slug: string, version = "1.0.0") {
+  /** Create a project from a fresh creator with one staff-approved release. */
+  async function approvedProject(slug: string, version = "1.0.0") {
     const owner = await signIn(OWNER, "OreKeeper");
     const username = `Creator${String(++creatorId).slice(-4)}`;
     const creator = await signIn(String(creatorId), username);
     const initial = await (await submit(creator, slug, version, { hud: true })).json() as { id: string };
     expect((await owner.post(`/staff/versions/${initial.id}/decision`, { decision: "approve" })).status).toBe(200);
-    expect((await owner.post(`/staff/mods/${slug}/trust`, { trusted: true, reason: "Established project reviewed by staff" })).status).toBe(200);
     return { owner, creator, initial, username };
   }
 
   it("persists original signed bytes across policy changes and store restarts", async () => {
-    const { initial } = await established("historical-signature", "8.7.41");
+    const { initial } = await approvedProject("historical-signature", "8.7.41");
     const original = await (await api("/mods/historical-signature")).json() as any;
     const historical = JSON.stringify({ ...JSON.parse(original.release.statement), policy: "historical-policy", client_revision: "a".repeat(40) });
     const signature = await signText(env.MARKETPLACE_SIGNING_KEY!, historical);
@@ -448,8 +421,8 @@ describe("upload and publication pipeline", () => {
     expect(await verifies(historical, signature)).toBe(true);
   });
 
-  it("holds legacy signatures without original statement bytes for fresh scanning and review", async () => {
-    const { initial, owner } = await established("missing-statement", "8.7.42");
+  it("holds legacy signatures without original statement bytes for a fresh review", async () => {
+    const { initial, owner } = await approvedProject("missing-statement", "8.7.42");
     await runInDurableObject(hub(), (_: Hub, state) => {
       state.storage.sql.exec("UPDATE mod_versions SET statement = NULL WHERE id = ?", Number(initial.id));
       state.storage.sql.exec("DELETE FROM market_schema WHERE version = 2");
@@ -457,8 +430,7 @@ describe("upload and publication pipeline", () => {
       expect(state.storage.sql.exec("SELECT 1 FROM mod_approvals WHERE version_id = ?", Number(initial.id)).toArray()).toHaveLength(0);
     });
     expect((await api("/mods/missing-statement")).status).toBe(404);
-    expect(await (await owner.get(`/staff/versions/${initial.id}`)).json()).toMatchObject({ status: "submitted", scan: { state: "queued" } });
-    await scanOne();
+    expect(await (await owner.get(`/staff/versions/${initial.id}`)).json()).toMatchObject({ status: "submitted" });
     expect((await owner.post(`/staff/versions/${initial.id}/decision`, { decision: "approve" })).status).toBe(200);
     expect((await api("/mods/missing-statement")).status).toBe(200);
   });
@@ -569,125 +541,72 @@ describe("upload and publication pipeline", () => {
     expect(await verifies(text, response.headers.get("X-Cinnabar-Signature")!)).toBe(true);
   });
 
-  it("authenticates uploads before reading bodies and gives scanner tokens no staff privileges", async () => {
+  it("authenticates uploads before reading bodies and no longer serves the scanner protocol", async () => {
     expect((await api("/submissions", { method: "POST", body: "invalid body" })).status).toBe(401);
-    expect((await api("/internal/marketplace/claim", { method: "POST" })).status).toBe(401);
+    expect((await api("/internal/marketplace/claim", { method: "POST", headers: { Authorization: "Bearer test-scanner-token" } })).status).toBe(404);
     expect((await api("/staff/queue", { headers: { Authorization: "Bearer test-scanner-token" } })).status).toBe(401);
     const creator = await signIn("2535400000006101", "Uploader");
     expect((await api("/submissions", { method: "POST", body: "invalid body", headers: { Cookie: creator.cookie } })).status).toBe(403);
   });
 
-  it("stores uploads in the file bucket and requires a current scan before approval", async () => {
+  it("stores uploads in the file bucket and publishes them on approval without an automated scan", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
     const creator = await signIn("2535400000006102", "PendingUploader");
-    const v = await (await submit(creator, "pending-mod", "1.0.0", { hud: true }, {}, false)).json() as any;
-    expect(v.scan.state).toBe("queued");
+    const v = await (await submit(creator, "pending-mod", "1.0.0", { hud: true })).json() as any;
+    expect(v).not.toHaveProperty("scan");
+    expect(v).not.toHaveProperty("trust");
     expect(await env.MOD_FILES.head(`mods/${v.sha256}`)).not.toBeNull();
     expect((await api(`/mods/assets/${v.sha256}`)).status).toBe(404);
     const staffFile = await owner.get(`/staff/versions/${v.id}/file`);
     expect(staffFile.status).toBe(200);
-    const bytes = await staffFile.arrayBuffer();
-    expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(409);
-    const job = await claim();
-    const file = await scanFile(job, v.sha256);
-    expect(file.status).toBe(200);
-    expect(await file.arrayBuffer()).toEqual(bytes);
-    expect((await scanFile(job, v.sha256, "wrong")).status).toBe(404);
-    const bad = report(job, { sha256: "0".repeat(64) });
-    expect((await scanner(`jobs/${job.id}/complete`, bad, job.lease)).status).toBe(422);
-    expect((await scanner(`jobs/${job.id}/complete`, report(job, { policy: "old-policy" }), job.lease)).status).toBe(422);
-    expect((await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).status).toBe(200);
-    const duplicate = await scanner(`jobs/${job.id}/complete`, report(job), job.lease);
-    expect(await duplicate.json()).toMatchObject({ duplicate: true });
-    expect((await api(`/mods/assets/${v.sha256}`)).status).toBe(404);
+    expect(new Uint8Array(await staffFile.arrayBuffer())).toEqual(new Uint8Array(await (await env.MOD_FILES.get(`mods/${v.sha256}`))!.arrayBuffer()));
     expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(200);
     expect((await api(`/mods/assets/${v.sha256}`)).status).toBe(200);
   });
 
-  it("automatically publishes a checked established update once and preserves its signed evidence", async () => {
-    const { creator } = await established("trusted-mod");
-    const v = await (await submit(creator, "trusted-mod", "1.0.1", { hud: true }, {}, false)).json() as any;
-    const job = await claim();
-    const result = await scanner(`jobs/${job.id}/complete`, report(job), job.lease);
-    expect(await result.json()).toMatchObject({ automatic: true });
-    const listing = await (await api("/mods/trusted-mod")).json() as any;
-    expect(listing).toMatchObject({ version: "1.0.1", publication: "automatic" });
-    expect(JSON.parse(listing.release.statement)).toMatchObject({ sha256: v.sha256, policy: SCAN_POLICY, scan_job: job.id, publication: "automatic" });
-    expect((await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).status).toBe(200);
-    const mine = await (await creator.get("/me/mods")).json() as any[];
-    expect(mine.filter(x => x.version === "1.0.1")).toHaveLength(1);
+  it("publishes every update only after a staff approval and no longer offers trust or rescans", async () => {
+    const { owner, creator } = await approvedProject("manual-update");
+    const update = await (await submit(creator, "manual-update", "1.0.1", { hud: true })).json() as any;
+    expect(await (await api("/mods/manual-update")).json()).toMatchObject({ version: "1.0.0" });
+    expect((await owner.post("/staff/mods/manual-update/trust", { trusted: true, reason: "Retired route" })).status).toBe(404);
+    expect((await owner.post(`/staff/versions/${update.id}/rescan`)).status).toBe(404);
+    expect((await owner.post(`/staff/versions/${update.id}/decision`, { decision: "approve" })).status).toBe(200);
+    const listing = await (await api("/mods/manual-update")).json() as any;
+    expect(listing).toMatchObject({ version: "1.0.1", publication: "manual" });
+    expect(listing).not.toHaveProperty("scan");
+    const statement = JSON.parse(listing.release.statement);
+    expect(statement).toMatchObject({ sha256: update.sha256, policy: REVIEW_POLICY, client_revision: CLIENT_REVISION, publication: "manual" });
+    expect(statement).not.toHaveProperty("scan_job");
   });
 
-  it("holds permission expansion, metadata changes, and new imports for a human", async () => {
-    const { creator } = await established("changed-mod");
-    for (const [version, grants, extra, scan] of [
-      ["1.1.0", { hud: true, players: true }, {}, {}],
-      ["1.2.0", { hud: true }, { summary: "A description staff have not seen yet." }, {}],
-      ["1.3.0", { hud: true }, {}, { imports: ["cinnabar:extension/hud@0.1.0"] }],
-    ] as const) {
-      await submit(creator, "changed-mod", version, grants, extra, false);
-      expect(await (await scanOne(scan)).json()).toMatchObject({ automatic: false });
-    }
-    expect(await (await api("/mods/changed-mod")).json()).toMatchObject({ version: "1.0.0" });
-  });
-
-  it("holds AI flags for explained human review and blocks errors or deterministic failures", async () => {
-    const { owner, creator } = await established("flagged-mod");
-    const v = await (await submit(creator, "flagged-mod", "1.1.0", { hud: true }, {}, false)).json() as any;
-    await scanOne({ ai: { verdict: "flag", model: "test-model", prompt: PROMPT_VERSION, findings: ["Suspicious string"] } });
-    expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(422);
-    expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve", note: "Reviewed the finding against the submitted artifact" })).status).toBe(200);
-    for (const [version, failure] of [
-      ["1.2.0", { deterministic: "block", findings: ["Unsupported host import"] }],
-      ["1.3.0", { ai: { verdict: "error", model: "test-model", prompt: PROMPT_VERSION, findings: ["Timed out"] } }],
-    ] as const) {
-      const failed = await (await submit(creator, "flagged-mod", version, { hud: true }, {}, false)).json() as any;
-      await scanOne(failure);
-      expect((await owner.post(`/staff/versions/${failed.id}/decision`, { decision: "approve", note: "Cannot bypass checks" })).status).toBe(409);
-    }
-  });
-
-  it("rechecks revoked trust, open reports, suspension and the exact baseline at completion", async () => {
-    const { owner, creator, initial, username } = await established("revoked-mod");
-    await submit(creator, "revoked-mod", "1.1.0", { hud: true }, {}, false);
-    const job = await claim();
-    await owner.post("/staff/mods/revoked-mod/trust", { trusted: false, reason: "Incident under review" });
-    expect(await (await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).json()).toMatchObject({ automatic: false });
-    await owner.post("/staff/mods/revoked-mod/trust", { trusted: true, reason: "New review completed" });
-    await submit(creator, "revoked-mod", "1.2.0", { hud: true }, {}, false);
-    const nextJob = await claim();
-    const reporter = await signIn("2535400000006103", "IncidentReporter");
-    await reporter.post("/mods/revoked-mod/reports", { reason: "malicious", details: "Please check this suspicious behavior." });
-    expect(await (await scanner(`jobs/${nextJob.id}/complete`, report(nextJob), nextJob.lease)).json()).toMatchObject({ automatic: false });
-    await owner.post(`/staff/versions/${initial.id}/pull`, { reason: "Withdrawn during investigation" });
-    expect((await api("/mods/revoked-mod")).status).toBe(404);
-    await owner.post("/staff/people/suspend", { username, suspended: true, reason: "Incident under review" });
-    expect((await submit(creator, "revoked-mod", "1.3.0", { hud: true })).status).toBe(403);
+  it("returns releases the retired scanner queued for automatic publication to staff review", async () => {
+    const { owner, creator, initial } = await approvedProject("queued-automatic");
+    const pending = await (await submit(creator, "queued-automatic", "1.0.1", { hud: true })).json() as any;
+    await runInDurableObject(hub(), (_: Hub, state) => {
+      const sql = state.storage.sql;
+      // Model a store from before this upgrade: an automatic release already published and another queued behind it.
+      sql.exec("UPDATE mod_pipeline SET publish_mode = 'automatic' WHERE version_id IN (?, ?)", Number(initial.id), Number(pending.id));
+      sql.exec("UPDATE mod_versions SET note = 'Established creator; checks passed', decided_at = ? WHERE id = ?", Date.now(), Number(pending.id));
+      sql.exec("CREATE TABLE IF NOT EXISTS scan_ai_days (day INTEGER PRIMARY KEY, neurons INTEGER NOT NULL DEFAULT 0, paused INTEGER NOT NULL DEFAULT 0)");
+      sql.exec("DELETE FROM market_schema WHERE version = 12");
+      const store = new MarketplaceStore(sql, new Set([`${OWNER}@test.invalid`]));
+      expect(sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'scan_ai_days'").toArray()).toHaveLength(0);
+      expect(store.publicationReady(Number(pending.id))).toBeNull();
+      expect(store.pendingPublications()).not.toContain(Number(pending.id));
+    });
+    expect(await (await owner.get(`/staff/versions/${pending.id}`)).json()).toMatchObject({ status: "submitted", publication: null, note: "", decided_at: null });
+    const history = (await (await api("/mods/queued-automatic")).json() as any).history;
+    expect(history).toEqual([expect.objectContaining({ version: "1.0.0", publication: "automatic" })]);
+    expect((await owner.post(`/staff/versions/${pending.id}/decision`, { decision: "approve" })).status).toBe(200);
+    expect(await (await api("/mods/queued-automatic")).json()).toMatchObject({ version: "1.0.1", publication: "manual" });
   });
 
   it("does not replace approved listing text with an unreviewed edit", async () => {
-    const { creator, owner } = await established("snapshot-mod");
+    const { creator, owner } = await approvedProject("snapshot-mod");
     const edit = await (await submit(creator, "snapshot-mod", "2.0.0", { hud: true }, { description: "Unreviewed text", name: "Changed name" })).json() as any;
     expect(await (await api("/mods/snapshot-mod")).json()).toMatchObject({ name: "snapshot-mod", description: "", version: "1.0.0" });
     await owner.post(`/staff/versions/${edit.id}/decision`, { decision: "approve" });
     expect(await (await api("/mods/snapshot-mod")).json()).toMatchObject({ name: "Changed name", description: "Unreviewed text", version: "2.0.0" });
-  });
-
-  it("reclaims expired leases, rejects stale completion and exhausts retries into a hold", async () => {
-    const owner = await signIn(OWNER, "OreKeeper");
-    const creator = await signIn("2535400000006104", "RetryCreator");
-    const v = await (await submit(creator, "retry-mod", "1.0.0", { hud: true }, {}, false)).json() as any;
-    const first = await claim();
-    const expire = () => runInDurableObject(hub(), (_: Hub, state) => { state.storage.sql.exec("UPDATE mod_pipeline SET lease_until = ? WHERE version_id = ?", Date.now() - SCAN_LEASE_MS, Number(v.id)); });
-    await expire();
-    const second = await claim();
-    expect(second.lease).not.toBe(first.lease);
-    expect((await scanner(`jobs/${first.id}/complete`, report(first), first.lease)).status).toBe(409);
-    await expire(); await claim(); await expire();
-    expect(await claim()).toBeNull();
-    expect(await (await owner.get(`/staff/versions/${v.id}`)).json()).toMatchObject({ scan: { state: "failed", attempts: 3 } });
-    expect((await owner.post(`/staff/versions/${v.id}/rescan`)).status).toBe(200);
-    expect((await claim()).id).not.toBe(first.id);
   });
 
   it("recovers publication after a stored file is restored without exposing an unsigned release", async () => {
@@ -705,27 +624,23 @@ describe("upload and publication pipeline", () => {
     expect((await api("/mods/recovery-mod")).status).toBe(200);
   });
 
-  it("holds a concurrently scanned update whose approved baseline changed", async () => {
-    const { creator } = await established("parallel-mod");
-    await submit(creator, "parallel-mod", "1.0.1", { hud: true }, {}, false);
-    await submit(creator, "parallel-mod", "1.0.2", { hud: true }, {}, false);
-    const first = await claim(); const second = await claim();
-    expect(await (await scanner(`jobs/${first.id}/complete`, report(first), first.lease)).json()).toMatchObject({ automatic: true });
-    expect(await (await scanner(`jobs/${second.id}/complete`, report(second), second.lease)).json()).toMatchObject({ automatic: false });
-    expect(await (await api("/mods/parallel-mod")).json()).toMatchObject({ version: "1.0.1" });
-  });
-
-  it("rechecks trust after signing work and cannot commit an old publication ticket", async () => {
-    const { creator } = await established("race-mod");
-    const v = await (await submit(creator, "race-mod", "1.0.1", { hud: true }, {}, false)).json() as any;
+  it("rechecks listing visibility after signing work and cannot commit an old publication ticket", async () => {
+    const { creator } = await approvedProject("race-mod");
+    const v = await (await submit(creator, "race-mod", "1.0.1", { hud: true })).json() as any;
     await runInDurableObject(hub(), (_: Hub, state) => {
-      const store = new MarketplaceStore(state.storage.sql, new Set([`${OWNER}@test.invalid`]), dailyNeurons(env.SCAN_AI_DAILY_NEURONS));
-      const job = (store.claimScan(Date.now()).body as any).job;
-      expect(store.completeScan(job.id, job.lease, report(job), Date.now()).approved).toBe(Number(v.id));
-      const candidate = store.publicationReady(Number(v.id), Date.now())!;
+      const sql = state.storage.sql;
+      const store = new MarketplaceStore(sql, new Set([`${OWNER}@test.invalid`]));
+      // Record a complete approval without going through the Hub, which would sign and publish it at once.
+      sql.exec(`INSERT INTO mod_approvals (version_id, account_id, admin, at)
+        SELECT ?, account_id, 1, ? FROM identities WHERE provider = 'google' AND subject = ?`, Number(v.id), Date.now(), OWNER);
+      sql.exec("UPDATE mod_pipeline SET publish_mode = 'manual' WHERE version_id = ?", Number(v.id));
+      const candidate = store.publicationReady(Number(v.id))!;
       expect(candidate).not.toBeNull();
-      state.storage.sql.exec("DELETE FROM mod_trust WHERE slug = ?", "race-mod");
+      sql.exec("UPDATE mod_listings SET hidden = 1 WHERE slug = ?", "race-mod");
       expect(store.publish(Number(v.id), candidate.statement, "signature-from-outdated-ticket", Date.now())).toBe(false);
+      sql.exec("UPDATE mod_listings SET hidden = 0 WHERE slug = ?", "race-mod");
+      sql.exec("DELETE FROM mod_approvals WHERE version_id = ?", Number(v.id));
+      sql.exec("UPDATE mod_pipeline SET publish_mode = NULL WHERE version_id = ?", Number(v.id));
     });
     expect(await (await api("/mods/race-mod")).json()).toMatchObject({ version: "1.0.0" });
   });
@@ -760,21 +675,15 @@ describe("upload and publication pipeline", () => {
     expect((await api("/mods/icon-mod")).status).toBe(404);
     expect(await (await owner.get(`/staff/versions/${first.id}`)).json()).toMatchObject({ icon: first.icon });
     expect(await (await creator.get("/me/mods")).json()).toEqual(expect.arrayContaining([expect.objectContaining({ id: first.id, icon: first.icon })]));
-    const job = await claim();
-    expect(job.media).toHaveLength(5);
-    expect(job.media.find((item: any) => item.role === "icon")).toMatchObject({ sha256: hash, bytes: firstPng.length, type: "image/png" });
-    const scanIcon = await scanFile(job, hash);
-    expect(scanIcon.headers.get("Content-Type")).toBe("image/png");
-    expect(new Uint8Array(await scanIcon.arrayBuffer())).toEqual(firstPng);
-    expect((await scanner(`jobs/${job.id}/complete`, report(job, { media: job.media.slice(0, 4).map((m: any) => m.sha256) }), job.lease)).status).toBe(422);
-    expect((await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).status).toBe(200);
     expect((await owner.post(`/staff/versions/${first.id}/decision`, { decision: "approve" })).status).toBe(200);
     const publicIcon = `/v1/mods/media/${hash}`;
     const firstPublic = await (await api("/mods/icon-mod")).json() as any;
     expect(firstPublic.icon).toBe(publicIcon);
     expect(firstPublic.gallery).toHaveLength(4);
     expect(firstPublic.icon_error).toBeUndefined();
-    expect(JSON.parse(firstPublic.release.statement).media).toEqual(job.media);
+    const signedMedia = JSON.parse(firstPublic.release.statement).media;
+    expect(signedMedia).toHaveLength(5);
+    expect(signedMedia.find((item: any) => item.role === "icon")).toMatchObject({ sha256: hash, bytes: firstPng.length, type: "image/png" });
     expect(await (await api("/mods")).json()).toEqual(expect.arrayContaining([expect.objectContaining({ slug: "icon-mod", icon: publicIcon })]));
     const publicImage = await api(publicIcon.slice(3));
     expect(publicImage.status).toBe(200);
@@ -791,7 +700,6 @@ describe("upload and publication pipeline", () => {
     expect((await creator.get(second.icon.slice(3))).status).toBe(200);
     expect(await (await api("/mods/icon-mod")).json()).toMatchObject({ version: "1.0.0", icon: publicIcon });
     expect(await (await api("/mods")).json()).toEqual(expect.arrayContaining([expect.objectContaining({ slug: "icon-mod", icon: publicIcon })]));
-    await scanOne();
     expect(await (await api("/mods/icon-mod")).json()).toMatchObject({ version: "1.0.0", icon: publicIcon });
     expect((await owner.post(`/staff/versions/${second.id}/decision`, { decision: "approve" })).status).toBe(200);
     expect(await (await api("/mods/icon-mod")).json()).toMatchObject({ version: "1.0.1", icon: secondPublicIcon, gallery: [] });
@@ -799,7 +707,6 @@ describe("upload and publication pipeline", () => {
 
     const missing = await uploadIcon("1.0.2", null);
     expect(missing).toMatchObject({ icon: null, icon_error: null });
-    await scanOne();
     expect((await owner.post(`/staff/versions/${missing.id}/decision`, { decision: "approve" })).status).toBe(200);
     expect(await (await api("/mods/icon-mod")).json()).toMatchObject({ version: "1.0.2", icon: null, gallery: [] });
     // Withdrawal uses the same indexed visibility checks as gallery media.
@@ -819,7 +726,6 @@ describe("upload and publication pipeline", () => {
     expect(version).toMatchObject({ icon: null, icon_error: "The icon is not a PNG.", gallery: [] });
     expect(await (await owner.get(`/staff/versions/${version.id}`)).json()).toMatchObject({ icon: null, icon_error: version.icon_error });
     expect(await (await creator.get("/me/mods")).json()).toEqual(expect.arrayContaining([expect.objectContaining({ id: version.id, icon_error: version.icon_error })]));
-    await scanOne();
     expect((await owner.post(`/staff/versions/${version.id}/decision`, { decision: "approve" })).status).toBe(200);
     const listing = await (await api("/mods/bad-icon-mod")).json() as any;
     expect(listing.icon).toBeNull();
@@ -827,21 +733,21 @@ describe("upload and publication pipeline", () => {
     expect(JSON.parse(listing.release.statement).media).toEqual([]);
   });
 
-  it("stores images with components, binds their hashes to scans and publishes after approval", async () => {
+  it("stores images with components and publishes them after approval", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
     const creator = await signIn("2535400000006106", "ImageCreator");
     const form = new FormData();
     form.set("listing", JSON.stringify({ slug: "image-mod", name: "Image mod", summary: "A mod with a screenshot.", version: "1.0.0",
       category: "Interface", license: "MIT", notes: "Initial screenshot release" }));
     form.set("file", new File([component([["cinnabar:grants", "{}"]])], "image-mod.wasm"));
-    // Public synthetic 1x1 raster; actual full image decoding is tested by the scanner suite.
+    // Public synthetic 1x1 raster.
     const png = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aOioAAAAASUVORK5CYII="), c => c.charCodeAt(0));
     form.append("images", new File([png], "Screenshot.png", { type: "image/png" }));
     form.set("image_metadata", JSON.stringify([{ caption: "HUD screenshot", alt: "Coordinates above the hotbar" }]));
     const result = await upload(creator, form);
     expect(result.status).toBe(200);
     const v = await result.json() as any;
-    expect(v).toMatchObject({ category: "Interface", license: "MIT", notes: "Initial screenshot release", icon: null, icon_error: null, scan: { review_ready: false } });
+    expect(v).toMatchObject({ category: "Interface", license: "MIT", notes: "Initial screenshot release", icon: null, icon_error: null });
     expect(v.gallery[0]).toMatchObject({ caption: "HUD screenshot", alt: "Coordinates above the hotbar" });
     const mediaHash = v.gallery[0].sha256;
     expect(await env.MOD_FILES.head(`media/${mediaHash}`)).not.toBeNull();
@@ -852,16 +758,11 @@ describe("upload and publication pipeline", () => {
     expect((await api(privatePath)).status).toBe(404);
     const stranger = await signIn("2535400000006108", "ImageStranger");
     expect((await stranger.get(privatePath)).status).toBe(404);
-    const job = await claim();
-    expect((await scanner(`jobs/${job.id}/complete`, report(job, { media: [] }), job.lease)).status).toBe(422);
-    expect((await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).status).toBe(200);
-    expect(await (await owner.get(`/staff/versions/${v.id}`)).json()).toMatchObject({ scan: { review_ready: true } });
     await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" });
     const publicView = await (await api("/mods/image-mod")).json() as any;
     expect(publicView).toMatchObject({ license: "MIT", category: "Interface", status: "approved", grants: {},
-      history: [{ notes: "Initial screenshot release", publication: "manual" }], scan: { report: { deterministic: "pass" } } });
-    expect(publicView.scan.report.findings).toBeUndefined();
-    expect(publicView.scan.job).toBeUndefined();
+      history: [{ notes: "Initial screenshot release", publication: "manual" }] });
+    expect(publicView).not.toHaveProperty("scan");
     const image = await api(`/mods/media/${mediaHash}`);
     expect(image.status).toBe(200); expect(image.headers.get("Content-Type")).toBe("image/png");
     expect(image.headers.get("X-Content-Type-Options")).toBe("nosniff");
@@ -870,20 +771,10 @@ describe("upload and publication pipeline", () => {
     expect((await api(`/mods/media/${mediaHash}`)).status).toBe(404);
   });
 
-  it("holds expired trust and refuses manual approval of an expired scan", async () => {
-    const { creator, owner } = await established("expiry-mod");
-    const v = await (await submit(creator, "expiry-mod", "1.0.1", { hud: true }, {}, false)).json() as any;
-    await runInDurableObject(hub(), (_: Hub, state) => { state.storage.sql.exec("UPDATE mod_trust SET expires_at = 0 WHERE slug = ?", "expiry-mod"); });
-    expect(await (await scanOne()).json()).toMatchObject({ automatic: false });
-    await runInDurableObject(hub(), (_: Hub, state) => { state.storage.sql.exec("UPDATE mod_pipeline SET completed_at = 0 WHERE version_id = ?", Number(v.id)); });
-    expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(409);
-    expect(await (await api("/mods/expiry-mod")).json()).toMatchObject({ version: "1.0.0" });
-  });
-
-  it("upgrades pre-pipeline releases without moving stored files and retains access across rescans", async () => {
+  it("upgrades pre-pipeline releases without moving stored files and holds them for a fresh review", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
     const creator = await signIn("2535400000006107", "LegacyCreator");
-    const v = await (await submit(creator, "legacy-mod", "0.9.7", { hud: true }, {}, false)).json() as any;
+    const v = await (await submit(creator, "legacy-mod", "0.9.7", { hud: true })).json() as any;
     const key = `mods/${v.sha256}`;
     const bytes = await (await env.MOD_FILES.get(key))!.arrayBuffer();
     await runInDurableObject(hub(), (_: Hub, state) => {
@@ -895,12 +786,8 @@ describe("upload and publication pipeline", () => {
       new MarketplaceStore(state.storage.sql, new Set([`${OWNER}@test.invalid`]));
     });
     expect((await api(`/mods/assets/${v.sha256}`)).status).toBe(404);
-    const rescan = await owner.post(`/staff/versions/${v.id}/rescan`);
-    expect(rescan.status).toBe(200);
-    const job = await claim();
-    const file = await scanFile(job, v.sha256);
+    const file = await owner.get(`/staff/versions/${v.id}/file`);
     expect(file.status).toBe(200); expect(await file.arrayBuffer()).toEqual(bytes);
-    expect((await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).status).toBe(200);
     expect((await owner.post(`/staff/versions/${v.id}/decision`, { decision: "approve" })).status).toBe(200);
     expect((await api("/mods/legacy-mod")).status).toBe(200);
   });
@@ -929,7 +816,7 @@ describe("marketplace revision-checked updates", () => {
       current_version: "1.0.0", current_sha256: installedHash, ...overrides })}`;
   }
   let creatorId = 2535400000008500n;
-  /** Publish a synthetic component through the real submission, scan and staff-signing paths. */
+  /** Publish a synthetic component through the real submission and staff-signing paths. */
   async function project(slug: string, versions = ["1.1.0"], apiRevisions: Record<string, string | null> = {}) {
     const owner = await signIn(OWNER, "OreKeeper");
     const username = `Updater${String(++creatorId).slice(-4)}`;
@@ -959,7 +846,7 @@ describe("marketplace revision-checked updates", () => {
     expect(Object.keys(body)).toEqual(["release"]);
     expect(Object.keys(body.release)).toEqual(["statement", "signature"]);
     expect(Object.keys(JSON.parse(body.release.statement))).toEqual(["approved_at", "approvers", "bytes", "grants", "sha256",
-      "slug", "version", "metadata", "media", "policy", "client_revision", "scan_job", "publication", "api_revision"]);
+      "slug", "version", "metadata", "media", "policy", "client_revision", "publication", "api_revision"]);
     expect(await verifies(body.release.statement, body.release.signature)).toBe(true);
     expect(JSON.parse(body.release.statement)).toMatchObject({ slug: "update-selection", version: "1.10.0",
       sha256: releases[1]!.sha256, api_revision: revision() });
@@ -1004,7 +891,6 @@ describe("marketplace revision-checked updates", () => {
       ["UPDATE mod_versions SET status = 'submitted' WHERE id = ?", "UPDATE mod_versions SET status = 'approved' WHERE id = ?"],
       ["UPDATE mod_versions SET signature = NULL WHERE id = ?", ""],
       ["UPDATE mod_versions SET statement = NULL WHERE id = ?", ""],
-      ...["queued", "running", "failed"].map(value => [`UPDATE mod_pipeline SET state = '${value}' WHERE version_id = ?`, "UPDATE mod_pipeline SET state = 'complete' WHERE version_id = ?"]),
     ];
     const original = await (await api(`/mods/update-gates/releases/1.2.0/${releases[1]!.sha256}`)).json() as any;
     for (const [disable, restore] of gates) {
@@ -1057,26 +943,18 @@ describe("marketplace revision-checked updates", () => {
     expect((await api(updateUrl("update-legacy"))).status).toBe(204);
   });
 
-  it("records submission compatibility and refreshes it only when a current scan completes", async () => {
+  it("records the pinned API revision at submission and signs it on approval", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
     const creator = await signIn(String(++creatorId), "PendingUpdater");
-    const submitted = await submit(creator, "update-scan-pin", "1.1.0", { hud: true }, {}, false);
+    const submitted = await submit(creator, "update-submission-pin", "1.1.0", { hud: true });
     expect(submitted.status).toBe(200);
     const { id } = await submitted.json() as { id: string };
     await runInDurableObject(hub(), (_: Hub, state) => {
-      const sql = state.storage.sql;
-      expect(sql.exec<{ api_revision: string }>("SELECT api_revision FROM mod_versions WHERE id = ?", Number(id)).one().api_revision).toBe(revision());
-      sql.exec("UPDATE mod_versions SET api_revision = ? WHERE id = ?", unknownRevision, Number(id));
+      expect(state.storage.sql.exec<{ api_revision: string }>("SELECT api_revision FROM mod_versions WHERE id = ?", Number(id)).one().api_revision).toBe(revision());
     });
-    expect((await api(updateUrl("update-scan-pin"))).status).toBe(204);
-    const job = await claim();
-    expect((await scanner(`jobs/${job.id}/complete`, report(job, { client_revision: unknownRevision }), job.lease)).status).toBe(422);
-    await runInDurableObject(hub(), (_: Hub, state) => {
-      expect(state.storage.sql.exec<{ api_revision: string }>("SELECT api_revision FROM mod_versions WHERE id = ?", Number(id)).one().api_revision).toBe(unknownRevision);
-    });
-    expect((await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).status).toBe(200);
+    expect((await api(updateUrl("update-submission-pin"))).status).toBe(204);
     expect((await owner.post(`/staff/versions/${id}/decision`, { decision: "approve" })).status).toBe(200);
-    const selected = await (await api(updateUrl("update-scan-pin"))).json() as any;
+    const selected = await (await api(updateUrl("update-submission-pin"))).json() as any;
     expect(JSON.parse(selected.release.statement).api_revision).toBe(revision());
     expect(await verifies(selected.release.statement, selected.release.signature)).toBe(true);
   });
@@ -1220,24 +1098,9 @@ describe("moderation input and targeting", () => {
     expect(reports.filter((r) => r.slug === "report-gates")).toEqual([]);
   });
 
-  it("forbids staff from rescanning their own pending release", async () => {
-    const owner = await signIn(OWNER, "OreKeeper");
-    const creator = await signIn("2535400000007131", "StaffCreator");
-    await promote(owner, "StaffCreator", "moderator");
-    const v = await (await submit(creator, "self-rescan", "1.0.0", { hud: true })).json() as { id: string };
-    const own = await creator.post(`/staff/versions/${v.id}/rescan`);
-    expect(own.status).toBe(403);
-    expect(await (await owner.get(`/staff/versions/${v.id}`)).json()).toMatchObject({ scan: { state: "complete" } });
-    expect((await owner.post(`/staff/versions/${v.id}/rescan`)).status).toBe(200);
-  });
 });
 
 describe("staff conflicts, public load and revocation limits", () => {
-  // Earlier tests can leave jobs queued, such as a requested rescan; scanOne claims the oldest job.
-  beforeAll(async () => {
-    for (let job = await claim(); job; job = await claim()) await scanner(`jobs/${job.id}/complete`, report(job), job.lease);
-  });
-
   it("refuses staff hiding, restoring or resolving reports on their own mod, and leaves restoring to admins", async () => {
     const owner = await signIn(OWNER, "OreKeeper");
     const admin = await signIn("2535400000008001", "ConflictAdmin");
@@ -1259,15 +1122,13 @@ describe("staff conflicts, public load and revocation limits", () => {
     expect((await hide(admin, { hidden: false, reason: "Administrative review completed" })).status).toBe(200);
     expect((await api("/mods/conflict-mod")).status).toBe(200);
 
-    // An open report holds the creator's trusted updates; they can't clear it themselves.
-    expect((await owner.post("/staff/mods/conflict-mod/trust", { trusted: true, reason: "Re-established after review" })).status).toBe(200);
+    // Creators can't clear reports about their own mod, and their updates still wait for staff.
     const reporter = await signIn("2535400000008004", "ConflictReporter");
     expect((await reporter.post("/mods/conflict-mod/reports", { reason: "malicious", details: "It sends my inventory somewhere." })).status).toBe(200);
     const reportId = (await (await owner.get("/staff/reports")).json() as { id: string; slug: string }[]).find(r => r.slug === "conflict-mod")!.id;
     expect((await creator.post(`/staff/reports/${reportId}/resolve`, { note: "Not malicious" })).status).toBe(403);
     expect((await (await owner.get("/staff/reports")).json() as { id: string; status: string }[]).find(r => r.id === reportId)!.status).toBe("open");
-    await submit(creator, "conflict-mod", "1.0.1", { hud: true }, {}, false);
-    expect(await (await scanOne()).json()).toMatchObject({ automatic: false });
+    expect((await submit(creator, "conflict-mod", "1.0.1", { hud: true })).status).toBe(200);
     expect(await (await api("/mods/conflict-mod")).json()).toMatchObject({ version: "1.0.0", version_id: v.id });
     expect((await reviewer.post(`/staff/reports/${reportId}/resolve`, { note: "Checked the network calls" })).status).toBe(200);
   });
@@ -1279,31 +1140,9 @@ describe("staff conflicts, public load and revocation limits", () => {
       expect(validateListing({ slug, name: slug, summary: "A reserved slug fixture.", version: "1.0.0" }).errors.slug, slug).toBeTruthy();
     }
     const creator = await signIn("2535400000008011", "ReservedCreator");
-    const refused = await submit(creator, "revocations", "1.0.0", { hud: true }, {}, false);
+    const refused = await submit(creator, "revocations", "1.0.0", { hud: true });
     expect(refused.status).toBe(422);
     expect(await refused.json()).toMatchObject({ fields: { slug: expect.any(String) } });
-  });
-
-  it("stops automatic publication once the granting admin is demoted or suspended", async () => {
-    const owner = await signIn(OWNER, "OreKeeper");
-    const granter = await signIn("2535400000008021", "TrustGranter");
-    await promote(owner, "TrustGranter", "admin");
-    const { creator } = await published(owner, "2535400000008022", "granted-mod");
-    expect((await granter.post("/staff/mods/granted-mod/trust", { trusted: true, reason: "Reviewed the project history" })).status).toBe(200);
-    const update = async (version: string) => {
-      const v = await (await submit(creator, "granted-mod", version, { hud: true }, {}, false)).json() as { id: string };
-      return { id: v.id, automatic: (await (await scanOne()).json() as { automatic: boolean }).automatic };
-    };
-    expect((await update("1.0.1")).automatic).toBe(true);
-    await promote(owner, "TrustGranter", "moderator");
-    const held = await update("1.0.2");
-    expect(held.automatic).toBe(false);
-    expect(await (await owner.get(`/staff/versions/${held.id}`)).json()).toMatchObject({ trust: { trusted: false } });
-    await promote(owner, "TrustGranter", "admin");
-    expect((await update("1.0.3")).automatic).toBe(true);
-    expect((await owner.post("/staff/people/suspend", { username: "TrustGranter", suspended: true, reason: "Account compromised" })).status).toBe(200);
-    expect((await update("1.0.4")).automatic).toBe(false);
-    expect(await (await api("/mods/granted-mod")).json()).toMatchObject({ version: "1.0.3" });
   });
 
   it("authorizes public screenshots exactly as before, through a digest index", async () => {
@@ -1319,7 +1158,6 @@ describe("staff conflicts, public load and revocation limits", () => {
       const png = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, ...new TextEncoder().encode(`indexed-media ${version}`)]);
       form.append("images", new File([png], "screenshot.png", { type: "image/png" }));
       const v = await (await upload(creator, form)).json() as { id: string; sha256: string; gallery: { sha256: string }[] };
-      await scanOne();
       return { id: v.id, sha256: v.sha256, image: v.gallery[0]!.sha256 };
     };
     const status = async (image: string) => (await api(`/mods/media/${image}`)).status;
@@ -1582,10 +1420,9 @@ describe("anonymous load, sign-in state and moderation probes", () => {
       ["/auth/signout", { method: "POST" }, "signout"], ["/me/username", json("POST", { username: "AnonPlayer" }), "username"],
       ["/staff/queue", undefined, "queue"], ["/staff/reports", undefined, "reports"], ["/staff/people", undefined, "people"],
       ["/staff/audit", undefined, "audit"], ["/staff/versions/1", undefined, "version"], ["/staff/versions/1/file", undefined, "version"],
-      ["/staff/versions/1/rescan", { method: "POST" }, "rescan"], ["/staff/versions/1/decision", json("POST", { decision: "approve" }), "decide"],
+      ["/staff/versions/1/decision", json("POST", { decision: "approve" }), "decide"],
       ["/staff/versions/1/pull", json("POST"), "pull"], ["/staff/reports/1/resolve", json("POST", { note: "Probe" }), "resolve"],
       ["/staff/mods/anonymous-probe/hide", json("POST", { hidden: true, reason: "Probe" }), "hide"],
-      ["/staff/mods/anonymous-probe/trust", json("POST", { trusted: true, reason: "Probe" }), "trust"],
       ["/staff/people/role", json("POST", { username: "OreKeeper", role: "player", reason: "Probe" }), "role"],
       ["/staff/people/suspend", json("POST", { username: "OreKeeper", suspended: true, reason: "Probe" }), "suspend"],
       ["/mods/anonymous-probe/send", { method: "POST" }, "send"],
@@ -1666,7 +1503,6 @@ describe("anonymous load, sign-in state and moderation probes", () => {
     expect(await (await creator.get("/me/mods")).json()).toEqual([]);
     const withAssets = await send("asset-heavy", sizedComponent(MAX_EXECUTABLE_BYTES + sectionSize(notices, asset), [[notices, asset]]));
     expect(withAssets.status, await withAssets.clone().text()).toBe(200);
-    await scanOne();
   });
 });
 
@@ -1693,141 +1529,5 @@ describe("listing addresses", () => {
     expect(listing({ name: "No source" }).errors.source).toBeUndefined();
     expect(listing({ name: "Bad source", source: "None" }).errors.source).toBeTruthy();
     expect(listing({ name: "Good source", source: "https://github.com/RestartFU/cinnaroids" }).errors.source).toBeUndefined();
-  });
-});
-
-describe("scanner AI budget", () => {
-  const DAY = 86_400_000;
-  /** Neurons charged to the UTC day containing `at`. */
-  const charged = (sql: SqlStorage, at: number): number =>
-    sql.exec<{ neurons: number }>("SELECT neurons FROM scan_ai_days WHERE day = ?", Math.floor(at / DAY)).toArray()[0]?.neurons ?? 0;
-  /** A passing report for `job` carrying AI `usage`, or none like reports from older scanners. */
-  const reportWith = (job: any, usage?: unknown) =>
-    report(job, { ai: { verdict: "clear", model: "test-model", prompt: PROMPT_VERSION, findings: [], ...(usage ? { usage } : {}) } });
-  const NO_USAGE = { prompt_tokens: 0, completion_tokens: 0 };
-  /** Completes every job claimable at `at`, since the Hub's storage carries other tests' leftover jobs. */
-  const drainAt = (store: MarketplaceStore, at: number) => {
-    for (let job = (store.claimScan(at).body as any).job; job; job = (store.claimScan(at).body as any).job) {
-      store.completeScan(job.id, job.lease, reportWith(job, NO_USAGE), at);
-    }
-  };
-
-  it("prices usage with the default model's Neuron rates and reads the configured budget", () => {
-    expect(neuronsFor({ prompt_tokens: 1_000_000, completion_tokens: 0 })).toBe(26_668);
-    expect(neuronsFor({ prompt_tokens: 0, completion_tokens: 1_000_000 })).toBe(204_805);
-    expect(neuronsFor({ prompt_tokens: 0, completion_tokens: 0 })).toBe(0);
-    expect(neuronsFor({ prompt_tokens: 227_912, completion_tokens: 0 })).toBe(6078);
-    // 96 KiB of message bytes plus 2,048 template tokens in, 1,200 tokens out.
-    expect(AI_SCAN_WORST_CASE_NEURONS).toBe(2922);
-    expect(AI_DAILY_NEURONS).toBe(9000);
-    for (const value of [undefined, "", "abc", "0", "-5", "1.5", "1e4"]) expect(dailyNeurons(value)).toBe(9000);
-    expect(dailyNeurons("5000")).toBe(5000);
-    expect(dailyNeurons(" 7000 ")).toBe(7000);
-  });
-
-  it("accepts bounded token usage in scan reports and rejects malformed usage", () => {
-    const job = { sha256: "a".repeat(64), media: [] };
-    expect(parseScanReport(reportWith(job), job.sha256)!.ai).not.toHaveProperty("usage");
-    const usage = { prompt_tokens: 10, completion_tokens: AI_USAGE_MAX_TOKENS };
-    expect(parseScanReport(reportWith(job, usage), job.sha256)!.ai.usage).toEqual(usage);
-    for (const bad of [{ prompt_tokens: -1, completion_tokens: 0 }, { prompt_tokens: 1.5, completion_tokens: 0 },
-      { prompt_tokens: "10", completion_tokens: 0 }, { prompt_tokens: 0, completion_tokens: AI_USAGE_MAX_TOKENS + 1 },
-      { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }, { prompt_tokens: 0 }, [0, 0], 7]) {
-      expect(parseScanReport(reportWith(job, bad), job.sha256), JSON.stringify(bad)).toBeNull();
-    }
-    expect(parseScanReport(report(job, { ai: { verdict: "clear", model: "m", prompt: PROMPT_VERSION, findings: [], usage: null } }), job.sha256)).toBeNull();
-  });
-
-  it("charges each UTC day for reservations and reported usage, refusing claims that could exceed the default budget", async () => {
-    const creator = await signIn("2535400000007101", "BudgetCreator");
-    const day = Date.UTC(2030, 0, 1), noon = day + DAY / 2;
-    // Leftover jobs would be claimed first, so finish them on an earlier day.
-    await runInDurableObject(hub(), (_: Hub, state) => drainAt(new MarketplaceStore(state.storage.sql, new Set()), day - DAY));
-    for (const slug of ["budget-a", "budget-b", "budget-c"]) await submit(creator, slug, "1.0.0", { hud: true }, {}, false);
-    await runInDurableObject(hub(), (_: Hub, state) => {
-      const sql = state.storage.sql;
-      const store = new MarketplaceStore(sql, new Set());
-      const claimAt = (at: number) => store.claimScan(at).body as any;
-      const attempts = () => sql.exec<{ slug: string; attempts: number; state: string }>(`SELECT v.slug, p.attempts, p.state
-        FROM mod_pipeline p JOIN mod_versions v ON v.id = p.version_id WHERE v.slug LIKE 'budget-%' ORDER BY v.slug`).toArray();
-
-      const a = claimAt(noon).job;
-      expect(charged(sql, noon)).toBe(AI_SCAN_WORST_CASE_NEURONS);
-      expect(store.completeScan(a.id, a.lease, reportWith(a, { prompt_tokens: 227_912, completion_tokens: 0 }), noon + 1).status).toBe(200);
-      expect(charged(sql, noon)).toBe(6078);
-      // 6,078 used plus a 2,922 worst case is exactly the 9,000 budget.
-      const b = claimAt(noon + 2).job;
-      expect(b).toBeTruthy();
-      expect(charged(sql, noon)).toBe(AI_DAILY_NEURONS);
-      // The in-flight reservation counts, so a third claim could exceed the budget: it pauses without touching the job.
-      const before = attempts();
-      expect(claimAt(noon + 3)).toEqual({ job: null, paused: "daily_ai_budget", resumes_at: day + DAY });
-      expect(attempts()).toEqual(before);
-      expect(before[2]).toEqual({ slug: "budget-c", attempts: 0, state: "queued" });
-      // A report without usage keeps its worst-case charge.
-      expect(store.completeScan(b.id, b.lease, reportWith(b), noon + 4).status).toBe(200);
-      expect(charged(sql, noon)).toBe(AI_DAILY_NEURONS);
-      expect(claimAt(day + DAY - 1).paused).toBe("daily_ai_budget");
-
-      // The next UTC day starts empty. A lease that crosses midnight charges both days, then settles both.
-      const late = day + 2 * DAY - 60_000;
-      const c = claimAt(late).job;
-      expect(c).toBeTruthy();
-      expect(charged(sql, late)).toBe(AI_SCAN_WORST_CASE_NEURONS);
-      expect(charged(sql, late + 60_000)).toBe(AI_SCAN_WORST_CASE_NEURONS);
-      expect(store.completeScan(c.id, c.lease, reportWith(c, { prompt_tokens: 1000, completion_tokens: 10 }), late + 120_000).status).toBe(200);
-      expect([charged(sql, late), charged(sql, late + 60_000)]).toEqual([29, 29]);
-      expect(charged(sql, noon)).toBe(AI_DAILY_NEURONS);
-    });
-  });
-
-  it("reads the daily budget from SCAN_AI_DAILY_NEURONS", async () => {
-    const creator = await signIn("2535400000007103", "ConfiguredBudget");
-    await submit(creator, "configured-budget", "1.0.0", { hud: true }, {}, false);
-    const setCharged = (neurons: number) => runInDurableObject(hub(), (_: Hub, state) => {
-      state.storage.sql.exec("INSERT OR REPLACE INTO scan_ai_days (day, neurons, paused) VALUES (?, ?, 0)", Math.floor(Date.now() / DAY), neurons);
-    });
-    await setCharged(Number(env.SCAN_AI_DAILY_NEURONS) - AI_SCAN_WORST_CASE_NEURONS + 1);
-    expect(await (await scanner("claim")).json()).toMatchObject({ job: null, paused: "daily_ai_budget" });
-    await setCharged(Number(env.SCAN_AI_DAILY_NEURONS) - AI_SCAN_WORST_CASE_NEURONS);
-    const job = await claim();
-    expect(job).toBeTruthy();
-    // The Hub's storage outlives this test, so leave nothing claimed or charged behind.
-    expect((await scanner(`jobs/${job.id}/complete`, report(job), job.lease)).status).toBe(200);
-    await setCharged(0);
-  });
-
-  it("returns a refused job to the queue uncounted and pauses claims until the next UTC day", async () => {
-    const owner = await signIn(OWNER, "OreKeeper");
-    const creator = await signIn("2535400000007102", "ReleaseCreator");
-    for (let job = await claim(); job; job = await claim()) await scanner(`jobs/${job.id}/complete`, reportWith(job, NO_USAGE), job.lease);
-    const v = await (await submit(creator, "release-mod", "1.0.0", { hud: true }, {}, false)).json() as any;
-    const scan = async () => ((await (await owner.get(`/staff/versions/${v.id}`)).json()) as any).scan;
-    const job = await claim();
-    expect(job.version_id).toBe(Number(v.id));
-    expect((await scanner(`jobs/${job.id}/release`, undefined, "wrong-lease")).status).toBe(409);
-    expect((await scanner(`jobs/${job.id}/release`, { reason: "other" }, job.lease)).status).toBe(400);
-    // A capacity refusal requeues without pausing.
-    expect(await (await scanner(`jobs/${job.id}/release`, { reason: "capacity" }, job.lease)).json()).toEqual({ released: true, paused: false });
-    expect(await scan()).toMatchObject({ state: "queued", attempts: 0 });
-    const again = await claim();
-    expect(again.id).toBe(job.id);
-    expect(await scan()).toMatchObject({ state: "running", attempts: 1 });
-    // The default reason is a used-up daily allocation.
-    expect(await (await scanner(`jobs/${again.id}/release`, undefined, again.lease)).json()).toEqual({ released: true, paused: true });
-    expect((await scanner(`jobs/${again.id}/complete`, report(again), again.lease)).status).toBe(409);
-    expect(await scan()).toMatchObject({ state: "queued", attempts: 0 });
-    const tomorrow = (Math.floor(Date.now() / DAY) + 1) * DAY;
-    expect(await (await scanner("claim")).json()).toEqual({ job: null, paused: "daily_ai_budget", resumes_at: tomorrow });
-    expect(await scan()).toMatchObject({ state: "queued", attempts: 0 });
-    await runInDurableObject(hub(), (_: Hub, state) => {
-      const store = new MarketplaceStore(state.storage.sql, new Set());
-      const next = (store.claimScan(tomorrow).body as any).job;
-      expect(next.id).toBe(job.id);
-      expect(state.storage.sql.exec<{ attempts: number }>("SELECT attempts FROM mod_pipeline WHERE job_id = ?", job.id).one().attempts).toBe(1);
-      // The Hub's storage outlives this test, so finish the job and lift today's pause.
-      expect(store.completeScan(next.id, next.lease, report(next), tomorrow + 1).status).toBe(200);
-      state.storage.sql.exec("DELETE FROM scan_ai_days WHERE day = ?", Math.floor(Date.now() / DAY));
-    });
   });
 });

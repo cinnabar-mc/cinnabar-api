@@ -375,44 +375,6 @@ marketplaceRoutes.get("/me/mods/:id/media/:sha256", async c => {
     "X-Content-Type-Options": "nosniff", "Content-Security-Policy": IMAGE_CSP });
 });
 
-marketplaceRoutes.post("/staff/versions/:id/rescan", async c => {
-  const target = id(c.req.param("id"));
-  return target === null ? c.notFound() : forward(c, { op: "rescan", id: target });
-});
-marketplaceRoutes.post("/staff/mods/:slug/trust", (c) =>
-  forwardJson(c, "Send JSON.", (body) => ({ op: "trust", slug: c.req.param("slug"), body })));
-
-/** Scanner credentials authorize only this internal job protocol, never marketplace staff operations. */
-marketplaceRoutes.use("/internal/marketplace/*", async (c, next) => {
-  c.header("Cache-Control", "no-store");
-  const secret = c.env.MARKETPLACE_SCANNER_TOKEN;
-  if (!secret) return c.json({ error: "Scanner is not configured." }, 503);
-  const presented = c.req.header("Authorization")?.replace(/^Bearer /, "") ?? "";
-  const a = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret)));
-  const b = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(presented)));
-  let different = 0;
-  for (let i = 0; i < a.length; i++) different |= a[i]! ^ b[i]!;
-  if (different !== 0) return c.json({ error: "Unauthorized." }, 401);
-  return next();
-});
-marketplaceRoutes.post("/internal/marketplace/claim", async c => reply(c, await call(c, { op: "scan-claim" })));
-marketplaceRoutes.get("/internal/marketplace/jobs/:job/files/:sha256", async c => {
-  const result = await call(c, { op: "scan-file", job: c.req.param("job"), lease: c.req.header("X-Scan-Lease") ?? "", sha256: c.req.param("sha256") });
-  if (result.status !== 200) return reply(c, result);
-  const { key, type } = result.body as { key: string; type: string };
-  return stream(c, key, { "Content-Type": type, "Cache-Control": "no-store" });
-});
-marketplaceRoutes.post("/internal/marketplace/jobs/:job/complete", async c => {
-  const body = await readJson(c);
-  if (body === null) return c.json({ error: "Send a bounded scan report." }, 400);
-  return reply(c, await call(c, { op: "scan-complete", job: c.req.param("job"), lease: c.req.header("X-Scan-Lease") ?? "", body }));
-});
-marketplaceRoutes.post("/internal/marketplace/jobs/:job/release", async c => {
-  const body = await readJson(c);
-  if (body === null) return c.json({ error: "Send an empty body or a JSON release reason." }, 400);
-  return reply(c, await call(c, { op: "scan-release", job: c.req.param("job"), lease: c.req.header("X-Scan-Lease") ?? "", body }));
-});
-
 const INVALID_REQUEST = "Send the request as JSON.";
 for (const [path, op] of [["/staff/versions/:id/decision", "decide"], ["/staff/versions/:id/pull", "pull"],
   ["/staff/reports/:id/resolve", "resolve"]] as const) {

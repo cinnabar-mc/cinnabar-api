@@ -9,8 +9,7 @@ import {
   type Reach, type ReviewState, type Role,
 } from "./policy";
 import { revocationBody, withinRevocationBudget, type RevokedRow } from "./revocations";
-import { API_REVISION, CLIENT_REVISION, MAX_SCAN_ATTEMPTS, SCAN_LEASE_MS, SCAN_MAX_AGE_MS, SCAN_POLICY, parseScanReport, scanReady, type ScanReport } from "./scanning";
-import { AI_DAILY_NEURONS, ScanBudget, neuronsFor } from "./ai-budget";
+import { API_REVISION, CLIENT_REVISION, REVIEW_POLICY } from "./review";
 
 export const PLAYER_SESSION_MS = 30 * 24 * 3_600_000;
 const STAFF_SESSION_MS = 12 * 3_600_000;
@@ -82,27 +81,26 @@ type ListingRow = {
 export interface MediaFile { sha256: string; bytes: number; type: "image/png" | "image/jpeg" | "image/webp"; caption: string; alt?: string; role?: "icon" }
 /** A submitted component already stored under its SHA-256, with the grants read from its bytes and its images. */
 export interface SubmittedFile { sha256: string; bytes: number; grants: Grants | null; media: MediaFile[]; iconError?: string | null }
+/**
+ * A version's immutable release snapshot. `automatic` marks releases published by the retired scanner;
+ * the columns that scanner used stay in the table but are no longer read.
+ */
 type PipelineRow = {
   version_id: number; metadata: string; media: string; icon_error: string | null; baseline: number | null;
-  job_id: string; state: "queued" | "running" | "complete" | "failed";
-  attempts: number; lease: string | null; lease_until: number | null;
-  report: string | null; completed_at: number | null; publish_mode: "manual" | "automatic" | "official" | null; promotion_attempt_at: number;
-  /** Worst-case Neurons charged by the current claim and when it was made, see `ScanBudget`. */
-  ai_reserved: number; ai_claimed_at: number | null;
+  job_id: string; completed_at: number | null; publish_mode: "manual" | "automatic" | "official" | null; promotion_attempt_at: number;
 };
 
 const ok = (body: unknown, extra: Partial<MarketResult> = {}): MarketResult => ({ status: 200, body, ...extra });
 const fail = (status: number, error: string, fields?: Record<string, string>): MarketResult =>
   ({ status, body: fields ? { error, fields } : { error } });
-const reportOf = (p: PipelineRow): ScanReport | null => p.report ? JSON.parse(p.report) as ScanReport : null;
 /** Parses stored JSON with every string value made well-formed, so legacy rows can't put lone surrogates in signed bodies. */
 const parseWellFormed = (json: string): unknown => JSON.parse(json, (_, value) => typeof value === "string" ? value.toWellFormed() : value);
 
 /** A version's listing snapshot; snapshots migrated from before category, license and notes read them as "". */
 const snapshotOf = (p: PipelineRow): ListingFields => ({ category: "", license: "", notes: "", ...JSON.parse(p.metadata) });
-/** Public versions have a signature and completed scan or recorded official approval; revoked official bytes stay withdrawn. */
+/** Public versions are approved and signed, official ones with a recorded official release; revoked official bytes stay withdrawn. */
 const PUBLISHED = `v.status = 'approved' AND v.signature IS NOT NULL AND v.statement IS NOT NULL AND v.pulled = 0
-  AND EXISTS (SELECT 1 FROM mod_pipeline p WHERE p.version_id = v.id AND p.state = 'complete'
+  AND EXISTS (SELECT 1 FROM mod_pipeline p WHERE p.version_id = v.id
     AND (COALESCE(p.publish_mode, '') != 'official' OR (v.slug = '${OFFICIAL_SLUG}' AND EXISTS
       (SELECT 1 FROM mod_official_releases o WHERE o.version_id = v.id))))
   AND NOT EXISTS (SELECT 1 FROM mod_versions revoked WHERE revoked.slug = '${OFFICIAL_SLUG}'
@@ -113,11 +111,7 @@ const PUBLISHED = `v.status = 'approved' AND v.signature IS NOT NULL AND v.state
  * approvals, reports, players' libraries and the staff audit log. Every rule the website shows is enforced here.
  */
 export class MarketplaceStore {
-  private readonly budget: ScanBudget;
-
-  /** `aiDailyNeurons` bounds the Workers AI Neurons scans may use per UTC day. */
-  constructor(private readonly sql: SqlStorage, private readonly owners: ReadonlySet<string>, aiDailyNeurons = AI_DAILY_NEURONS) {
-    this.budget = new ScanBudget(sql, aiDailyNeurons);
+  constructor(private readonly sql: SqlStorage, private readonly owners: ReadonlySet<string>) {
     for (const statement of [
       `CREATE TABLE IF NOT EXISTS market_accounts (xuid TEXT PRIMARY KEY, gamertag TEXT NOT NULL,
         role TEXT NOT NULL DEFAULT 'player', suspended INTEGER NOT NULL DEFAULT 0, seen_at INTEGER NOT NULL)`,
@@ -237,6 +231,14 @@ export class MarketplaceStore {
     migrate(11, "CREATE TABLE scan_ai_days (day INTEGER PRIMARY KEY, neurons INTEGER NOT NULL DEFAULT 0, paused INTEGER NOT NULL DEFAULT 0)",
       "ALTER TABLE mod_pipeline ADD COLUMN ai_reserved INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE mod_pipeline ADD COLUMN ai_claimed_at INTEGER");
+    // Staff now review every release by hand. Drop the AI ledger and return releases the retired scanner had queued
+    // for automatic publication to the review queue, clearing the decision it recorded on them. mod_trust stays for
+    // the record but no longer publishes anything.
+    migrate(12, "DROP TABLE IF EXISTS scan_ai_days",
+      `UPDATE mod_versions SET note = '', decided_at = NULL WHERE status = 'submitted' AND id IN
+        (SELECT version_id FROM mod_pipeline WHERE publish_mode = 'automatic')`,
+      `UPDATE mod_pipeline SET publish_mode = NULL WHERE publish_mode = 'automatic'
+        AND version_id IN (SELECT id FROM mod_versions WHERE status = 'submitted')`);
   }
 
   /** Increases whenever the set of pulled versions changes, so callers can tell a memoized revocation list is stale. */
@@ -543,7 +545,6 @@ export class MarketplaceStore {
   private publicListing(listing: ListingRow, live: VersionRow) {
     const p = this.pipeline(live.id)!;
     const metadata = snapshotOf(p);
-    const report = reportOf(p);
     const grants = JSON.parse(live.grants) as Grants;
     return {
       slug: listing.slug, name: metadata.name, summary: metadata.summary, description: metadata.description,
@@ -554,11 +555,6 @@ export class MarketplaceStore {
       capabilities: requestedCapabilities(grants), sha256: live.sha256, bytes: live.bytes,
       updated_at: live.decided_at, reviewed_by: this.approvals(live.id).map((a) => a.username).join(", "),
       publication: p.publish_mode,
-      // Public summaries omit private scanner findings and source evidence.
-      scan: { state: p.state, completed_at: p.completed_at, report: report ? {
-        deterministic: report.deterministic, policy: report.policy, validator: report.validator,
-        ai: { verdict: report.ai.verdict, model: report.ai.model, prompt: report.ai.prompt },
-      } : null },
       update_pending: this.sql.exec("SELECT 1 FROM mod_versions WHERE slug = ? AND status = 'submitted'", listing.slug)
         .toArray().length > 0,
     };
@@ -599,9 +595,9 @@ export class MarketplaceStore {
     const approvers = p.publish_mode === "official" ? [OFFICIAL_CREATOR] : this.approvals(v.id).map((a) => a.id);
     return JSON.stringify({ approved_at: v.decided_at, approvers, bytes: v.bytes, grants: parseWellFormed(v.grants), sha256: v.sha256,
       slug: v.slug, version: v.version, metadata: parseWellFormed(p.metadata), media: parseWellFormed(p.media),
-      policy: p.publish_mode === "official" ? OFFICIAL_POLICY : SCAN_POLICY,
+      policy: p.publish_mode === "official" ? OFFICIAL_POLICY : REVIEW_POLICY,
       client_revision: p.publish_mode === "official" ? this.officialManifest(versionId)!.manifest.host.revision : CLIENT_REVISION,
-      scan_job: p.job_id, publication: p.publish_mode,
+      publication: p.publish_mode,
       ...(v.api_revision === null ? {} : { api_revision: v.api_revision }) });
   }
 
@@ -630,7 +626,7 @@ export class MarketplaceStore {
 
   /** Atomically exposes a signed release after rechecking every gate following external I/O. */
   publish(versionId: number, statement: string, signature: string, now: number): boolean {
-    if (this.publicationReady(versionId, now)?.statement !== statement) return false;
+    if (this.publicationReady(versionId)?.statement !== statement) return false;
     this.sql.exec("UPDATE mod_versions SET status = 'approved', statement = ?, signature = ? WHERE id = ?", statement, signature, versionId);
     const v = this.versionRow(versionId)!;
     this.log("system", "published", `${v.slug} ${v.version}`, this.pipeline(versionId)!.publish_mode!, now);
@@ -780,14 +776,9 @@ export class MarketplaceStore {
     return ok({});
   }
 
-  /** Load the immutable release snapshot and its current scanner lease/evidence. */
+  /** Load the immutable release snapshot. */
   private pipeline(id: number): PipelineRow | undefined {
     return this.sql.exec<PipelineRow>("SELECT * FROM mod_pipeline WHERE version_id = ?", id).toArray()[0];
-  }
-
-  /** Whether a version's scan completed under the current policy and is still recent enough to act on. */
-  private scanPassed(p: PipelineRow, now: number): boolean {
-    return p.state === "complete" && scanReady(reportOf(p), p.completed_at, now);
   }
 
   /** Media descriptors belong to the immutable version, not mutable listing metadata. */
@@ -825,128 +816,17 @@ export class MarketplaceStore {
       .toArray().length > 0;
   }
 
-  /**
-   * SQL jobs are a transactional outbox: creation commits with the version, independent of scanner availability.
-   * When the day's AI budget can't cover another worst-case scan, answers `{job: null, paused, resumes_at}` and
-   * leaves every job and attempt count unchanged.
-   */
-  claimScan(now: number): MarketResult {
-    this.sql.exec(`UPDATE mod_pipeline SET state = 'failed', lease = NULL, lease_until = NULL
-      WHERE state IN ('queued', 'running') AND attempts >= ? AND (lease_until IS NULL OR lease_until <= ?)`, MAX_SCAN_ATTEMPTS, now);
-    const p = this.sql.exec<PipelineRow>(`SELECT p.* FROM mod_pipeline p JOIN mod_versions v ON v.id = p.version_id
-      WHERE v.status = 'submitted' AND (p.state = 'queued' OR (p.state = 'running' AND p.lease_until <= ?))
-      AND p.attempts < ? ORDER BY p.version_id LIMIT 1`, now, MAX_SCAN_ATTEMPTS).toArray()[0];
-    if (!p) return ok({ job: null });
-    const resumes = this.budget.refusal(now);
-    if (resumes !== null) return ok({ job: null, paused: "daily_ai_budget", resumes_at: resumes });
-    const lease = crypto.randomUUID();
-    this.sql.exec(`UPDATE mod_pipeline SET state = 'running', lease = ?, lease_until = ?, attempts = attempts + 1,
-      ai_reserved = ?, ai_claimed_at = ? WHERE version_id = ?`, lease, now + SCAN_LEASE_MS, this.budget.reserve(now), now, p.version_id);
-    const v = this.versionRow(p.version_id)!;
-    const previous = p.baseline === null ? undefined : this.versionRow(p.baseline);
-    return ok({ job: { id: p.job_id, lease, version_id: v.id, sha256: v.sha256, bytes: v.bytes, policy: SCAN_POLICY,
-      listing: JSON.parse(p.metadata), grants: JSON.parse(v.grants), media: this.media(v.id),
-      previous: previous ? { sha256: previous.sha256, grants: JSON.parse(previous.grants),
-        report: JSON.parse(this.pipeline(previous.id)?.report ?? "null") } : null } });
-  }
-
-  /** A scanner can read only files attached to its current, unexpired claim. It cannot list the bucket. */
-  scanFile(job: string, lease: string, sha256: string, now: number): MarketResult {
-    const p = this.sql.exec<PipelineRow>("SELECT * FROM mod_pipeline WHERE job_id = ? AND lease = ? AND state = 'running' AND lease_until > ?",
-      job, lease, now).toArray()[0];
-    const v = p && this.versionRow(p.version_id);
-    const media = p && this.media(p.version_id).find(m => m.sha256 === sha256);
-    if (!v || (v.sha256 !== sha256 && !media)) return fail(404, "No claimed file.");
-    return ok({ key: `${media ? "media" : "mods"}/${sha256}`, type: media?.type ?? "application/wasm" });
-  }
-
-  /** Deduplicate completion and reject stale leases, wrong hashes, malformed reports and outdated policy. */
-  completeScan(job: string, lease: string, input: unknown, now: number): MarketResult {
-    const p = this.sql.exec<PipelineRow>("SELECT * FROM mod_pipeline WHERE job_id = ?", job).toArray()[0];
-    if (!p || p.lease !== lease) return fail(409, "Stale scan claim.");
-    const v = this.versionRow(p.version_id)!;
-    const report = parseScanReport(input, v.sha256, this.media(v.id).map(m => m.sha256));
-    if (!report) return fail(422, "Invalid scan attestation.");
-    if (p.state === "complete" || p.state === "failed") {
-      return p.report === JSON.stringify(report) ? ok({ received: true, duplicate: true }) : fail(409, "Scan already completed.");
-    }
-    if (p.state !== "running" || !p.lease_until || p.lease_until <= now || v.status !== "submitted") return fail(409, "Stale scan claim.");
-    const failed = report.deterministic === "error" || report.ai.verdict === "error";
-    this.sql.exec("UPDATE mod_pipeline SET state = ?, report = ?, completed_at = ?, ai_reserved = 0 WHERE version_id = ?",
-      failed ? "failed" : "complete", JSON.stringify(report), now, v.id);
-    // A report without usage comes from an older scanner, so its worst-case charge stands.
-    if (report.ai.usage && p.ai_claimed_at !== null) this.budget.settle(p.ai_claimed_at, p.ai_reserved, neuronsFor(report.ai.usage));
-    // Pending releases can cross deployments; the accepted report attests to the current pinned scanner client.
-    this.sql.exec("UPDATE mod_versions SET api_revision = ? WHERE id = ?", API_REVISION, v.id);
-    if (this.automaticAllowed(v, now)) {
-      this.sql.exec("UPDATE mod_pipeline SET publish_mode = 'automatic' WHERE version_id = ?", v.id);
-      this.sql.exec("UPDATE mod_versions SET decided_at = ?, note = 'Established creator; checks passed' WHERE id = ?", now, v.id);
-      return ok({ received: true, automatic: true }, { approved: v.id });
-    }
-    return ok({ received: true, automatic: false });
-  }
-
-  /**
-   * Returns a claimed job to the queue without counting the attempt, after Workers AI refused its request. The
-   * `daily_allocation` reason (the default) also pauses claims until the next UTC day; `capacity` does not.
-   */
-  releaseScan(job: string, lease: string, input: unknown, now: number): MarketResult {
-    const reason = input && typeof input === "object" && "reason" in input ? (input as { reason: unknown }).reason : "daily_allocation";
-    if (reason !== "daily_allocation" && reason !== "capacity") return fail(400, "Unknown release reason.");
-    const p = this.sql.exec<PipelineRow>("SELECT * FROM mod_pipeline WHERE job_id = ?", job).toArray()[0];
-    if (!p || p.lease !== lease || p.state !== "running" || !p.lease_until || p.lease_until <= now) return fail(409, "Stale scan claim.");
-    this.sql.exec(`UPDATE mod_pipeline SET state = 'queued', lease = NULL, lease_until = NULL, attempts = MAX(attempts - 1, 0),
-      ai_reserved = 0, ai_claimed_at = NULL WHERE version_id = ?`, p.version_id);
-    if (p.ai_claimed_at !== null) this.budget.settle(p.ai_claimed_at, p.ai_reserved, 0);
-    if (reason === "daily_allocation") this.budget.pause(now);
-    return ok({ released: true, paused: reason === "daily_allocation" });
-  }
-
-  /** Evaluate live trust and the exact prior release again, including after signing or storage I/O. */
-  private automaticAllowed(v: VersionRow, now: number): boolean {
-    const p = this.pipeline(v.id)!;
-    const creator = this.account(v.creator);
-    if (v.status !== "submitted" || v.pulled || v.reach >= 3 || this.listing(v.slug)!.hidden || !creator || creator.suspended
-      || !this.scanPassed(p, now) || reportOf(p)!.ai.verdict !== "clear") return false;
-    const baseline = this.liveVersion(v.slug);
-    if (!this.trusted(v.slug, v.creator, now) || !baseline || baseline.id !== p.baseline) return false;
-    if (this.sql.exec("SELECT 1 FROM mod_reports WHERE slug = ? AND status = 'open'", v.slug).toArray().length) return false;
-    const prior = this.pipeline(baseline.id)!;
-    const priorReport = reportOf(prior);
-    if (!priorReport || priorReport.policy !== SCAN_POLICY || priorReport.client_revision !== CLIENT_REVISION || priorReport.deterministic !== "pass") return false;
-    if (grantDiff(JSON.parse(baseline.grants), JSON.parse(v.grants)).expanded) return false;
-    // New host interfaces are authority changes even if the declaration did not change.
-    if (reportOf(p)!.imports.some(name => !priorReport.imports.includes(name))) return false;
-    // Listing/source/media edits get a human content review at launch. Raw snapshots, so a migrated one differs.
-    const before = JSON.parse(prior.metadata) as Record<string, unknown>;
-    const after = JSON.parse(p.metadata) as Record<string, unknown>;
-    return !["name", "summary", "description", "source", "category", "license"].some(key => before[key] !== after[key])
-      && prior.media === p.media;
-  }
-
-  /**
-   * Whether `creator` holds unexpired trust for `slug` from someone who is still an active admin and isn't the
-   * creator, so a later demotion or suspension of the granter withdraws it.
-   */
-  private trusted(slug: string, creator: string, now: number): boolean {
-    const grant = this.sql.exec<{ granted_by: string }>("SELECT granted_by FROM mod_trust WHERE slug = ? AND creator = ? AND expires_at > ?",
-      slug, creator, now).toArray()[0];
-    const granter = grant && this.account(grant.granted_by);
-    return !!granter && !granter.suspended && atLeast(granter, "admin") && granter.id !== creator;
-  }
-
-  /** Return publication material only while current scan, account and decision gates still hold. */
-  publicationReady(id: number, now: number): { sha256: string; bytes: number; media: MediaFile[]; statement: string } | null {
+  /** Return publication material only while account, listing and decision gates still hold. */
+  publicationReady(id: number): { sha256: string; bytes: number; media: MediaFile[]; statement: string } | null {
     const v = this.versionRow(id);
     const p = this.pipeline(id);
     if (!v || !p || v.status !== "submitted" || v.pulled || this.account(v.creator)?.suspended || this.listing(v.slug)?.hidden
-      || (p.publish_mode === "official" ? p.state !== "complete" || v.slug !== OFFICIAL_SLUG || v.creator !== OFFICIAL_CREATOR
-        || this.officialDigestPulled(v.sha256) || !this.officialValidationReady(v, p)
-        : !this.scanPassed(p, now))) return null;
+      || (p.publish_mode === "official" && (v.slug !== OFFICIAL_SLUG || v.creator !== OFFICIAL_CREATOR
+        || this.officialDigestPulled(v.sha256) || !this.officialValidationReady(v, p)))) return null;
     // Manual approvals count only from staff who are still active and aren't the creator, unless that creator is an owner,
     // whose own approval publishes their mod by itself.
-    const decided = p.publish_mode === "official" || (p.publish_mode === "automatic" ? this.automaticAllowed(v, now)
-      : p.publish_mode === "manual" && approvalsComplete(v.reach as Reach, this.approvals(id).flatMap(a => {
+    const decided = p.publish_mode === "official" || (p.publish_mode === "manual"
+      && approvalsComplete(v.reach as Reach, this.approvals(id).flatMap(a => {
         const actor = this.account(a.id);
         return actor && !actor.suspended && atLeast(actor, "moderator") && (actor.id !== v.creator || actor.role === "owner")
           ? [{ admin: atLeast(actor, "admin"), ownerSelf: actor.id === v.creator && actor.role === "owner" }] : [];
@@ -974,55 +854,12 @@ export class MarketplaceStore {
   /** Official versions use their retained MOD_ASSETS object for signing and public download checks. */
   isOfficialVersion(id: number): boolean { return this.officialManifest(id) !== null; }
 
-  /** Retry jobs with a new identity, invalidating old scanner leases and all earlier approvals. */
-  rescan(caller: Caller, id: number, now: number): MarketResult {
-    const staff = this.staff(caller, now, true);
-    if ("status" in staff) return staff;
-    const v = this.versionRow(id);
-    if (!v || v.status !== "submitted") return fail(409, "Only pending releases can be rescanned.");
-    if (this.isOfficialVersion(id)) return fail(409, "Official releases use release-hook validation.");
-    if (v.creator === staff.id) return fail(403, "You can't rescan your own mod.");
-    this.sql.exec(`UPDATE mod_pipeline SET job_id = ?, state = 'queued', attempts = 0, lease = NULL,
-      lease_until = NULL, report = NULL, completed_at = NULL, publish_mode = NULL WHERE version_id = ?`, crypto.randomUUID(), id);
-    this.sql.exec("DELETE FROM mod_approvals WHERE version_id = ?", id);
-    this.log(staff.id, "rescan", `${v.slug} ${v.version}`, "New scan job", now);
-    return ok(this.versionView(v));
-  }
-
-  /** Admins explicitly grant revocable, project-scoped trust after at least one human-approved release. */
-  setTrust(caller: Caller, slug: string, input: unknown, now: number): MarketResult {
-    const session = this.writer(caller, now);
-    if ("status" in session) return session;
-    if (session.account.suspended || !atLeast(session.account, "admin")) return fail(403, "Only admins manage creator trust.");
-    if (session.created_at + ROLE_CHANGE_SIGN_IN_MS <= now) return fail(401, "Sign in again before changing trust.");
-    const listing = this.listing(slug);
-    if (!listing) return fail(404, "No such mod.");
-    if (listing.creator === session.account.id) return fail(403, "You can't establish your own trust.");
-    const body = fieldsOf(input);
-    if (malformedText(body.reason)) return fail(422, MALFORMED_TEXT);
-    const reason = clip(trimmed(body.reason), 500);
-    if (!reason || typeof body.trusted !== "boolean") return fail(422, "Supply trusted and an audit reason.");
-    if (body.trusted) {
-      const humanApproved = this.sql.exec(`SELECT 1 FROM mod_versions v JOIN mod_pipeline p ON p.version_id = v.id
-        WHERE v.slug = ? AND v.status = 'approved' AND p.publish_mode = 'manual' AND v.pulled = 0 LIMIT 1`, slug).toArray().length;
-      if (!this.publicVersion(listing) || !humanApproved) {
-        return fail(409, "A visible human-approved release and active creator are required.");
-      }
-      this.sql.exec(`INSERT INTO mod_trust (slug, creator, granted_by, expires_at, reason) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT (slug) DO UPDATE SET creator = excluded.creator, granted_by = excluded.granted_by,
-        expires_at = excluded.expires_at, reason = excluded.reason`, slug, listing.creator, session.account.id, now + 90 * 86_400_000, reason);
-    } else this.sql.exec("DELETE FROM mod_trust WHERE slug = ?", slug);
-    this.log(session.account.id, body.trusted ? "established creator" : "revoked trust", slug, reason, now);
-    return ok({ trusted: body.trusted });
-  }
-
   // --- Staff ---------------------------------------------------------------------------------------------
 
   private versionView(v: VersionRow) {
     const listing = this.listing(v.slug)!;
     const p = this.pipeline(v.id)!;
     const metadata = snapshotOf(p);
-    const trust = this.sql.exec<{ expires_at: number }>("SELECT expires_at FROM mod_trust WHERE slug = ? AND creator = ?", v.slug, v.creator).toArray()[0];
     const previous = p.baseline === null ? undefined : this.versionRow(p.baseline);
     const grants = JSON.parse(v.grants) as Grants;
     return {
@@ -1031,11 +868,7 @@ export class MarketplaceStore {
       submitted_at: v.submitted_at, decided_at: v.decided_at, pulled: !!v.pulled, pull_reason: v.pull_reason,
       name: metadata.name, summary: metadata.summary, description: metadata.description, source: metadata.source, hidden: !!listing.hidden,
       category: metadata.category, license: metadata.license, notes: metadata.notes,
-      trust: { trusted: !!trust && this.trusted(v.slug, v.creator, Date.now()), expires_at: trust?.expires_at ?? null },
-      gallery: this.gallery(v.id), icon: this.iconUrl(v.id, true), icon_error: p.icon_error,
-      scan: { state: p.state, attempts: p.attempts, job: p.job_id,
-        completed_at: p.completed_at, expires_at: p.completed_at === null ? null : p.completed_at + SCAN_MAX_AGE_MS,
-        review_ready: this.scanPassed(p, Date.now()), report: reportOf(p) }, publication: p.publish_mode,
+      gallery: this.gallery(v.id), icon: this.iconUrl(v.id, true), icon_error: p.icon_error, publication: p.publish_mode,
       capabilities: requestedCapabilities(grants), rule: approvalRule(v.reach as Reach), approvals: this.approvals(v.id),
       ...(this.isOfficialVersion(v.id) ? { official_validation: JSON.parse(this.sql.exec<{ validation: string }>(
         "SELECT validation FROM mod_official_releases WHERE version_id = ?", v.id).one().validation),
@@ -1073,9 +906,6 @@ export class MarketplaceStore {
     if (body.decision === "approve") {
       const allowed = canApprove(staff, state);
       if (!allowed.ok) return fail(403, allowed.reason);
-      const p = this.pipeline(v.id)!;
-      if (!this.scanPassed(p, now)) return fail(409, "A current, complete scan must pass before approval. Rescan failed or expired jobs.");
-      if (reportOf(p)!.ai.verdict === "flag" && !note) return fail(422, "Explain how the flagged findings were resolved before approving.");
       if (this.account(v.creator)?.suspended || this.listing(v.slug)?.hidden) return fail(409, "Restore the creator and listing before approving.");
       const admin = atLeast(staff, "admin");
       this.sql.exec("INSERT INTO mod_approvals (version_id, account_id, admin, at) VALUES (?, ?, ?, ?)", v.id, staff.id, admin ? 1 : 0, now);
@@ -1116,13 +946,12 @@ export class MarketplaceStore {
     }
     this.sql.exec("UPDATE mod_versions SET pulled = 1, pull_reason = ? WHERE id = ?", reason, v.id);
     this.revocationRevision++;
-    this.sql.exec("DELETE FROM mod_trust WHERE slug = ?", v.slug);
     this.log(staff.id, "pulled", `${v.slug} ${v.version}`, reason, now);
     const holders = this.sql.exec<{ account_id: string }>("SELECT account_id FROM mod_library WHERE version_id = ?", v.id).toArray().flatMap((r) => this.xbox(r.account_id)?.xuid ?? []);
     return ok(this.versionView(this.versionRow(v.id)!), { notify: holders });
   }
 
-  /** Hides or restores another creator's listing; restoring needs an admin, as hiding withdrew its trust. */
+  /** Hides or restores another creator's listing; restoring needs an admin. */
   hide(caller: Caller, slug: string, input: unknown, now: number): MarketResult {
     const staff = this.staff(caller, now, true);
     if ("status" in staff) return staff;
@@ -1137,7 +966,6 @@ export class MarketplaceStore {
     const hidden = body.hidden;
     if (!hidden && !atLeast(staff, "admin")) return fail(403, "Only admins can restore a hidden listing.");
     this.sql.exec("UPDATE mod_listings SET hidden = ? WHERE slug = ?", hidden ? 1 : 0, slug);
-    if (hidden) this.sql.exec("DELETE FROM mod_trust WHERE slug = ?", slug);
     this.log(staff.id, hidden ? "hid listing" : "restored listing", slug, reason, now);
     return ok({ hidden });
   }
@@ -1155,7 +983,7 @@ export class MarketplaceStore {
     }));
   }
 
-  /** Resolves a report about another creator's mod; open reports hold automatic publication. */
+  /** Resolves a report about another creator's mod. */
   resolve(caller: Caller, id: number, input: unknown, now: number): MarketResult {
     const staff = this.staff(caller, now, true);
     if ("status" in staff) return staff;
@@ -1220,7 +1048,6 @@ export class MarketplaceStore {
     if (typeof body.suspended !== "boolean") return fail(422, "Supply suspended as true or false.");
     const suspended = body.suspended;
     this.sql.exec("UPDATE accounts SET suspended = ? WHERE id = ?", suspended ? 1 : 0, target.id);
-    if (suspended) this.sql.exec("DELETE FROM mod_trust WHERE creator = ?", target.id);
     this.log(staff.id, suspended ? "suspended" : "restored", target.id, reason, now);
     return ok(this.account(target.id));
   }
@@ -1256,11 +1083,7 @@ export type MarketCall = Caller & (
   | { op: "version"; id: number } | { op: "decide"; id: number; body: unknown } | { op: "pull"; id: number; body: unknown }
   | { op: "hide"; slug: string; body: unknown } | { op: "resolve"; id: number; body: unknown }
   | { op: "role"; body: unknown } | { op: "suspend"; body: unknown } | { op: "asset"; sha256: string }
-  | { op: "media"; sha256: string } | { op: "trust"; slug: string; body: unknown } | { op: "rescan"; id: number }
-  | { op: "private-media"; id: number; sha256: string }
-  | { op: "scan-claim" } | { op: "scan-file"; job: string; lease: string; sha256: string }
-  | { op: "scan-complete"; job: string; lease: string; body: unknown }
-  | { op: "scan-release"; job: string; lease: string; body: unknown }
+  | { op: "media"; sha256: string } | { op: "private-media"; id: number; sha256: string }
   | { op: "signin"; identity: ProviderIdentity; newSession: string; newCsrf: string }
   | { op: "link-code"; codeHash: string } | { op: "unlink" } | { op: "username"; body: unknown }
 );
@@ -1270,7 +1093,7 @@ export type MarketCall = Caller & (
  * the same answer from them. A test checks every one against the Hub's actual anonymous answer.
  */
 export const SESSION_OPS = ["me", "mine", "signout", "username", "link-code", "unlink", "send", "remove", "report", "upload-auth", "precheck", "submit", "version",
-  "decide", "pull", "hide", "resolve", "role", "suspend", "queue", "reports", "people", "audit", "trust", "rescan", "private-media",
+  "decide", "pull", "hide", "resolve", "role", "suspend", "queue", "reports", "people", "audit", "private-media",
 ] as const satisfies readonly MarketCall["op"][];
 
 /**
@@ -1317,12 +1140,6 @@ export function handle(store: MarketplaceStore, call: MarketCall, now: number): 
     case "asset": return ok({ allowed: store.assetAllowed(call.sha256) });
     case "media": return ok({ allowed: store.mediaAllowed(call.sha256) });
     case "private-media": return store.privateMedia(call, call.id, call.sha256, now);
-    case "trust": return store.setTrust(call, call.slug, call.body, now);
-    case "rescan": return store.rescan(call, call.id, now);
-    case "scan-claim": return store.claimScan(now);
-    case "scan-file": return store.scanFile(call.job, call.lease, call.sha256, now);
-    case "scan-complete": return store.completeScan(call.job, call.lease, call.body, now);
-    case "scan-release": return store.releaseScan(call.job, call.lease, call.body, now);
     case "signin":
       store.signIn(call.identity, call.newSession, call.newCsrf, now);
       return ok({});

@@ -24,7 +24,7 @@ export function deriveContract(inputs, revision) {
   return { revision, api_revision: apiRevision, capabilities, interfaces, signingKeys, component: componentLimits(inputs) };
 }
 
-/** Requires the client's nonempty oldest-to-newest array of full revisions; its last entry is the scanned API. */
+/** Requires the client's nonempty oldest-to-newest array of full revisions; its last entry is the newest stable API. */
 export function newestApiRevision(input) {
   let revisions;
   try {
