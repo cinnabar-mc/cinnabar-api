@@ -1,7 +1,6 @@
 // Secrets aren't in wrangler.jsonc, so `wrangler types` can't see them.
 declare namespace Cloudflare {
   interface Env {
-    MARKETPLACE_SCANNER_TOKEN?: string; // isolated scanner: claim/read/complete only, never an admin or signing key
     MOD_RELEASE_HOOK_SECRET?: string;
     MOD_RELEASE_REPOSITORY?: string;
     MOD_RELEASE_PACKAGE?: string;
@@ -14,11 +13,9 @@ declare namespace Cloudflare {
     MARKETPLACE_ORIGIN?: string; // the website origin allowed to call marketplace routes with credentials
     GOOGLE_CLIENT_ID?: string; // Google web OAuth client ID
     OWNER_EMAILS?: string; // comma-separated verified account emails that hold the owner role
-    SCAN_AI_DAILY_NEURONS?: string; // optional Workers AI Neurons the scanner may use per UTC day; defaults to 9000
   }
 }
 interface Env {
-  MARKETPLACE_SCANNER_TOKEN?: string;
   MOD_RELEASE_HOOK_SECRET?: string;
   MOD_RELEASE_REPOSITORY?: string;
   MOD_RELEASE_PACKAGE?: string;
@@ -30,5 +27,4 @@ interface Env {
   MARKETPLACE_ORIGIN?: string;
   GOOGLE_CLIENT_ID?: string;
   OWNER_EMAILS?: string;
-  SCAN_AI_DAILY_NEURONS?: string;
 }

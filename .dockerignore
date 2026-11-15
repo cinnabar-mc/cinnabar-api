@@ -1,7 +1,0 @@
-.git
-node_modules
-.dev.vars
-.env*
-.wrangler
-.generated
-.build

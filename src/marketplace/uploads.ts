@@ -45,7 +45,7 @@ export async function storeComponentIcon(bucket: R2Bucket, bytes: Uint8Array | n
   return { sha256: hash, bytes: bytes.length, type: "image/png", caption: "", role: "icon" };
 }
 
-/** Accept passive raster formats only. The scanner fully decodes them before publication. */
+/** Accept passive raster formats only, identified by their signature bytes; staff check the images during review. */
 export function imageType(bytes: Uint8Array): MediaFile["type"] {
   if (bytes.length > MAX_IMAGE_BYTES || bytes.length < 12) throw new Error("Each image must be at most 1 MiB.");
   if ([137, 80, 78, 71, 13, 10, 26, 10].every((v, i) => bytes[i] === v)) return "image/png";

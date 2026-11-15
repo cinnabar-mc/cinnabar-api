@@ -133,10 +133,10 @@ highest reach it touches. Reach sets the review rule:
 
 A source link is optional for every listing.
 
-**Files and trust.**
+**Files and review.**
 - Components (at most 16 MiB, of which at most the pinned client's 4 MiB may be executable code) and up to four raster images (1 MiB each) enter private
   `MOD_FILES` storage under server-computed SHA-256 keys. An authenticated,
-  byte-bounded multipart request creates an immutable metadata snapshot and durable scan job.
+  byte-bounded multipart request creates an immutable metadata snapshot.
 - Listing summaries and details include `icon: string | null`, a hash-addressed
   `/v1/mods/media/<sha256>` URL extracted from the approved component's optional
   `cinnabar:extension/icon@1` PNG section. Creators do not upload a separate icon;
@@ -146,33 +146,26 @@ A source link is optional for every listing.
   `icon_error` diagnostic. Pending versions never replace the public icon.
   The Worker checks PNG structure and CRCs; the client also decodes pixels. See
   [icon validation and media](docs/marketplace.md#upload-and-release-contract).
-- A separate scanner validates full component structure/types/core bytecode, host imports
-  and image decoding without executing uploaded code. Workers AI assists staff with bounded,
-  schema-validated findings. Missing, failed or expired checks prevent publication.
-- Scanning stays within Workers AI's free 10,000 Neurons a day: the API stops handing out jobs once
-  the day's reported usage plus one worst-case scan (2,922 Neurons) would pass 9,000 Neurons
-  (`SCAN_AI_DAILY_NEURONS` overrides this). Paused jobs stay queued and are scanned after 00:00 UTC; nothing
-  fails because of the budget. See [the daily budget](docs/marketplace.md#daily-workers-ai-budget).
-- Admins can establish a creator for a particular project after human review. Eligible updates
-  publish automatically only with current trust and completed checks, unchanged content/imports,
-  no added permissions or commands, and no suspension, withdrawal or open-report hold.
-  Acts and Network releases always need human approval. See [the pipeline contract](docs/marketplace.md).
+- No automated scan runs. Staff download each submitted file and review it by hand before approving;
+  every creator release, including an update, waits for the approvals its reach needs. The upload-time
+  reader checks only component framing, declarations, grants and size. See [the pipeline contract](docs/marketplace.md).
 - An approved version is signed with the Ed25519 `MARKETPLACE_SIGNING_KEY` over a canonical statement
-  `{approved_at, approvers, bytes, grants, sha256, slug, version, metadata, media, policy, client_revision, scan_job, publication, api_revision}`,
+  `{approved_at, approvers, bytes, grants, sha256, slug, version, metadata, media, policy, client_revision, publication, api_revision}`,
   returned as `release` on `GET /v1/mods/:slug`. `metadata` is the immutable listing snapshot, `media` the gallery
-  and component icon descriptors (icons carry `role: "icon"`), `policy` and `client_revision` the scan policy and pinned client revision, `scan_job` the scan job ID
-  and `publication` `manual`, `automatic` or `official`. Official statements retain the manifest’s host and API
+  and component icon descriptors (icons carry `role: "icon"`), `policy` and `client_revision` the review policy and pinned client revision,
+  and `publication` `manual` or `official` (`automatic` on releases the retired scanner published). Statements signed before the
+  scanner's removal also carry `scan_job` and keep their original bytes. Official statements retain the manifest’s host and API
   revisions and identify their separate authenticated-hook validation policy. For creator uploads, `api_revision`
   is the last (newest) stable API revision in the pinned
   client's `crates/mod-api/compatibility-revisions.json`, derived by `pnpm source:fetch` and recorded per version
-  at submission and scan completion. Older versions without this stored revision retain their original statements
+  at submission. Older versions without this stored revision retain their original statements
   and are excluded from automatic update selection.
 - `GET /v1/mods/:slug/update?api_revisions=<comma-separated revisions>&host_revision=<40-hex>&current_version=<version>&current_sha256=<64-hex>`
   anonymously returns `{release: {statement, signature}}` for the highest published version strictly newer than
   the installed stable version, with a different digest and a stored `api_revision` in the supplied list (1–32
-  full lowercase 40-hex revisions). The host revision is required identity, not an equality constraint on the scan
-  client's pin. No match returns 204, malformed queries 400, unknown/hidden listings or suspended creators 404.
-  Pulled, unsigned or incompletely scanned releases never match. Responses use `Cache-Control: no-store` so pulls
+  full lowercase 40-hex revisions). The host revision is required identity, not an equality constraint on the API's
+  client pin. No match returns 204, malformed queries 400, unknown/hidden listings or suspended creators 404.
+  Pulled or unsigned releases never match. Responses use `Cache-Control: no-store` so pulls
   and visibility changes apply on the next check; there is no compatibility fallback. The Official Mod is the
   reserved `cinnabar-mod` listing owned by `system:official`. Its existing mod release hook now signs marketplace
   versions; shipped clients keep their existing `/v1/mod/update`, `/v1/mod/download` and digest URLs with their
@@ -203,7 +196,6 @@ Before enabling it in production:
 ```sh
 pnpm exec wrangler r2 bucket create cinnabar-mods
 pnpm exec wrangler secret put MARKETPLACE_SIGNING_KEY   # base64 PKCS#8 Ed25519 private key
-pnpm exec wrangler secret put MARKETPLACE_SCANNER_TOKEN # separate random scanner credential
 pnpm exec wrangler secret put GOOGLE_CLIENT_SECRET      # Google web OAuth client secret
 ```
 
@@ -215,12 +207,8 @@ Then set the `MARKETPLACE_ORIGIN`, `GOOGLE_CLIENT_ID` and `OWNER_EMAILS` variabl
   sign-in cookie's encryption key is derived from that secret.
 - The session cookie only reaches the API when the website shares its registrable domain (for example
   `cinnabar.gg`), so the site must leave `*.workers.dev` before sign-in works there.
-- Keep the marketplace R2 bucket private with no public domains. The separate scanner runs every ten
-  minutes from `.github/workflows/scanner.yml` with its limited credential and a Workers AI token; it
-  never receives the signing key. Add `MARKETPLACE_SCANNER_TOKEN` (a long random value; deployment also
-  installs it as the Worker secret and fails without it) and `AI_API_TOKEN` (a Cloudflare API token with
-  only Account · Workers AI · Read) to the `production` GitHub environment. Until both exist, scheduled
-  runs exit with a notice. Provisioning and website HTTP enablement are separate from merging the API code.
+- Keep the marketplace R2 bucket private with no public domains. Provisioning and website HTTP enablement
+  are separate from merging the API code.
   See [deployment and recovery](docs/marketplace.md#deployment-and-recovery).
 
 ## Privacy
@@ -327,8 +315,6 @@ no emote history is written to durable storage or logs. No server addresses are 
 pnpm install
 pnpm source:fetch # derive capabilities/imports from the immutable client revision in source.json
 pnpm test          # vitest in the Workers runtime
-pnpm scanner:setup # checksum-pinned official wasm-tools (Linux x64/arm64)
-pnpm test:scanner  # component/client-world types, image decoding and scanner protocol
 pnpm typecheck
 cp .dev.vars.example .dev.vars && pnpm dev
 ```

@@ -51,8 +51,8 @@ function parseGrants(value: string): Grants {
 }
 
 /**
- * Read strictly framed top-level declarations. Full component/type/code validation
- * additionally runs in the scanner; this reader never executes an upload. Trusted official publication may
+ * Read strictly framed top-level declarations. Staff review the full component by hand before approving it;
+ * this reader never executes an upload. Trusted official publication may
  * supply its existing 32 MiB transport ceiling; creator submissions retain the default 16 MiB ceiling.
  * Invalid optional icons yield null and a private diagnostic; they never reject otherwise valid framing.
  */

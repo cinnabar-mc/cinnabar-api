@@ -8,7 +8,6 @@ import { storeComponentIcon } from "./marketplace/uploads";
 import { modAssetKey, MAX_MOD_ASSET_BYTES } from "./mod-assets";
 import { DurableObject } from "cloudflare:workers";
 import { MarketplaceStore, handle, type MarketCall, type MarketResult } from "./marketplace/store";
-import { dailyNeurons } from "./marketplace/ai-budget";
 import { signText } from "./marketplace/signing";
 import { reusableRevocations, type SignedRevocations } from "./marketplace/revocations";
 import { PresenceHistory } from "./presence-history";
@@ -121,8 +120,7 @@ export class Hub extends DurableObject<Env> {
     super(ctx, env);
     this.history = new PresenceHistory(ctx.storage.sql, env.API_CACHE, env.METRICS);
     this.market = ctx.storage.transactionSync(() => new MarketplaceStore(ctx.storage.sql,
-      new Set((env.OWNER_EMAILS ?? "").split(",").map(email => email.trim().toLowerCase()).filter(Boolean)),
-      dailyNeurons(env.SCAN_AI_DAILY_NEURONS)));
+      new Set((env.OWNER_EMAILS ?? "").split(",").map(email => email.trim().toLowerCase()).filter(Boolean))));
     this.mods = new ModReleases(ctx.storage.sql);
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS lookup_budgets (
       xuid TEXT PRIMARY KEY, tokens REAL NOT NULL, updated_at INTEGER NOT NULL
@@ -671,7 +669,7 @@ export class Hub extends DurableObject<Env> {
   private async publishMod(id: number): Promise<boolean> {
     this.market.publicationAttempt(id, Date.now());
     const key = this.env.MARKETPLACE_SIGNING_KEY;
-    const candidate = key ? this.market.publicationReady(id, Date.now()) : null;
+    const candidate = key ? this.market.publicationReady(id) : null;
     if (!key || !candidate) return false;
     try {
       if (this.market.isOfficialVersion(id)) {
